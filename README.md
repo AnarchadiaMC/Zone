@@ -38,11 +38,11 @@ graph TB
         HOOK["MinHook detour on<br/>luaL_openlibs in LuaJIT.dll"]
         PROV["AssetProvisioner<br/>auto-writes missing configs"]
         ID["Identity<br/>UUID + HWID hash<br/>persisted in %APPDATA%"]
-        BIND["ZoneNet Lua Bindings<br/>8 C closures → _G"]
+        BIND["ZoneNet Lua Polyfill<br/>8 FFI wrappers in zone_net.script"]
         RING["Lock-free SPSC Ring Buffer<br/>256 entries × 1500 bytes"]
     end
 
-    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 16 opcodes"| NET
+    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 14 opcodes"| NET
     BIND <-.->|"ZoneNet.* Lua calls"| SCRIPTS
 
     style Server fill:#1a1a2e,stroke:#0f3460,color:#e0e0e0
@@ -56,9 +56,9 @@ graph TB
 
 - **Headless Authoritative Daemon (`zone-server`)** — Written in Go for native concurrency and low memory footprint. Ticks at a fixed **30 Hz** (33,333 µs), managing a 64m spatial grid, 220m Area of Interest radius, and two-tier AI simulation. Runs on Windows and Linux.
 
-- **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode with an async write-behind queue (buffered channel, capacity 1000) to avoid blocking the game loop.
+- **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue infrastructure exists (buffered channel, capacity 1000) but is not yet wired into the game loop.
 
-- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — never overwrites existing files.
+- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — never overwrites existing files. **Note: `AssetProvisioner::GetGameRoot()` has a bug — auto-provisioning may not trigger until fixed.**
 
 - **Native X-Ray UI** — Zero external overlay layers or DirectX Present hooks. Injects a native `CUI3tButton` on the main menu via Lua script, opening a native `CUIScriptWnd` Server Browser with Direct Connect, persistent Favorites (up to 16), and double-click-to-connect.
 
@@ -77,12 +77,12 @@ zone-online/
 ├── zone-server/                 # Golang dedicated survival server
 │   ├── cmd/server/main.go       # Entrypoint: wires config, DB, game loop, UDP
 │   ├── internal/
-│   │   ├── ai/                  # Squad manager, A* pathfinding (stub)
+│   │   ├── ai/                  # Squad manager (stub), A* pathfinding (complete)
 │   │   ├── config/              # YAML configuration loader
 │   │   ├── database/            # SQLite schema (7 tables), CRUD, async write queue
 │   │   ├── game/                # 30Hz ticker, spatial grid, safe zones, AoI, events
 │   │   ├── network/             # UDP listener (8 workers), sessions, reliable ACK queue
-│   │   └── protocol/            # Binary wire protocol (16 opcodes, 12-byte header)
+│   │   └── protocol/            # Binary wire protocol (14 opcodes, 12-byte header)
 │   └── zone_server.yaml         # Server configuration
 │
 ├── zone-client/                 # C++ injectable client DLL + automated injector
@@ -122,7 +122,7 @@ zone-online/
 
 ## Lua Scripting Layer
 
-The client-side game logic is implemented entirely in native X-Ray Lua scripts. These communicate with the server through the `ZoneNet` global table injected by the DLL.
+The client-side game logic is implemented entirely in native X-Ray Lua scripts. These communicate with the server through the `ZoneNet` global table — a Lua-side polyfill defined in `zone_net.script` that wraps FFI calls to the injected `ZoneClient.dll` exports.
 
 ```mermaid
 graph TD
@@ -149,15 +149,15 @@ graph TD
 
 | Script | Lines | Purpose |
 |:---|:---:|:---|
-| `zone_main` | 59 | Bootstrap entry point. Reads `%APPDATA%\zone_identity.ltx`, calls `ZoneNet:Connect()`, registers `actor_on_update` and hit/key callbacks. |
-| `zone_net` | 124 | Core network tick. Sends player transform at 30 Hz via LuaJIT FFI. Parses 12-byte packet headers and dispatches by opcode to other scripts. |
-| `zone_dummy` | 186 | Manages remote player proxy objects. Spawns alife stalkers, buffers 8 position samples, applies cubic Hermite (Catmull-Rom) interpolation with 100ms jitter buffer every frame. |
-| `zone_safezone` | 107 | Enforces safe zone rules. Nullifies incoming damage (`s_hit.power = 0`), blocks fire input, forces weapon holster via `db.actor:hide_weapon()`. |
-| `zone_hud` | 215 | Persistent HUD indicator at top-right showing `[ZO] Online` / `Safe Zone` / `Offline` with ping. Issues PDA news tips on state transitions. Runs at 1 Hz. |
-| `zone_menu_patch` | 113 | Monkey-patches `ui_main_menu.main_menu:InitControls` to append a native `CUI3tButton` at position (40, 548) labeled "Zone". |
+| `zone_main` | 55 | Bootstrap entry point. Reads `%APPDATA%\zone_identity.ltx`, calls `ZoneNet:Connect()`, registers `actor_on_update` and hit/key callbacks. |
+| `zone_net` | 177 | Core network tick. Sends player transform at 30 Hz via LuaJIT FFI. Parses 12-byte packet headers and dispatches by opcode to other scripts. Also defines the `ZoneNet` Lua polyfill table wrapping DLL exports. |
+| `zone_dummy` | 213 | Manages remote player proxy objects. Spawns alife stalkers, buffers 8 position samples, applies cubic Hermite (Catmull-Rom) interpolation with 100ms jitter buffer every frame. Handles damage/kill propagation. |
+| `zone_safezone` | 104 | Enforces safe zone rules. Nullifies incoming damage (`s_hit.power = 0`), blocks fire input, forces weapon holster via `db.actor:hide_weapon()`. Re-holsters every frame. |
+| `zone_hud` | 210 | Persistent HUD indicator at top-right showing `[ZO] Online` / `Safe Zone` / `Offline` with ping. Issues PDA news tips on state transitions. Runs at 1 Hz. |
+| `zone_menu_patch` | 94 | Monkey-patches `ui_main_menu.main_menu:InitControls` to append a native `CUI3tButton` labeled "Zone". Button position defined in XML layout. |
 | `zone_ui_server_list` | 506 | Full `CUIScriptWnd` server browser. Favorites persisted in `%APPDATA%\zone_identity.ltx` (max 16). Supports direct IP connect, double-click-to-connect, add/remove favorites. |
-| `zone_ai_proxy` | 85 | Spawns server-authoritative AI puppets. Handles entity enter (NPC/mutant), AI action events (attack, death, flee), and entity leave. |
-| `zone_worldevent` | 40 | Handles emission warnings (`0x01`), active emissions (`0x02`), clear (`0x03`), raid start (`0x04`), and raid end (`0x05`). Triggers weather changes and siren sounds. |
+| `zone_ai_proxy` | 86 | Spawns server-authoritative AI puppets. Handles entity enter (NPC/mutant), AI action events (attack, death), and entity leave. |
+| `zone_worldevent` | 43 | Handles emission warnings (`0x01`), active emissions (`0x02`), clear (`0x03`), raid start (`0x04`), and raid end (`0x05`). Triggers weather changes and siren sounds. |
 
 ---
 
@@ -262,36 +262,57 @@ Once in the main menu:
 
 ## Implementation Status
 
-| Subsystem | Status | Notes |
-|:---|:---:|:---|
-| Config loading (YAML) | Done | Port, tick rate, max players, DB path, emission interval |
-| Database schema + CRUD | Done | 7 tables, WAL mode, async write-behind queue |
-| Safe zone seeding + detection | Done | 8 cylindrical zones with 2D distance + height check |
-| UDP listener + worker pool | Done | 8 goroutines, FNV-1a affinity, sync.Pool buffers |
-| Reliable delivery (ACK/retransmit) | Done | 500ms timeout, 100ms scan interval |
-| Session management | Done | Dual-index map (by ID + by addr), 30s stale timeout |
-| Binary protocol read/write | Done | 12-byte header, little-endian, 16 opcodes |
-| Heartbeat handling | Done | Updates `LastSeen` timestamp |
-| Handshake handling | Partial | Reads request and logs; response not yet sent |
-| Snapshot broadcast | Stub | AoI manager methods defined but empty |
-| Spatial grid queries | Stub | `GetNeighbors` returns empty slice |
-| Packet dispatch (most opcodes) | Stub | Only HandshakeReq and Heartbeat handled |
-| Anti-cheat | Stub | Velocity check defined, not integrated |
-| Economy system | Stub | Struct defined, no logic |
-| Stash manager | Stub | Struct defined, no logic |
-| Emission orchestrator | Stub | Struct defined, no logic |
-| AI pathfinding (A*) | Stub | Returns empty waypoint slice |
-| AI squad manager | Stub | `Tick` method is a no-op |
-| Admin server (named pipe) | Stub | Config key defined, no listener |
-| DLL injection + hook | Done | MinHook on luaL_openlibs, 3 injector modes |
-| Asset provisioning | Done | Auto-writes missing LTX + XML on first inject |
-| Identity persistence | Done | UUID (UuidCreate) + HWID (FNV-1a of MachineGuid + hostname) |
-| Lua bindings (ZoneNet) | Done | 8 C closures dynamically resolved from LuaJIT.dll |
-| Player proxy interpolation | Done | Cubic Hermite, 100ms jitter, 8-sample ring buffer |
-| Safe zone enforcement | Done | Client-side damage nullification + weapon block |
-| Server browser UI | Done | CUIScriptWnd with favorites, direct connect |
-| HUD status overlay | Done | 1 Hz update, connection/safe zone indicators |
-| World event sync | Done | Emission warn/active/clear, raid start/end |
+### Complete
+
+| Subsystem | Notes |
+|:---|:---|
+| Config loading (YAML) | 7 keys: port, tick_rate_hz, max_players, db_path, log_level, emission_interval_min, admin_pipe |
+| Database schema (7 tables) | accounts, characters, character_inventory, world_stashes, safe_zones, audit_log, ai_squads. WAL mode via pragma. |
+| Database CRUD | AutoProvision, LoadCharacter, SaveCharacter, FlushPlayerTransform, GetCharacterInventory, IsPlayerBanned |
+| Safe zone seeding + detection | 8 cylindrical zones hardcoded, seeded into DB on startup. 2D distance + height check. |
+| UDP listener + worker pool | 8 goroutines, FNV-1a address affinity, sync.Pool buffer recycling, silent drop on full channel |
+| Session management | Dual-index map (by ID + by addr), cached slice for lock-free reads, 30s stale timeout |
+| Binary protocol read/write | 12-byte header, little-endian, 14 opcodes defined, WritePacket/ReadHeader tested |
+| Reliable delivery (send + retransmit) | 500ms timeout, 100ms scan interval. Retransmit loop is wired into game loop. |
+| AI pathfinding (A*) | Full implementation with priority queue, 3D Euclidean heuristic, path reconstruction. 4 test cases pass. |
+| DLL injection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege, 11 known exe names |
+| Asset provisioning | Auto-writes DLTX config + UI XML if missing. **Bug: `GetGameRoot()` returns empty — `GetModuleFileNameW` never called.** |
+| Identity persistence | UUID via UuidCreate, HWID via FNV-1a(MachineGuid + ComputerName), LTX file in %APPDATA% |
+| UDP client (background thread) | 3-state machine (DISCONNECTED/CONNECTING/CONNECTED), select with 10ms timeout, exponential backoff on handshake |
+| Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering |
+| Player proxy interpolation | Cubic Hermite (Catmull-Rom), 100ms jitter buffer, 8-sample ring buffer |
+| Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0`), fire input block, weapon re-holster every frame |
+| Server browser UI | CUIScriptWnd with favorites (max 16), direct connect, double-click-to-connect, LTX persistence |
+| HUD status overlay | CUIStatic at top-right, 1 Hz update, color-coded states, PDA news on transitions |
+| World event sync | Emission warn/active/clear, raid start/end. Weather changes + siren sounds. |
+| Emission + raid Lua handling | 5 event types parsed, surge API with fallback to weather override |
+
+### To-Do
+
+| Subsystem | Priority | Current State | What Needs Doing |
+|:---|:---:|:---|:---|
+| Handshake response | **High** | Request parsed + logged, no response sent | Send `HANDSHAKE_RES`, create session, call `AutoProvision`, load spawn point |
+| Spatial grid | **High** | `GetNeighbors` always returns `[]uint32{}` | Implement `Insert`, `Remove`, `Update`, cell-key computation, and real neighbor query |
+| Packet dispatch — `CLIENT_TRANSFORM` (0x0010) | **High** | Opcode defined, not handled | Parse transform, update session position, trigger AoI checks |
+| Packet dispatch — `DISCONNECT` (0x0003) | **High** | Opcode defined, not handled | Remove session, broadcast leave to peers |
+| Packet dispatch — `CHAT_TEXT` (0x0060) | Medium | Opcode defined, not handled | Parse sender + message, broadcast to all sessions |
+| Packet dispatch — `STASH_INTERACT` (0x0040) | Medium | Opcode defined, no payload struct in server | Define Go struct, implement stash CRUD, send response |
+| Snapshot broadcast | **High** | Code complete but dead (no sessions, empty grid) | Depends on handshake + spatial grid. Then it will work. |
+| ACK receive side | **High** | `AckReceived()` never called | Handle incoming ACK packets to stop retransmission |
+| Emission orchestrator | Medium | Config key loaded, never used | Create orchestrator struct, timer goroutine, emit `WORLD_EVENT` packets |
+| AI squad manager | Medium | Empty struct, no methods | Implement `Tick`, spawn/despawn squads, path following, broadcast AI actions |
+| Anti-cheat | Medium | `ValidateVelocity` exists, never called | Integrate into `CLIENT_TRANSFORM` handler, add more checks |
+| Economy system | Low | Empty struct | Implement buy/sell, currency, tier progression |
+| Stash manager | Low | DB table exists, no Go code | CRUD operations, opcode handlers, contents serialization |
+| Admin server (named pipe) | Low | Config key loaded, no listener | Implement named pipe listener, RPC commands (kick, ban, status, broadcast) |
+| Lua hook wiring | **High** | `lua_hook.cpp` exists but not in CMakeLists, never called from main.cpp | Add to CMakeLists, call `LuaHook::Install()` from InitThread |
+| ZoneNet Lua bindings | **High** | `RegisterZoneNetBindings()` declared but never defined | Implement function body: create Lua table, register C closures, set as global |
+| Dynamic Lua function pointers | **High** | 17 `extern` declarations, never initialized | Add `GetProcAddress` loop in init to populate all function pointers from LuaJIT.dll |
+| AssetProvisioner `GetGameRoot()` | **High** | Returns empty string always | Add `GetModuleFileNameW(hModule, buf, MAX_PATH)` call before path processing |
+| Ping measurement | Low | `g_Ping` always returns 0 | Implement RTT measurement using heartbeat timestamp round-trip |
+| DB async write queue | Low | `StartWriteQueue()` works but never called | Wire into `main.go` startup, route writes through channel |
+| Safe zone server integration | **High** | `CheckSafeZone()` works but never called | Call from game loop or transform handler, set `InSafeZone` on sessions, send `SAFEZONE_STATE` |
+| DB integration in packet handlers | **High** | CRUD methods exist, none called from handlers | Call `AutoProvision` on handshake, `SaveCharacter` on disconnect, `FlushPlayerTransform` periodically |
 
 ---
 
