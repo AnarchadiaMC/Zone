@@ -1,0 +1,40 @@
+-- zone_worldevent.script
+-- World events (emissions, raids)
+
+local active_emission = false
+local emission_timer = 0
+
+function on_world_event(pkt, offset)
+    local event_type, pos = zone_net.read_uint8(pkt, offset)
+    local timer, pos = zone_net.read_uint32_le(pkt, pos)
+    
+    if event_type == 0x01 then -- EMISSION_WARN
+        if db.actor then
+            local msg = "ZONE EMISSION IN " .. tostring(timer) .. " SECONDS - FIND SHELTER"
+            db.actor:give_game_news("Anomaly Detected", msg, "ui_inGame2_Vibros", 0, 10000, 0)
+            -- Play sound if possible
+            local snd = sound_object("characters_voice\\scenario\\video\\emission_siren")
+            if snd then snd:play(db.actor, 0, sound_object.s2d) end
+        end
+    elseif event_type == 0x02 then -- EMISSION_ACTIVE
+        active_emission = true
+        if xr_effects and xr_effects.start_surge then
+            -- Trigger anomaly surge
+            xr_effects.start_surge(db.actor, nil, {})
+        else
+            -- Manual fallback
+            level.set_weather("emission", true)
+        end
+    elseif event_type == 0x03 then -- EMISSION_CLEAR
+        active_emission = false
+        level.set_weather("default", true)
+    elseif event_type == 0x04 then -- RAID_START
+        if db.actor then
+            db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        end
+    elseif event_type == 0x05 then -- RAID_END
+        if db.actor then
+            db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        end
+    end
+end

@@ -1,0 +1,50 @@
+﻿# Zone Online — .gitignore
+
+# Binaries and Executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin
+
+# Compiler and Linker Artifacts
+*.obj
+*.lib
+*.a
+*.pdb
+*.exp
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+
+# Build Directories
+build/
+bin/
+out/
+dist/
+zone-client/build/
+zone-server/build/
+cmake-build-*/
+
+# IDE / Editor Files
+.vs/
+.vscode/
+.idea/
+*.vcxproj.user
+*.suo
+*.user
+
+# Databases and Local Storage
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+zone_world.db*
+
+# Logs and Temporary Files
+*.log
+*.tmp
+*.bak
+appdata/logs/
+imgui.ini

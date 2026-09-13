@@ -1,0 +1,59 @@
+-- zone_main.script
+-- Zone Online Bootstrap
+
+local config = {}
+
+local function load_config()
+    local appdata = os.getenv("APPDATA")
+    if not appdata then return false end
+    
+    local path = appdata .. "\\zone_identity.ltx"
+    local file = io.open(path, "r")
+    if not file then
+        printf("ZoneOnline: Missing zone_identity.ltx in %APPDATA%")
+        return false
+    end
+    
+    for line in file:lines() do
+        local key, val = string.match(line, "^%s*([%w_]+)%s*=%s*(.+)%s*$")
+        if key and val then
+            if key == "hwid_hash" or key == "server_port" then
+                config[key] = tonumber(val)
+            else
+                config[key] = val
+            end
+        end
+    end
+    file:close()
+    return true
+end
+
+function on_game_start()
+    if type(ZoneNet) == "nil" then
+        printf("ZoneOnline: ZoneNet global not found! DLL hook failed or missing.")
+        return
+    end
+    
+    if not load_config() then
+        printf("ZoneOnline: Failed to load config.")
+        return
+    end
+    
+    local ip = config.server_ip or "127.0.0.1"
+    local port = config.server_port or 27015
+    local uuid = config.client_uuid or "default_uuid"
+    local hwid = config.hwid_hash or 123456789
+    local nick = config.nickname or "Stalker"
+    
+    printf("ZoneOnline: Connecting to %s:%d as %s...", ip, port, nick)
+    ZoneNet:Connect(ip, port, uuid, hwid, nick)
+    
+    -- Register callbacks
+    RegisterScriptCallback("actor_on_update", zone_net.on_tick)
+    RegisterScriptCallback("on_before_hit", zone_safezone.on_before_hit)
+    RegisterScriptCallback("on_key_press", zone_safezone.on_key_press)
+end
+
+function get_config()
+    return config
+end

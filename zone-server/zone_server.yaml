@@ -1,0 +1,7 @@
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+db_path: "zone_world.db"
+log_level: "info"
+emission_interval_min: 45
+admin_pipe: "\\\\.\\pipe\\zone_server_admin"

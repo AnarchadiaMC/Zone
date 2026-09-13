@@ -1,0 +1,107 @@
+-- zone_safezone.script
+-- Safe zone enforcement and combat protection for Zone Online.
+
+local in_safe_zone = false
+local safe_zone_id = ""
+
+--- Handles server packet PKT_SAFEZONE_STATE (opcode 0x0020).
+--- @param pkt string  raw network packet buffer
+--- @param offset number  1-based byte offset following 12-byte header
+function on_safezone_state(pkt, offset)
+    local locked, pos = zone_net.read_uint8(pkt, offset)
+    local zone_id_raw, _ = zone_net.read_string(pkt, pos, 16)
+    local zid = zone_id_raw:gsub("%z+", "")
+
+    local is_locked = (locked == 1)
+
+    if is_locked then
+        in_safe_zone = true
+        safe_zone_id = zid
+
+        -- Notify HUD module (displays PDA news tip and updates HUD indicator)
+        if zone_hud and zone_hud.notify_safezone then
+            zone_hud.notify_safezone(true)
+        end
+
+        -- Enforce safe zone restrictions on actor
+        if db.actor then
+            -- Holster active weapon
+            if db.actor.hide_weapon then
+                pcall(function() db.actor:hide_weapon() end)
+            end
+            if db.actor.set_actor_allow_address then
+                pcall(function() db.actor:set_actor_allow_address(false) end)
+            end
+        end
+    else
+        in_safe_zone = false
+        safe_zone_id = ""
+
+        -- Notify HUD module (displays PDA news tip and restores HUD indicator)
+        if zone_hud and zone_hud.notify_safezone then
+            zone_hud.notify_safezone(false)
+        end
+
+        -- Restore actor capabilities
+        if db.actor and db.actor.set_actor_allow_address then
+            pcall(function() db.actor:set_actor_allow_address(true) end)
+        end
+    end
+end
+
+--- Prevents all damage to the actor while inside a safe zone.
+function on_before_hit(npc, s_hit, bone_id)
+    if not db.actor then return end
+
+    -- Check if it is the local player taking damage inside a safe zone
+    if npc and npc:id() == db.actor:id() and in_safe_zone then
+        s_hit.power = 0
+        s_hit.ignore_flag = true
+    end
+end
+
+--- Intercepts weapon fire input inside safe zones.
+function on_key_press(key)
+    if not in_safe_zone or not db.actor then return end
+
+    if dik_to_bind and key_bindings then
+        local bind = dik_to_bind(key)
+        if bind == key_bindings.kFIRE or bind == key_bindings.kFIRE2 then
+            if db.actor.hide_weapon then
+                pcall(function() db.actor:hide_weapon() end)
+            end
+        end
+    end
+end
+
+--- Periodically ensures weapons stay holstered while in safe zone.
+local function on_actor_update()
+    if not in_safe_zone or not db.actor then return end
+
+    local active_item = db.actor:active_item()
+    if active_item and IsWeapon and IsWeapon(active_item) then
+        if db.actor.hide_weapon then
+            pcall(function() db.actor:hide_weapon() end)
+        end
+    end
+end
+
+--- Query if local player is currently within a safe zone.
+--- @return boolean
+function is_in_safe_zone()
+    return in_safe_zone
+end
+
+--- Query the ID of the current safe zone, if any.
+--- @return string
+function get_safe_zone_id()
+    return safe_zone_id
+end
+
+function on_game_start()
+    if RegisterScriptCallback then
+        RegisterScriptCallback("on_before_hit",  on_before_hit)
+        RegisterScriptCallback("on_key_press",   on_key_press)
+        RegisterScriptCallback("actor_on_update", on_actor_update)
+    end
+end

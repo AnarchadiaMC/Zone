@@ -1,0 +1,113 @@
+-- zone_menu_patch.script
+-- Injects a native "Zone Online" button into the Anomaly main menu.
+-- Hooks ui_main_menu.main_menu:InitControls and registers on_main_menu_on callback.
+
+local BUTTON_REG_NAME = "btn_zone_online"
+local BUTTON_TEXT     = "Zone Online"
+
+-- Track patched state to avoid duplicate buttons
+local _hook_installed = false
+
+-- ============================================================
+-- Button creator helper
+-- ============================================================
+local function attach_zone_button(menu_wnd)
+    if not menu_wnd then return end
+
+    -- Check if child already exists
+    local existing = menu_wnd[BUTTON_REG_NAME]
+    if existing then return end
+
+    -- Build CUI3tButton programmatically
+    local btn = CUI3tButton()
+    btn:SetAutoDelete(true)
+
+    -- Anomaly 1024x768 UI: position below standard menu items (y=548)
+    btn:SetWndRect(Frect():set(40, 548, 215, 578))
+
+    if GetFontLetterica18Russian then
+        btn:SetFont(GetFontLetterica18Russian())
+    elseif GetFontLetterica16Russian then
+        btn:SetFont(GetFontLetterica16Russian())
+    end
+
+    if btn.SetText then
+        pcall(function() btn:SetText(BUTTON_TEXT) end)
+    end
+    if btn.TextControl then
+        pcall(function() btn:TextControl():SetText(BUTTON_TEXT) end)
+    end
+
+    if GetARGB then
+        btn:SetTextColor(GetARGB(255, 100, 200, 255))
+    end
+
+    menu_wnd:AttachChild(btn)
+    menu_wnd:Register(btn, BUTTON_REG_NAME)
+    menu_wnd:AddCallback(
+        BUTTON_REG_NAME,
+        ui_events.BUTTON_CLICKED,
+        function()
+            if zone_ui_server_list and zone_ui_server_list.open_server_browser then
+                zone_ui_server_list.open_server_browser()
+            else
+                printf("ZoneOnline: zone_ui_server_list module not loaded!")
+            end
+        end,
+        menu_wnd
+    )
+
+    menu_wnd[BUTTON_REG_NAME] = btn
+    printf("ZoneOnline MenuPatch: 'Zone Online' button attached to main menu.")
+end
+
+-- ============================================================
+-- Hook ui_main_menu.main_menu:InitControls
+-- ============================================================
+local function hook_init_controls()
+    if _hook_installed then return true end
+
+    if not (ui_main_menu and ui_main_menu.main_menu) then
+        return false
+    end
+
+    local orig_InitControls = ui_main_menu.main_menu.InitControls
+    if not orig_InitControls then
+        return false
+    end
+
+    ui_main_menu.main_menu.InitControls = function(self_menu)
+        orig_InitControls(self_menu)
+        attach_zone_button(self_menu)
+    end
+
+    _hook_installed = true
+    printf("ZoneOnline MenuPatch: Hooked ui_main_menu.main_menu:InitControls successfully.")
+    return true
+end
+
+-- ============================================================
+-- on_main_menu_on fallback callback
+-- ============================================================
+local function on_main_menu_on(menu_obj)
+    -- Ensure the hook is in place
+    hook_init_controls()
+
+    -- Also directly attach to the passed instance if available
+    if menu_obj then
+        attach_zone_button(menu_obj)
+    end
+end
+
+-- ============================================================
+-- on_game_start — Anomaly script entrypoint
+-- ============================================================
+function on_game_start()
+    -- Attempt immediate hook
+    hook_init_controls()
+
+    -- Always register callback as a guarantee across all game states
+    if RegisterScriptCallback then
+        RegisterScriptCallback("on_main_menu_on", on_main_menu_on)
+    end
+end

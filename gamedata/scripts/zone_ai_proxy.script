@@ -1,0 +1,85 @@
+-- zone_ai_proxy.script
+-- Server-authoritative AI puppet rendering
+
+local ai_entities = {}
+
+function on_entity_enter(pkt, offset)
+    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    local typ, pos = zone_net.read_uint8(pkt, pos)
+    local section, pos = zone_net.read_string(pkt, pos, 32)
+    section = section:gsub("%z+", "")
+    
+    local x, pos = zone_net.read_float_le(pkt, pos)
+    local y, pos = zone_net.read_float_le(pkt, pos)
+    local z, pos = zone_net.read_float_le(pkt, pos)
+    
+    local faction, pos = zone_net.read_string(pkt, pos, 16)
+    faction = faction:gsub("%z+", "")
+    local health, pos = zone_net.read_uint8(pkt, pos)
+    
+    if typ == 2 or typ == 3 then -- NPC or Mutant
+        local lvid = db.actor and db.actor:level_vertex_id() or 0
+        local gvid = db.actor and db.actor:game_vertex_id() or 0
+        
+        local se_obj = alife():create(section, vector():set(x,y,z), lvid, gvid)
+        if se_obj then
+            se_obj.is_zone_ai_proxy = true
+            ai_entities[eid] = {
+                se_id = se_obj.id,
+                section = section,
+                pos = vector():set(x,y,z),
+                faction = faction,
+                action = 0,
+                target_id = 0
+            }
+        end
+    end
+end
+
+function on_ai_action(pkt, offset)
+    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    local action, pos = zone_net.read_uint8(pkt, pos)
+    local target_id, pos = zone_net.read_uint32_le(pkt, pos)
+    
+    local entity = ai_entities[eid]
+    if not entity then return end
+    
+    entity.action = action
+    entity.target_id = target_id
+    
+    local obj = level.object_by_id(entity.se_id)
+    if obj then
+        if action == 4 then -- DEATH
+            if obj:alive() then
+                obj:kill(obj)
+            end
+            -- Delay release
+            local function release_corpse()
+                local se = alife():object(entity.se_id)
+                if se then alife():release(se, true) end
+                ai_entities[eid] = nil
+                return true
+            end
+            level.add_call(function() return time_global() > time_global() + 5000 end, release_corpse)
+        elseif action == 2 then -- ATTACK
+            -- Face target if known
+            -- Target facing logic requires target position, we simplify by facing actor if target is actor
+            if target_id == 0 or target_id == db.actor:id() then
+                local dir = db.actor:position():sub(obj:position()):normalize()
+                obj:set_desired_direction(dir)
+            end
+        end
+    end
+end
+
+function on_entity_leave(pkt, offset)
+    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    local entity = ai_entities[eid]
+    if entity then
+        local se = alife():object(entity.se_id)
+        if se then
+            alife():release(se, true)
+        end
+        ai_entities[eid] = nil
+    end
+end

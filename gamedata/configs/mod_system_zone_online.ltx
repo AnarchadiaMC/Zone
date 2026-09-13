@@ -1,0 +1,22 @@
+; Zone Online DLTX Patch — auto-merged into system.ltx by Anomaly Modded EXEs
+[zone_proxy_stalker]:sim_default_stalker
+$spawn = "respawn\zone_proxy_stalker"
+species = stalker
+community = stalker
+character_name = none
+clan = stalker
+initial_reputation = 400
+use_simplified_phys_while_not_active = true
+
+; Disable NPC-driven combat AI; movement and posture are driven by zone_dummy.script.
+can_select_items = false
+take_items = false
+max_item_mass = 0
+
+; Minimal health so damage packets can kill the proxy body cleanly.
+health = 1.0
+min_wound_size = 0.0
+
+; Prevent the proxy from wandering between waypoints or panicking on its own.
+no_move_in_panic = true
+panic_threshold = 0.0

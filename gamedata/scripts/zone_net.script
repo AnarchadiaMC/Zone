@@ -1,0 +1,124 @@
+-- zone_net.script
+-- Network dispatcher and transform sync
+
+local ffi = require("ffi")
+
+local last_tick = 0
+local TICK_RATE_MS = 33 -- ~30Hz
+local last_pos = nil
+
+function read_uint8(pkt, pos)
+    return string.byte(pkt, pos), pos + 1
+end
+
+function read_uint16_le(pkt, pos)
+    local b1, b2 = string.byte(pkt, pos, pos + 1)
+    return b1 + (b2 * 256), pos + 2
+end
+
+function read_uint32_le(pkt, pos)
+    local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
+    return b1 + (b2 * 256) + (b3 * 65536) + (b4 * 16777216), pos + 4
+end
+
+ffi.cdef[[
+    typedef union { float f; uint8_t b[4]; } znet_float_cast;
+]]
+
+function read_float_le(pkt, pos)
+    local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
+    local cast = ffi.new("znet_float_cast")
+    cast.b[0] = b1; cast.b[1] = b2; cast.b[2] = b3; cast.b[3] = b4;
+    return cast.f, pos + 4
+end
+
+function read_string(pkt, pos, len)
+    return string.sub(pkt, pos, pos + len - 1), pos + len
+end
+
+function dispatch_packet(pkt)
+    if not pkt or string.len(pkt) < 12 then return end
+    
+    -- Parse Header (12 bytes)
+    -- 2(magic) + 1(proto) + 1(flags) + 4(seq) + 2(opcode) + 2(paylen)
+    local magic, pos = read_uint16_le(pkt, 1)
+    local proto, pos = read_uint8(pkt, pos)
+    local flags, pos = read_uint8(pkt, pos)
+    local seq, pos = read_uint32_le(pkt, pos)
+    local opcode, pos = read_uint16_le(pkt, pos)
+    local paylen, pos = read_uint16_le(pkt, pos)
+    
+    local offset = 13 -- 1-based index after 12 bytes
+    
+    if opcode == 0x0011 then
+        zone_dummy.on_snapshot(pkt, offset)
+    elseif opcode == 0x0012 then
+        zone_dummy.on_entity_enter(pkt, offset)
+    elseif opcode == 0x0013 then
+        zone_dummy.on_entity_leave(pkt, offset)
+    elseif opcode == 0x0020 then
+        zone_safezone.on_safezone_state(pkt, offset)
+    elseif opcode == 0x0030 then
+        zone_worldevent.on_world_event(pkt, offset)
+    elseif opcode == 0x0050 then
+        -- Handle damage notification (TODO)
+    elseif opcode == 0x0060 then
+        -- Chat text
+        local txt, _ = read_string(pkt, offset, paylen)
+        if db.actor then
+            db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
+        end
+    elseif opcode == 0x0070 then
+        zone_ai_proxy.on_ai_action(pkt, offset)
+    end
+end
+
+function on_tick()
+    local tg = time_global()
+    
+    -- Let dummy system interpolate every frame
+    zone_dummy.interpolate_proxies()
+    
+    if tg - last_tick < TICK_RATE_MS then
+        return
+    end
+    local dt = (tg - last_tick) / 1000.0
+    last_tick = tg
+    
+    if type(ZoneNet) == "nil" or not ZoneNet:IsConnected() then
+        return
+    end
+    
+    if db.actor then
+        local pos = db.actor:position()
+        local dir = db.actor:direction()
+        
+        local vx, vy, vz = 0, 0, 0
+        if last_pos and dt > 0 then
+            vx = (pos.x - last_pos.x) / dt
+            vy = (pos.y - last_pos.y) / dt
+            vz = (pos.z - last_pos.z) / dt
+        end
+        last_pos = vector():set(pos)
+        
+        local yaw = math.atan2(dir.x, dir.z)
+        local pitch = math.asin(dir.y)
+        
+        local animflags = 0
+        if IsMoveState("mcCrouch") then animflags = bit.bor(animflags, 1) end
+        if IsMoveState("mcSprint") then animflags = bit.bor(animflags, 2) end
+        -- Basic aiming detection:
+        if db.actor:active_item() and db.actor:is_zoom_aiming_mode() then
+            animflags = bit.bor(animflags, 4)
+        end
+        
+        ZoneNet:SendTransform(pos.x, pos.y, pos.z, yaw, pitch, vx, vy, vz, animflags)
+    end
+    
+    -- Poll all pending events
+    while true do
+        local pkt = ZoneNet:PollEvent()
+        if not pkt then break end
+        dispatch_packet(pkt)
+    end
+end

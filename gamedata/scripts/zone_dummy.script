@@ -1,0 +1,186 @@
+-- zone_dummy.script
+-- Proxy stalker system with Hermite Spline Interpolation
+
+local spawned_proxies = {}
+local MAX_HISTORY = 8
+local JITTER_BUFFER_MS = 100
+
+function spawn_proxy(session_id, pos, faction)
+    if spawned_proxies[session_id] then return end
+    
+    local section = "sim_default_" .. (faction or "stalker")
+    -- Fallback to standard stalker if generic section doesn't exist (relies on zone_proxy_stalker in system.ltx ideally)
+    if not ini_sys:section_exist(section) then
+        section = "sim_default_stalker"
+    end
+    
+    local lvid = db.actor and db.actor:level_vertex_id() or 0
+    local gvid = db.actor and db.actor:game_vertex_id() or 0
+    
+    local se_obj = alife():create(section, pos, lvid, gvid)
+    if se_obj then
+        -- Tag for death manager bypass (needs integration in death_manager.script)
+        se_obj.is_zone_proxy = true
+        
+        spawned_proxies[session_id] = {
+            se_id = se_obj.id,
+            game_id = nil,
+            pos_history = {},
+            last_update = time_global()
+        }
+    end
+end
+
+function despawn_proxy(session_id)
+    local proxy = spawned_proxies[session_id]
+    if proxy then
+        local se_obj = alife():object(proxy.se_id)
+        if se_obj then
+            alife():release(se_obj, true)
+        end
+        spawned_proxies[session_id] = nil
+    end
+end
+
+function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
+    local proxy = spawned_proxies[session_id]
+    if not proxy then return end
+    
+    table.insert(proxy.pos_history, {
+        x = x, y = y, z = z, yaw = yaw, health = health, t = time_global()
+    })
+    
+    while #proxy.pos_history > MAX_HISTORY do
+        table.remove(proxy.pos_history, 1)
+    end
+    
+    proxy.last_update = time_global()
+    
+    -- Resolve game_id once online
+    if not proxy.game_id then
+        local obj = level.object_by_id(proxy.se_id)
+        if obj then proxy.game_id = proxy.se_id end
+    end
+    
+    -- Apply anim flags / health if game object exists
+    local obj = proxy.game_id and level.object_by_id(proxy.game_id) or nil
+    if obj then
+        if health <= 0 and obj:alive() then
+            obj:kill(obj)
+        end
+        -- We could force set movement here if needed, but we focus on interpolation.
+    end
+end
+
+-- Hermite spline interpolation for smooth proxy movement
+function interpolate_proxies()
+    local tg = time_global()
+    local target_t = tg - JITTER_BUFFER_MS
+    
+    for sid, proxy in pairs(spawned_proxies) do
+        local hist = proxy.pos_history
+        if #hist >= 4 then
+            -- Find the interval
+            local idx = 1
+            for i = 1, #hist - 1 do
+                if hist[i].t <= target_t and hist[i+1].t >= target_t then
+                    idx = i
+                    break
+                end
+            end
+            
+            -- Need 4 points for Hermite: idx-1, idx, idx+1, idx+2
+            if idx > 1 and idx < #hist - 1 then
+                local p0 = hist[idx-1]
+                local p1 = hist[idx]
+                local p2 = hist[idx+1]
+                local p3 = hist[idx+2]
+                
+                local dt = p2.t - p1.t
+                local t = (dt > 0) and ((target_t - p1.t) / dt) or 0
+                t = math.max(0, math.min(1, t))
+                
+                -- Tangents
+                local m1x = 0.5 * (p2.x - p0.x); local m1y = 0.5 * (p2.y - p0.y); local m1z = 0.5 * (p2.z - p0.z)
+                local m2x = 0.5 * (p3.x - p1.x); local m2y = 0.5 * (p3.y - p1.y); local m2z = 0.5 * (p3.z - p1.z)
+                
+                -- Basis functions
+                local h00 = (2*t^3 - 3*t^2 + 1)
+                local h10 = (t^3 - 2*t^2 + t)
+                local h01 = (-2*t^3 + 3*t^2)
+                local h11 = (t^3 - t^2)
+                
+                local ix = h00*p1.x + h10*m1x + h01*p2.x + h11*m2x
+                local iy = h00*p1.y + h10*m1y + h01*p2.y + h11*m2y
+                local iz = h00*p1.z + h10*m1z + h01*p2.z + h11*m2z
+                
+                if proxy.game_id then
+                    local obj = level.object_by_id(proxy.game_id)
+                    if obj and obj:alive() then
+                        obj:set_npc_position(vector():set(ix, iy, iz))
+                    end
+                end
+            end
+        end
+    end
+end
+
+function on_snapshot(pkt, offset)
+    local count, pos = zone_net.read_uint8(pkt, offset)
+    for i = 1, count do
+        local sid, pos2 = zone_net.read_uint32_le(pkt, pos)
+        local x, pos3 = zone_net.read_float_le(pkt, pos2)
+        local y, pos4 = zone_net.read_float_le(pkt, pos3)
+        local z, pos5 = zone_net.read_float_le(pkt, pos4)
+        local yaw, pos6 = zone_net.read_uint16_le(pkt, pos5)
+        local pitch, pos7 = zone_net.read_uint16_le(pkt, pos6)
+        local animflags, pos8 = zone_net.read_uint8(pkt, pos7)
+        local health, pos9 = zone_net.read_uint8(pkt, pos8)
+        pos = pos9
+        
+        -- Convert pseudo-floats
+        if yaw > 32767 then yaw = yaw - 65536 end
+        if pitch > 32767 then pitch = pitch - 65536 end
+        
+        -- If not spawned (maybe missed ENTER), we could spawn, but faction is missing. We skip or spawn generic.
+        if not spawned_proxies[sid] then
+            spawn_proxy(sid, vector():set(x,y,z), "stalker")
+        end
+        update_proxy(sid, x, y, z, yaw / 100.0, pitch / 100.0, animflags, health)
+    end
+end
+
+function on_entity_enter(pkt, offset)
+    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    local typ, pos = zone_net.read_uint8(pkt, pos)
+    local section, pos = zone_net.read_string(pkt, pos, 32)
+    -- clean null bytes from section
+    section = section:gsub("%z+", "")
+    
+    local x, pos = zone_net.read_float_le(pkt, pos)
+    local y, pos = zone_net.read_float_le(pkt, pos)
+    local z, pos = zone_net.read_float_le(pkt, pos)
+    
+    local faction, pos = zone_net.read_string(pkt, pos, 16)
+    faction = faction:gsub("%z+", "")
+    local health, pos = zone_net.read_uint8(pkt, pos)
+    
+    if typ == 1 then -- Player
+        spawn_proxy(eid, vector():set(x,y,z), faction)
+    end
+end
+
+function on_entity_leave(pkt, offset)
+    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    despawn_proxy(eid)
+end
+
+function on_level_changing()
+    for sid, _ in pairs(spawned_proxies) do
+        despawn_proxy(sid)
+    end
+end
+
+function on_game_start()
+    RegisterScriptCallback("actor_on_level_changing", on_level_changing)
+end

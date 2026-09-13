@@ -1,0 +1,215 @@
+-- zone_hud.script
+-- Native in-game HUD indicator and status notifications for Zone Online.
+-- Displays real-time connection status and ping overlay, and issues PDA news tips.
+
+local last_update_time = 0
+local UPDATE_INTERVAL_MS = 1000 -- 1 Hz HUD status polling
+
+local last_connected   = nil    -- nil (uninitialized), true, false
+local last_ping        = -1
+local safe_zone_active = false
+
+-- Persistent HUD static widget
+local hud_static       = nil
+
+-- Color definitions (ARGB)
+local COLOR_CONNECTED    = (GetARGB and GetARGB(220, 80,  220, 80))  or 0xDC50DC50 -- Green
+local COLOR_SAFEZONE     = (GetARGB and GetARGB(220, 80,  160, 255)) or 0xDC50A0FF -- Blue
+local COLOR_DISCONNECTED = (GetARGB and GetARGB(220, 220, 80,  80))  or 0xDCDC5050 -- Red
+local COLOR_DLL_MISSING  = (GetARGB and GetARGB(220, 180, 180, 180)) or 0xDCB4B4B4 -- Grey
+
+-- ============================================================
+-- Status Helpers
+-- ============================================================
+
+local function is_dll_loaded()
+    return type(ZoneNet) == "table" or type(ZoneNet) == "userdata"
+end
+
+local function get_status_data()
+    if not is_dll_loaded() then
+        return false, 0, 0, "[ZO] DLL Offline", COLOR_DLL_MISSING
+    end
+
+    local connected = false
+    local ok, res = pcall(function() return ZoneNet:IsConnected() end)
+    if ok and res then connected = true end
+
+    if connected then
+        local sid, ping = 0, 0
+        local ok_info, s, p = pcall(function() return ZoneNet:GetSessionInfo() end)
+        if ok_info then
+            sid = s or 0
+            ping = p or 0
+        end
+
+        local text, color
+        if safe_zone_active then
+            text = string.format("[ZO] Safe Zone | Ping: %d ms", ping)
+            color = COLOR_SAFEZONE
+        else
+            text = string.format("[ZO] Online | Ping: %d ms", ping)
+            color = COLOR_CONNECTED
+        end
+        return true, sid, ping, text, color
+    end
+
+    return false, 0, 0, "[ZO] Offline", COLOR_DISCONNECTED
+end
+
+-- ============================================================
+-- HUD Static Widget Management
+-- ============================================================
+
+local function get_or_create_static()
+    local hud_mgr = get_hud and get_hud()
+    if not hud_mgr then return nil end
+
+    local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+    if not ui then return nil end
+
+    if hud_static and hud_static:IsShown() ~= nil then
+        return hud_static
+    end
+
+    local s = CUIStatic()
+    s:SetAutoDelete(true)
+    -- Top-right HUD position in 1024x768 / widescreen coordinates
+    s:SetWndRect(Frect():set(800, 8, 1016, 30))
+
+    if GetFontLetterica16Russian then
+        s:SetFont(GetFontLetterica16Russian())
+    end
+
+    s:SetTextColor(COLOR_CONNECTED)
+    s:SetText("")
+    s:Show(true)
+
+    ui:AttachChild(s)
+    hud_static = s
+    return hud_static
+end
+
+local function update_hud_display(text, color)
+    local s = get_or_create_static()
+    if not s then return end
+
+    if s.SetText then
+        pcall(function() s:SetText(text) end)
+    end
+    if s.TextControl then
+        pcall(function() s:TextControl():SetText(text) end)
+    end
+    if s.SetTextColor then
+        pcall(function() s:SetTextColor(color) end)
+    end
+    s:Show(true)
+end
+
+-- ============================================================
+-- actor_on_update Handler
+-- ============================================================
+
+local function on_actor_update()
+    if not db.actor then return end
+
+    local tg = time_global()
+    if tg - last_update_time < UPDATE_INTERVAL_MS then return end
+    last_update_time = tg
+
+    local connected, sid, ping, status_text, status_color = get_status_data()
+
+    -- Update corner HUD text overlay
+    update_hud_display(status_text, status_color)
+
+    -- Connection transition notifications
+    if is_dll_loaded() then
+        if connected and last_connected ~= true then
+            last_connected = true
+            db.actor:give_game_news(
+                "Zone Online",
+                string.format("Connected to session #%s | Ping: %d ms", tostring(sid), ping),
+                "ui_inGame2_PDA_icon",
+                0, 5000, 1
+            )
+        elseif not connected and last_connected == true then
+            last_connected = false
+            db.actor:give_game_news(
+                "Zone Online",
+                "Disconnected from server.",
+                "ui_inGame2_PDA_icon",
+                0, 5000, 1
+            )
+        end
+    else
+        last_connected = false
+    end
+end
+
+-- ============================================================
+-- Safe Zone Notifications API
+-- ============================================================
+
+--- Called when safe zone state changes (e.g. from zone_safezone.script).
+--- @param locked boolean  true = entered safe zone, false = left safe zone
+function notify_safezone(locked)
+    local is_locked = (locked == true or locked == 1)
+
+    if is_locked and not safe_zone_active then
+        safe_zone_active = true
+        if db.actor then
+            db.actor:give_game_news(
+                "Zone Online",
+                "[Safe Zone] Weapons locked — peaceful territory",
+                "ui_inGame2_PDA_icon",
+                0, 5000, 1
+            )
+        end
+        local _, _, _, text, color = get_status_data()
+        update_hud_display(text, color)
+
+    elseif not is_locked and safe_zone_active then
+        safe_zone_active = false
+        if db.actor then
+            db.actor:give_game_news(
+                "Zone Online",
+                "[Safe Zone] You have left the safe zone",
+                "ui_inGame2_PDA_icon",
+                0, 3000, 1
+            )
+        end
+        local _, _, _, text, color = get_status_data()
+        update_hud_display(text, color)
+    end
+end
+
+-- ============================================================
+-- Cleanup on Level Transition / Actor Destroy
+-- ============================================================
+
+local function on_actor_destroy()
+    if hud_static then
+        local hud_mgr = get_hud and get_hud()
+        if hud_mgr then
+            local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+            if ui and ui.DetachChild then
+                pcall(function() ui:DetachChild(hud_static) end)
+            end
+        end
+        hud_static       = nil
+        last_update_time = 0
+        last_connected   = nil
+        safe_zone_active = false
+    end
+end
+
+-- ============================================================
+-- on_game_start
+-- ============================================================
+
+function on_game_start()
+    if RegisterScriptCallback then
+        RegisterScriptCallback("actor_on_update",      on_actor_update)
+        RegisterScriptCallback("actor_on_net_destroy", on_actor_destroy)
+    end
+end

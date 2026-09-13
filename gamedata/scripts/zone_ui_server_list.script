@@ -1,0 +1,506 @@
+-- zone_ui_server_list.script
+-- Native S.T.A.L.K.E.R. Anomaly Server Browser Dialog
+-- Implements CUIScriptWnd-based server browser with favorites persistence in %APPDATA%\zone_identity.ltx.
+
+if not ui_events then ui_events = {} end
+
+local DIALOG_XML    = "zone_ui_server_list.xml"
+local APPDATA_DIR   = os.getenv("APPDATA") or ""
+local APPDATA_LTX   = APPDATA_DIR .. "\\zone_identity.ltx"
+local HISTORY_SEC   = "server_history"
+local IDENTITY_SEC  = "identity"
+local MAX_FAVORITES = 16
+
+-- Singleton dialog instance
+local _server_browser_dlg = nil
+
+-- Helper to safely call init methods across CScriptXmlInit / CUIXml variations
+local function safe_init(xml, method, path, arg2, arg3)
+    if not xml or not xml[method] then return nil end
+    local ok, res
+    if arg3 ~= nil then
+        ok, res = pcall(function() return xml[method](xml, path, arg2, arg3) end)
+        if ok and res then return res end
+    end
+    if arg2 ~= nil then
+        ok, res = pcall(function() return xml[method](xml, path, arg2) end)
+        if ok and res then return res end
+    end
+    ok, res = pcall(function() return xml[method](xml, path) end)
+    if ok and res then return res end
+    return nil
+end
+
+-- ============================================================
+-- class UIZoneServerList (CUIScriptWnd)
+-- ============================================================
+class "UIZoneServerList" (CUIScriptWnd)
+
+function UIZoneServerList:__init()
+    CUIScriptWnd.__init(self)
+    self.favorites = {}   -- list of { label = string, ip = string, port = number, status = string }
+    self.sel_idx   = nil  -- currently selected 0-based list index
+    self.uuid      = "anonymous"
+    self.hwid      = 0
+    self.nick      = "Stalker"
+end
+
+function UIZoneServerList:__finalize()
+    _server_browser_dlg = nil
+end
+
+-- ------------------------------------------------------------
+-- InitControls — loads XML layout and initializes widgets
+-- ------------------------------------------------------------
+function UIZoneServerList:InitControls()
+    self:SetAutoDelete(true)
+
+    local xml = (CScriptXmlInit and CScriptXmlInit()) or (CUIXml and CUIXml())
+    if not xml then
+        printf("ZoneOnline UI Error: Neither CScriptXmlInit nor CUIXml is available!")
+        return
+    end
+
+    if xml.ParseFile then
+        xml:ParseFile(DIALOG_XML)
+    elseif xml.Load then
+        xml:Load("config\\ui\\", DIALOG_XML)
+    end
+
+    -- Background frame
+    safe_init(xml, "InitWindow", "background", 0, self)
+
+    -- Column header statics (optional decorative labels from XML)
+    safe_init(xml, "InitStatic", "cap_col_name", self)
+    safe_init(xml, "InitStatic", "cap_col_host", self)
+    safe_init(xml, "InitStatic", "cap_col_port", self)
+    safe_init(xml, "InitStatic", "cap_col_status", self)
+    safe_init(xml, "InitStatic", "cap_direct_connect", self)
+    safe_init(xml, "InitStatic", "cap_ip", self)
+    safe_init(xml, "InitStatic", "cap_port", self)
+    safe_init(xml, "InitStatic", "cap_nick", self)
+
+    -- Server list box (try server_list, then nested variants)
+    self.list_servers = safe_init(xml, "InitListBox", "server_list", self)
+        or safe_init(xml, "InitListBox", "server_list_frame:server_list", self)
+        or safe_init(xml, "InitListBox", "server_list_frame:list", self)
+
+    if self.list_servers then
+        self:Register(self.list_servers, "server_list")
+    else
+        printf("ZoneOnline UI Warning: server_list listbox could not be initialized!")
+    end
+
+    -- Direct connect input boxes
+    self.edit_ip = safe_init(xml, "InitEditBox", "edit_ip", self)
+        or safe_init(xml, "InitEditBox", "ip_edit", self)
+
+    self.edit_port = safe_init(xml, "InitEditBox", "edit_port", self)
+        or safe_init(xml, "InitEditBox", "port_edit", self)
+
+    self.edit_nick = safe_init(xml, "InitEditBox", "edit_nick", self)
+        or safe_init(xml, "InitEditBox", "nick_edit", self)
+
+    if self.edit_ip then self:Register(self.edit_ip, "edit_ip") end
+    if self.edit_port then self:Register(self.edit_port, "edit_port") end
+    if self.edit_nick then self:Register(self.edit_nick, "edit_nick") end
+
+    -- Action buttons
+    self.btn_connect = safe_init(xml, "Init3tButton", "btn_connect", self)
+    self.btn_add_fav = safe_init(xml, "Init3tButton", "btn_add_fav", self)
+    self.btn_del_fav = safe_init(xml, "Init3tButton", "btn_del_fav", self)
+    self.btn_back    = safe_init(xml, "Init3tButton", "btn_back", self)
+
+    if self.btn_connect then self:Register(self.btn_connect, "btn_connect") end
+    if self.btn_add_fav then self:Register(self.btn_add_fav, "btn_add_fav") end
+    if self.btn_del_fav then self:Register(self.btn_del_fav, "btn_del_fav") end
+    if self.btn_back then    self:Register(self.btn_back,    "btn_back") end
+
+    -- Load saved servers and nickname
+    self:LoadFavorites()
+end
+
+-- ------------------------------------------------------------
+-- InitCallBacks — binds UI events to handlers
+-- ------------------------------------------------------------
+function UIZoneServerList:InitCallBacks()
+    if self.btn_connect then
+        self:AddCallback("btn_connect", ui_events.BUTTON_CLICKED, self.OnConnect, self)
+    end
+    if self.btn_add_fav then
+        self:AddCallback("btn_add_fav", ui_events.BUTTON_CLICKED, self.OnAddFavorite, self)
+    end
+    if self.btn_del_fav then
+        self:AddCallback("btn_del_fav", ui_events.BUTTON_CLICKED, self.OnDelFavorite, self)
+    end
+    if self.btn_back then
+        self:AddCallback("btn_back", ui_events.BUTTON_CLICKED, self.OnBack, self)
+    end
+
+    if self.list_servers then
+        self:AddCallback("server_list", ui_events.LIST_ITEM_CLICKED, self.OnListSelect, self)
+        if ui_events.WINDOW_LBUTTON_DB_CLICK then
+            self:AddCallback("server_list", ui_events.WINDOW_LBUTTON_DB_CLICK, self.OnConnect, self)
+        end
+    end
+end
+
+-- ============================================================
+-- Favorites persistence (%APPDATA%\zone_identity.ltx)
+-- ============================================================
+
+local function parse_history_entry(raw)
+    if not raw then return nil end
+    local label, rest = raw:match("^([^|]+)|(.+)$")
+    if not label then
+        label = raw
+        rest = raw
+    end
+    local ip, port = rest:match("^([^:]+):(%d+)$")
+    if not ip or not port then return nil end
+    return {
+        label  = label:match("^%s*(.-)%s*$"),
+        ip     = ip:match("^%s*(.-)%s*$"),
+        port   = tonumber(port),
+        status = "Saved"
+    }
+end
+
+function UIZoneServerList:LoadFavorites()
+    self.favorites = {}
+
+    local file = io.open(APPDATA_LTX, "r")
+    if file then
+        local current_section = ""
+        for line in file:lines() do
+            local sec = line:match("^%s*%[([^%]]+)%]")
+            if sec then
+                current_section = sec:lower()
+            else
+                local k, v = line:match("^%s*([%w_]+)%s*=%s*(.+)%s*$")
+                if k and v then
+                    k = k:lower()
+                    v = v:match("^%s*(.-)%s*$")
+                    if current_section == HISTORY_SEC:lower() then
+                        local entry = parse_history_entry(v)
+                        if entry and #self.favorites < MAX_FAVORITES then
+                            self.favorites[#self.favorites + 1] = entry
+                        end
+                    elseif current_section == IDENTITY_SEC:lower() or current_section == "" then
+                        if k == "nickname" then
+                            self.nick = v
+                        elseif k == "uuid" or k == "client_uuid" then
+                            self.uuid = v
+                        elseif k == "hwid" or k == "hwid_hash" then
+                            self.hwid = tonumber(v) or self.hwid
+                        end
+                    end
+                end
+            end
+        end
+        file:close()
+    end
+
+    -- Pull config from zone_main if identity ltx had incomplete fields
+    if zone_main and zone_main.get_config then
+        local cfg = zone_main.get_config()
+        if cfg.client_uuid and self.uuid == "anonymous" then self.uuid = cfg.client_uuid end
+        if cfg.hwid_hash and self.hwid == 0 then self.hwid = cfg.hwid_hash end
+        if cfg.nickname and self.nick == "Stalker" then self.nick = cfg.nickname end
+    end
+
+    -- Seed default localhost server if no favorites exist
+    if #self.favorites == 0 then
+        self.favorites[1] = {
+            label  = "Local Dev Server",
+            ip     = "127.0.0.1",
+            port   = 3000,
+            status = "Ready"
+        }
+    end
+
+    -- Populate UI input fields
+    if self.edit_nick then
+        self.edit_nick:SetText(self.nick)
+    end
+    if self.edit_ip and self.favorites[1] then
+        self.edit_ip:SetText(self.favorites[1].ip)
+    end
+    if self.edit_port and self.favorites[1] then
+        self.edit_port:SetText(tostring(self.favorites[1].port))
+    end
+
+    self:RefreshList()
+end
+
+function UIZoneServerList:RefreshList()
+    if not self.list_servers then return end
+    self.list_servers:RemoveAll()
+
+    for i, entry in ipairs(self.favorites) do
+        -- Format for column headers: Server Name (22ch), Host (16ch), Port (6ch), Status (8ch)
+        local display = string.format("%-22s  %-15s  %-6d  %s",
+            entry.label or "Server",
+            entry.ip,
+            entry.port,
+            entry.status or "Saved"
+        )
+        self.list_servers:AddTextItem(display)
+    end
+    self.sel_idx = nil
+end
+
+function UIZoneServerList:SaveFavorites()
+    local lines = {}
+    local in_history = false
+    local history_written = false
+
+    local file = io.open(APPDATA_LTX, "r")
+    if file then
+        for line in file:lines() do
+            local sec = line:match("^%s*%[([^%]]+)%]")
+            if sec then
+                if in_history and not history_written then
+                    self:_emit_history_block(lines)
+                    history_written = true
+                end
+                in_history = (sec:lower() == HISTORY_SEC:lower())
+                if not in_history then
+                    lines[#lines + 1] = line
+                end
+            elseif not in_history then
+                -- Update nickname line in identity if modified
+                local k = line:match("^%s*([%w_]+)%s*=")
+                if k and k:lower() == "nickname" and self.nick then
+                    lines[#lines + 1] = "nickname=" .. self.nick
+                else
+                    lines[#lines + 1] = line
+                end
+            end
+        end
+        file:close()
+    end
+
+    if not history_written then
+        self:_emit_history_block(lines)
+    end
+
+    local out = io.open(APPDATA_LTX, "w")
+    if out then
+        for _, l in ipairs(lines) do
+            out:write(l .. "\n")
+        end
+        out:close()
+    end
+end
+
+function UIZoneServerList:_emit_history_block(lines)
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "[" .. HISTORY_SEC .. "]"
+    for i, entry in ipairs(self.favorites) do
+        lines[#lines + 1] = string.format(
+            "entry_%d = %s|%s:%d",
+            i - 1,
+            entry.label or (entry.ip .. ":" .. entry.port),
+            entry.ip,
+            entry.port
+        )
+    end
+end
+
+-- ============================================================
+-- Event Handlers
+-- ============================================================
+
+function UIZoneServerList:OnConnect()
+    local ip   = self.edit_ip   and self.edit_ip:GetText()   or ""
+    local port = self.edit_port and self.edit_port:GetText() or ""
+    local nick = self.edit_nick and self.edit_nick:GetText() or ""
+
+    ip   = ip:match("^%s*(.-)%s*$") or ""
+    port = port:match("^%s*(.-)%s*$") or ""
+    nick = nick:match("^%s*(.-)%s*$") or ""
+
+    if ip == "" then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "ERROR: Server IP address is required.", "ui_inGame2_PDA_icon", 0, 4000, 1)
+        end
+        printf("ZoneOnline: Cannot connect — empty server IP")
+        return
+    end
+
+    local port_n = tonumber(port)
+    if not port_n or port_n < 1 or port_n > 65535 then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "ERROR: Invalid port number (1 - 65535).", "ui_inGame2_PDA_icon", 0, 4000, 1)
+        end
+        printf("ZoneOnline: Cannot connect — invalid port '%s'", tostring(port))
+        return
+    end
+
+    if nick == "" then nick = "Stalker" end
+    self.nick = nick
+
+    if type(ZoneNet) == "nil" then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "ERROR: ZoneNet native DLL is not loaded.", "ui_inGame2_PDA_icon", 0, 5000, 1)
+        end
+        printf("ZoneOnline: ZoneNet DLL missing, cannot connect.")
+        return
+    end
+
+    printf("ZoneOnline UI: Connecting to %s:%d as '%s' (UUID: %s, HWID: %s)...", ip, port_n, nick, self.uuid, tostring(self.hwid))
+    ZoneNet:Connect(ip, port_n, self.uuid, self.hwid, nick)
+
+    -- Confirmation news tip
+    if db.actor then
+        db.actor:give_game_news(
+            "Zone Online",
+            string.format("Connecting to %s:%d as '%s'...", ip, port_n, nick),
+            "ui_inGame2_PDA_icon", 0, 5000, 1
+        )
+    end
+
+    -- Auto-save to favorites/history
+    local found = false
+    for _, e in ipairs(self.favorites) do
+        if e.ip == ip and e.port == port_n then
+            found = true
+            break
+        end
+    end
+    if not found and #self.favorites < MAX_FAVORITES then
+        self.favorites[#self.favorites + 1] = {
+            label  = string.format("%s:%d", ip, port_n),
+            ip     = ip,
+            port   = port_n,
+            status = "Recent"
+        }
+    end
+    self:SaveFavorites()
+
+    -- Close dialog
+    self:OnBack()
+end
+
+function UIZoneServerList:OnAddFavorite()
+    local ip   = self.edit_ip   and self.edit_ip:GetText()   or ""
+    local port = self.edit_port and self.edit_port:GetText() or ""
+
+    ip   = ip:match("^%s*(.-)%s*$") or ""
+    port = port:match("^%s*(.-)%s*$") or ""
+
+    if ip == "" or port == "" then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "Please enter both IP and Port before adding.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+        end
+        return
+    end
+
+    local port_n = tonumber(port)
+    if not port_n or port_n < 1 or port_n > 65535 then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "ERROR: Invalid port number.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+        end
+        return
+    end
+
+    for _, e in ipairs(self.favorites) do
+        if e.ip == ip and e.port == port_n then
+            if db.actor then
+                db.actor:give_game_news("Zone Online", "Server is already in favorites list.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+            end
+            return
+        end
+    end
+
+    if #self.favorites >= MAX_FAVORITES then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", string.format("Favorites list is full (%d max).", MAX_FAVORITES), "ui_inGame2_PDA_icon", 0, 3000, 1)
+        end
+        return
+    end
+
+    self.favorites[#self.favorites + 1] = {
+        label  = string.format("%s:%d", ip, port_n),
+        ip     = ip,
+        port   = port_n,
+        status = "Saved"
+    }
+
+    self:SaveFavorites()
+    self:RefreshList()
+
+    if db.actor then
+        db.actor:give_game_news("Zone Online", "Server added to favorites.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+    end
+end
+
+function UIZoneServerList:OnDelFavorite()
+    if not self.sel_idx then
+        if db.actor then
+            db.actor:give_game_news("Zone Online", "Select a server entry from the list first.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+        end
+        return
+    end
+
+    local tbl_idx = self.sel_idx + 1
+    if not self.favorites[tbl_idx] then return end
+
+    table.remove(self.favorites, tbl_idx)
+    self.sel_idx = nil
+
+    self:SaveFavorites()
+    self:RefreshList()
+
+    if db.actor then
+        db.actor:give_game_news("Zone Online", "Favorite server removed.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+    end
+end
+
+function UIZoneServerList:OnListSelect()
+    if not self.list_servers then return end
+    local idx = self.list_servers:GetSelectedIndex()
+    if idx == nil or idx < 0 then return end
+    self.sel_idx = idx
+
+    local entry = self.favorites[idx + 1]
+    if not entry then return end
+
+    if self.edit_ip then self.edit_ip:SetText(entry.ip) end
+    if self.edit_port then self.edit_port:SetText(tostring(entry.port)) end
+end
+
+function UIZoneServerList:OnBack()
+    self:HideDialog()
+end
+
+function UIZoneServerList:OnKeyboard(dik, keyboard_action)
+    CUIScriptWnd.OnKeyboard(self, dik, keyboard_action)
+    if dik == DIK_keys.DIK_ESCAPE and keyboard_action == 0 then
+        self:OnBack()
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+-- Public factory / API
+-- ============================================================
+
+--- Instantiates and shows the server browser dialog.
+--- Called from zone_menu_patch or console/hotkey.
+function open_server_browser()
+    if not _server_browser_dlg then
+        _server_browser_dlg = UIZoneServerList()
+        _server_browser_dlg:InitControls()
+        _server_browser_dlg:InitCallBacks()
+    else
+        _server_browser_dlg:LoadFavorites()
+    end
+    _server_browser_dlg:ShowDialog(true)
+end
+
+function get_dialog()
+    return _server_browser_dlg
+end
