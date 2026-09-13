@@ -44,8 +44,25 @@ type InventoryItem struct {
 }
 
 type DBWriteJob struct {
-	query string
-	args  []interface{}
+	Query string
+	Args  []interface{}
+}
+
+func NewDBWriteJob(query string, args ...interface{}) *DBWriteJob {
+	return &DBWriteJob{Query: query, Args: args}
+}
+
+type StashRecord struct {
+	StashID      uint32
+	LevelName    string
+	PosX         float32
+	PosY         float32
+	PosZ         float32
+	OwnerUUID    string
+	Passcode     string
+	ContentsJSON string
+	CreatedAt    int64
+	UpdatedAt    int64
 }
 
 func (d *DB) RawDB() *sql.DB {
@@ -107,6 +124,61 @@ func (d *DB) IsPlayerBanned(uuid string) (bool, string, error) {
 	return banned > 0, reason.String, nil
 }
 
+func (d *DB) BanAccount(uuid string, reason string) error {
+	_, err := d.db.Exec("UPDATE accounts SET banned = 1, ban_reason = ? WHERE client_uuid = ?", reason, uuid)
+	return err
+}
+
+func (d *DB) GetStash(stashID uint32) (*StashRecord, error) {
+	row := d.db.QueryRow("SELECT stash_id, level_name, pos_x, pos_y, pos_z, COALESCE(owner_uuid, ''), COALESCE(passcode, ''), contents_json, created_at, updated_at FROM world_stashes WHERE stash_id = ?", stashID)
+	var s StashRecord
+	if err := row.Scan(&s.StashID, &s.LevelName, &s.PosX, &s.PosY, &s.PosZ, &s.OwnerUUID, &s.Passcode, &s.ContentsJSON, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (d *DB) SaveStash(stashID uint32, level string, x, y, z float32, contentsJSON string) error {
+	now := time.Now().Unix()
+	if contentsJSON == "" {
+		contentsJSON = "[]"
+	}
+	if stashID == 0 {
+		_, err := d.db.Exec(`INSERT INTO world_stashes (level_name, pos_x, pos_y, pos_z, contents_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			level, x, y, z, contentsJSON, now, now)
+		return err
+	}
+	_, err := d.db.Exec(`INSERT INTO world_stashes (stash_id, level_name, pos_x, pos_y, pos_z, contents_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(stash_id) DO UPDATE SET
+			level_name=excluded.level_name,
+			pos_x=excluded.pos_x,
+			pos_y=excluded.pos_y,
+			pos_z=excluded.pos_z,
+			contents_json=excluded.contents_json,
+			updated_at=excluded.updated_at`,
+		stashID, level, x, y, z, contentsJSON, now, now)
+	return err
+}
+
+func (d *DB) UpdateStashContents(stashID uint32, contentsJSON string) error {
+	if contentsJSON == "" {
+		contentsJSON = "[]"
+	}
+	res, err := d.db.Exec("UPDATE world_stashes SET contents_json = ?, updated_at = ? WHERE stash_id = ?", contentsJSON, time.Now().Unix(), stashID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (d *DB) StartWriteQueue(ctx context.Context) chan *DBWriteJob {
 	q := make(chan *DBWriteJob, 1000)
 	go func() {
@@ -115,7 +187,7 @@ func (d *DB) StartWriteQueue(ctx context.Context) chan *DBWriteJob {
 			case <-ctx.Done():
 				return
 			case job := <-q:
-				_, _ = d.db.Exec(job.query, job.args...)
+				_, _ = d.db.Exec(job.Query, job.Args...)
 			}
 		}
 	}()

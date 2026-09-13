@@ -1,3 +1,7 @@
+// Zone Asset Provisioner
+// Automatically provisions missing configuration (DLTX mod_system_zone_online.ltx),
+// UI XML (zone_ui_server_list.xml), and essential scripts into S.T.A.L.K.E.R. Anomaly game root.
+
 #include "asset_provisioner.h"
 #include <windows.h>
 #include <shlwapi.h>
@@ -12,6 +16,7 @@ namespace AssetProvisioner
     std::wstring GetGameRoot()
     {
         wchar_t buf[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
         std::wstring path(buf);
 
         // Strip executable name

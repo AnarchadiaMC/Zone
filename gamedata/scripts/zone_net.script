@@ -115,7 +115,9 @@ function dispatch_packet(pkt)
         local attacker_id, pos = read_uint32_le(pkt, pos)
         local damage, pos = read_float_le(pkt, pos)
         local bone_id, pos = read_uint8(pkt, pos)
-        zone_dummy.on_damage_notify(target_id, attacker_id, damage, bone_id)
+        if zone_dummy and zone_dummy.on_damage_notify then
+            zone_dummy.on_damage_notify(target_id, attacker_id, damage, bone_id)
+        end
     elseif opcode == 0x0060 then
         -- Chat text
         local txt, _ = read_string(pkt, offset, paylen)

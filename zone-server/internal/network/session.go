@@ -16,7 +16,7 @@ type PlayerSession struct {
 	Rotation          [2]float32
 	Velocity          [3]float32
 	Health            float32
-	AnimFlags         uint16
+	AnimFlags         uint8
 	InSafeZone        bool
 	SafeZoneID        string
 	LastSeen          time.Time

@@ -43,7 +43,7 @@ type SnapshotEntry struct {
 	PosZ      float32
 	Yaw       int16
 	Pitch     int16
-	AnimFlags uint16
+	AnimFlags uint8
 	Health    uint8
 }
 
@@ -65,6 +65,34 @@ type EntityEnterAoI struct {
 
 type EntityLeaveAoI struct {
 	EntityID uint32
+}
+
+type DamageNotify struct {
+	TargetID   uint32
+	AttackerID uint32
+	Damage     float32
+	BoneID     uint8
+}
+
+type HeartbeatPayload struct {
+	Timestamp uint64
+}
+
+type ChatText struct {
+	SenderID uint32
+	Len      uint8
+	Text     [255]byte
+}
+
+func NewChatText(senderID uint32, msg string) ChatText {
+	var ct ChatText
+	ct.SenderID = senderID
+	if len(msg) > 255 {
+		msg = msg[:255]
+	}
+	ct.Len = uint8(len(msg))
+	copy(ct.Text[:], msg)
+	return ct
 }
 
 func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interface{}) error {

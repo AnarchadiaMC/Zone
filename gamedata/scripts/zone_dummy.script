@@ -175,24 +175,31 @@ function on_damage_notify(target_id, attacker_id, damage, bone_id)
     if not proxy then return end
 
     local hist_len = #proxy.pos_history
+    local current_health = 100
     if hist_len > 0 then
-        local current_health = proxy.pos_history[hist_len].health
-        local new_health = current_health - damage
+        current_health = proxy.pos_history[hist_len].health
+    end
+    local new_health = math.max(0, current_health - damage)
+    if hist_len > 0 then
         proxy.pos_history[hist_len].health = new_health
+    else
+        table.insert(proxy.pos_history, {
+            x = 0, y = 0, z = 0, yaw = 0, health = new_health, t = time_global()
+        })
+    end
 
-        if new_health <= 0 and proxy.game_id then
-            local obj = level.object_by_id(proxy.game_id)
-            if obj and obj:alive() then
-                local killer_obj = obj
-                local attacker_proxy = spawned_proxies[attacker_id]
-                if attacker_proxy and attacker_proxy.game_id then
-                    local a_obj = level.object_by_id(attacker_proxy.game_id)
-                    if a_obj then
-                        killer_obj = a_obj
-                    end
+    if new_health <= 0 and proxy.game_id then
+        local obj = level.object_by_id(proxy.game_id)
+        if obj and obj:alive() then
+            local killer_obj = obj
+            local attacker_proxy = spawned_proxies[attacker_id]
+            if attacker_proxy and attacker_proxy.game_id then
+                local a_obj = level.object_by_id(attacker_proxy.game_id)
+                if a_obj then
+                    killer_obj = a_obj
                 end
-                obj:kill(killer_obj)
             end
+            obj:kill(killer_obj)
         end
     end
 end

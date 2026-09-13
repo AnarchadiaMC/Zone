@@ -30,6 +30,10 @@ enum class Opcode : uint16_t {
     AI_ACTION_EVENT = 0x0070
 };
 
+struct HeartbeatPayload {
+    uint64_t timestamp;
+};
+
 struct HandshakeReq {
     char uuid[36];
     uint32_t hwid;

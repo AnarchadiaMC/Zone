@@ -123,8 +123,13 @@ namespace
             {
                 if (duration_cast<milliseconds>(now - lastHeartbeat).count() > 1000)
                 {
-                    ZO_Header hdr = { 0x5A4F, 1, 0, ++g_Sequence, (uint16_t)Opcode::HEARTBEAT, 0 };
-                    SendPacket((char*)&hdr, sizeof(hdr));
+                    uint64_t ts = (uint64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+                    HeartbeatPayload hb = { ts };
+                    ZO_Header hdr = { 0x5A4F, 1, 0, ++g_Sequence, (uint16_t)Opcode::HEARTBEAT, sizeof(hb) };
+                    char buf[sizeof(hdr) + sizeof(hb)];
+                    memcpy(buf, &hdr, sizeof(hdr));
+                    memcpy(buf + sizeof(hdr), &hb, sizeof(hb));
+                    SendPacket(buf, sizeof(buf));
                     lastHeartbeat = now;
                 }
                 
@@ -198,6 +203,18 @@ namespace
                                 g_Ring[head].len = res;
                                 memcpy(g_Ring[head].data, recvBuf, res);
                                 g_RingHead.store(nextHead, std::memory_order_release);
+                            }
+                        }
+                        else if (hdr->opcode == (uint16_t)Opcode::HEARTBEAT)
+                        {
+                            if (res >= sizeof(ZO_Header) + sizeof(uint64_t))
+                            {
+                                uint64_t sentTs = *(uint64_t*)(recvBuf + sizeof(ZO_Header));
+                                uint64_t nowMs = (uint64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+                                if (nowMs >= sentTs)
+                                {
+                                    g_Ping = (uint32_t)(nowMs - sentTs);
+                                }
                             }
                         }
                         else
