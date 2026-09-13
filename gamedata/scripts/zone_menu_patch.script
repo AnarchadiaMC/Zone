@@ -1,9 +1,9 @@
 -- zone_menu_patch.script
--- Injects a native "Zone Online" button into the Anomaly main menu.
+-- Injects a native "Zone" button into the Anomaly main menu.
 -- Hooks ui_main_menu.main_menu:InitControls and registers on_main_menu_on callback.
 
 local BUTTON_REG_NAME = "btn_zone_online"
-local BUTTON_TEXT     = "Zone Online"
+local BUTTON_TEXT     = "Zone"
 
 -- Track patched state to avoid duplicate buttons
 local _hook_installed = false
@@ -18,31 +18,12 @@ local function attach_zone_button(menu_wnd)
     local existing = menu_wnd[BUTTON_REG_NAME]
     if existing then return end
 
-    -- Build CUI3tButton programmatically
-    local btn = CUI3tButton()
+    -- Build CUI3tButton from XML to match native Anomaly style
+    local xml = CScriptXmlInit()
+    xml:ParseFile("zone_ui_server_list.xml")
+
+    local btn = xml:Init3tButton("btn_zone_online", menu_wnd)
     btn:SetAutoDelete(true)
-
-    -- Anomaly 1024x768 UI: position below standard menu items (y=548)
-    btn:SetWndRect(Frect():set(40, 548, 215, 578))
-
-    if GetFontLetterica18Russian then
-        btn:SetFont(GetFontLetterica18Russian())
-    elseif GetFontLetterica16Russian then
-        btn:SetFont(GetFontLetterica16Russian())
-    end
-
-    if btn.SetText then
-        pcall(function() btn:SetText(BUTTON_TEXT) end)
-    end
-    if btn.TextControl then
-        pcall(function() btn:TextControl():SetText(BUTTON_TEXT) end)
-    end
-
-    if GetARGB then
-        btn:SetTextColor(GetARGB(255, 100, 200, 255))
-    end
-
-    menu_wnd:AttachChild(btn)
     menu_wnd:Register(btn, BUTTON_REG_NAME)
     menu_wnd:AddCallback(
         BUTTON_REG_NAME,
@@ -51,14 +32,14 @@ local function attach_zone_button(menu_wnd)
             if zone_ui_server_list and zone_ui_server_list.open_server_browser then
                 zone_ui_server_list.open_server_browser()
             else
-                printf("ZoneOnline: zone_ui_server_list module not loaded!")
+                printf("Zone: zone_ui_server_list module not loaded!")
             end
         end,
         menu_wnd
     )
 
     menu_wnd[BUTTON_REG_NAME] = btn
-    printf("ZoneOnline MenuPatch: 'Zone Online' button attached to main menu.")
+    printf("Zone MenuPatch: 'Zone' button attached to main menu.")
 end
 
 -- ============================================================
@@ -82,7 +63,7 @@ local function hook_init_controls()
     end
 
     _hook_installed = true
-    printf("ZoneOnline MenuPatch: Hooked ui_main_menu.main_menu:InitControls successfully.")
+    printf("Zone MenuPatch: Hooked ui_main_menu.main_menu:InitControls successfully.")
     return true
 end
 

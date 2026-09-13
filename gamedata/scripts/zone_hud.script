@@ -1,5 +1,5 @@
 -- zone_hud.script
--- Native in-game HUD indicator and status notifications for Zone Online.
+-- Native in-game HUD indicator and status notifications for Zone.
 -- Displays real-time connection status and ping overlay, and issues PDA news tips.
 
 local last_update_time = 0
@@ -127,7 +127,7 @@ local function on_actor_update()
         if connected and last_connected ~= true then
             last_connected = true
             db.actor:give_game_news(
-                "Zone Online",
+                "Zone",
                 string.format("Connected to session #%s | Ping: %d ms", tostring(sid), ping),
                 "ui_inGame2_PDA_icon",
                 0, 5000, 1
@@ -135,7 +135,7 @@ local function on_actor_update()
         elseif not connected and last_connected == true then
             last_connected = false
             db.actor:give_game_news(
-                "Zone Online",
+                "Zone",
                 "Disconnected from server.",
                 "ui_inGame2_PDA_icon",
                 0, 5000, 1
@@ -159,7 +159,7 @@ function notify_safezone(locked)
         safe_zone_active = true
         if db.actor then
             db.actor:give_game_news(
-                "Zone Online",
+                "Zone",
                 "[Safe Zone] Weapons locked — peaceful territory",
                 "ui_inGame2_PDA_icon",
                 0, 5000, 1
@@ -172,7 +172,7 @@ function notify_safezone(locked)
         safe_zone_active = false
         if db.actor then
             db.actor:give_game_news(
-                "Zone Online",
+                "Zone",
                 "[Safe Zone] You have left the safe zone",
                 "ui_inGame2_PDA_icon",
                 0, 3000, 1
