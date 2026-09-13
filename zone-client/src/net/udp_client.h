@@ -9,7 +9,20 @@ namespace NetClient
 
     void Connect(const std::string& ip, uint16_t port, const std::string& uuid, uint32_t hwid, const std::string& nick);
     void Disconnect();
-    void SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint16_t animflags);
+
+    struct Transform {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        int16_t yaw = 0;
+        int16_t pitch = 0;
+        int16_t vx = 0;
+        int16_t vy = 0;
+        int16_t vz = 0;
+        uint16_t animflags = 0;
+    };
+
+    void SendTransform(const Transform& transform);
     bool PollEvent(char* outBuf, size_t& outLen);
     
     bool IsConnected();
