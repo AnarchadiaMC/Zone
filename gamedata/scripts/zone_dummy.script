@@ -170,6 +170,33 @@ function on_entity_enter(pkt, offset)
     end
 end
 
+function on_damage_notify(target_id, attacker_id, damage, bone_id)
+    local proxy = spawned_proxies[target_id]
+    if not proxy then return end
+
+    local hist_len = #proxy.pos_history
+    if hist_len > 0 then
+        local current_health = proxy.pos_history[hist_len].health
+        local new_health = current_health - damage
+        proxy.pos_history[hist_len].health = new_health
+
+        if new_health <= 0 and proxy.game_id then
+            local obj = level.object_by_id(proxy.game_id)
+            if obj and obj:alive() then
+                local killer_obj = obj
+                local attacker_proxy = spawned_proxies[attacker_id]
+                if attacker_proxy and attacker_proxy.game_id then
+                    local a_obj = level.object_by_id(attacker_proxy.game_id)
+                    if a_obj then
+                        killer_obj = a_obj
+                    end
+                end
+                obj:kill(killer_obj)
+            end
+        end
+    end
+end
+
 function on_entity_leave(pkt, offset)
     local eid, pos = zone_net.read_uint32_le(pkt, offset)
     despawn_proxy(eid)
