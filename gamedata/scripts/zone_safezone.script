@@ -29,9 +29,6 @@ function on_safezone_state(pkt, offset)
             if db.actor.hide_weapon then
                 pcall(function() db.actor:hide_weapon() end)
             end
-            if db.actor.set_actor_allow_address then
-                pcall(function() db.actor:set_actor_allow_address(false) end)
-            end
         end
     else
         in_safe_zone = false
@@ -42,9 +39,9 @@ function on_safezone_state(pkt, offset)
             zone_hud.notify_safezone(false)
         end
 
-        -- Restore actor capabilities
-        if db.actor and db.actor.set_actor_allow_address then
-            pcall(function() db.actor:set_actor_allow_address(true) end)
+        -- Restore active weapon if needed
+        if db.actor and db.actor.restore_weapon then
+            pcall(function() db.actor:restore_weapon() end)
         end
     end
 end
