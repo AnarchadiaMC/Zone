@@ -460,9 +460,9 @@ Features and subsystems scheduled for upcoming milestones.
 
 | Subsystem | Priority | Current State | What Needs Doing |
 |:---|:---:|:---|:---|
-| Proximity Voice Chat | Low | Protocol opcode reserved (`0x0061`) | Integrate Opus codec and positional 3D audio playback |
 | Master Server Browser | Low | Direct IP connect + local favorites complete | Add central HTTP master server listing for public community servers |
 | Dedicated Headless Linux VM Deployment | Low | Cross-compilation Makefile target ready | Deploy to headless Ubuntu container and verify LAN latency |
+
 
 ---
 
