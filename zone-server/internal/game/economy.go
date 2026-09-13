@@ -1,7 +1,7 @@
 package game
 
-type Economy struct {}
+type EconomyManager struct {}
 
-func NewEconomy() *Economy {
-	return &Economy{}
+func NewEconomyManager() *EconomyManager {
+	return &EconomyManager{}
 }
