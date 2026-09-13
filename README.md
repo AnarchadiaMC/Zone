@@ -56,9 +56,9 @@ graph TB
 
 - **Headless Authoritative Daemon (`zone-server`)** — Written in Go for native concurrency and low memory footprint. Ticks at a fixed **30 Hz** (33,333 µs), managing a 64m spatial grid, 220m Area of Interest radius, and two-tier AI simulation. Runs on Windows and Linux.
 
-- **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue infrastructure exists (buffered channel, capacity 1000) but is not yet wired into the game loop.
+- **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue (buffered channel, capacity 1000) is wired into the game loop for non-blocking DB writes.
 
-- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — never overwrites existing files. **Note: `AssetProvisioner::GetGameRoot()` has a bug — auto-provisioning may not trigger until fixed.**
+- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — never overwrites existing files.
 
 - **Native X-Ray UI** — Zero external overlay layers or DirectX Present hooks. Injects a native `CUI3tButton` on the main menu via Lua script, opening a native `CUIScriptWnd` Server Browser with Direct Connect, persistent Favorites (up to 16), and double-click-to-connect.
 
@@ -67,6 +67,12 @@ graph TB
 - **Cylindrical Safe Zones** — 8 canonical Zone locations enforce weapon holstering, godmode protection, and PDA alerts on entry/leave. Server-authoritative boundary checks use 2D distance + vertical half-extent.
 
 - **Lock-Free Networking** — Client uses a single-producer/single-consumer ring buffer (256 entries) for received packets. Server dispatches packets across 8 worker goroutines using FNV-1a hash of the client address for per-client ordering guarantees.
+
+- **Admin Server (Named Pipe)** — Windows named pipe (`\\.\pipe\zone_admin`) with Unix socket fallback (`/tmp/zone_admin.sock`). Supports `status`, `kick <session_id>`, `ban <uuid> <reason>`, and `broadcast <message>` commands. Wired into server startup with graceful shutdown.
+
+- **Economy System** — Full buy/sell transactional economy backed by SQLite. Ruble currency with balance queries, atomic buy (deduct + inventory insert) and sell (inventory remove + credit) operations, and tier progression tracking per character.
+
+- **Stash Manager** — World stash CRUD with JSON-serialized item contents. Supports save, open/close sessions per player, and add/deduct item counts with underflow protection. DB-backed via `world_stashes` table.
 
 ---
 
@@ -79,8 +85,8 @@ zone-online/
 │   ├── internal/
 │   │   ├── ai/                  # Squad manager (stub), A* pathfinding (complete)
 │   │   ├── config/              # YAML configuration loader
-│   │   ├── database/            # SQLite schema (7 tables), CRUD, async write queue
-│   │   ├── game/                # 30Hz ticker, spatial grid, safe zones, AoI, events
+│   │   ├── database/            # SQLite schema (7 tables), CRUD, async write queue, stash + ban ops
+│   │   ├── game/                # 30Hz ticker, spatial grid, safe zones, AoI, events, economy, stashes, admin
 │   │   ├── network/             # UDP listener (8 workers), sessions, reliable ACK queue
 │   │   └── protocol/            # Binary wire protocol (14 opcodes, 12-byte header)
 │   └── zone_server.yaml         # Server configuration
@@ -194,6 +200,7 @@ sequenceDiagram
 
     loop Every 1 second
         C->>S: HEARTBEAT (0x0004)<br/>Timestamp
+        S->>C: HEARTBEAT (0x0004)<br/>Timestamp (echo)
     end
 
     loop Every 33ms (30 Hz)
@@ -217,7 +224,7 @@ sequenceDiagram
 | `0x0001` | `PKT_HANDSHAKE_REQ` | C→S | UUID (36B), HWID Hash (4B), Nickname (32B), ProtoVer (1B) |
 | `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B) |
 | `0x0003` | `PKT_DISCONNECT` | Both | Reason (1B) |
-| `0x0004` | `PKT_HEARTBEAT` | C→S | Timestamp (8B) |
+| `0x0004` | `PKT_HEARTBEAT` | Both | Timestamp (8B) |
 | `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (2B) |
 | `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), Array of: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
 | `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | EntityID (4B), Type (1B), Section (32B), PosXYZ (12B), Faction (1B), Health (2B) |
@@ -268,7 +275,7 @@ Once in the main menu:
 |:---|:---|
 | Config loading (YAML) | 7 keys: port, tick_rate_hz, max_players, db_path, log_level, emission_interval_min, admin_pipe |
 | Database schema (7 tables) | accounts, characters, character_inventory, world_stashes, safe_zones, audit_log, ai_squads. WAL mode via pragma. |
-| Database CRUD | AutoProvision, LoadCharacter, SaveCharacter, FlushPlayerTransform, GetCharacterInventory, IsPlayerBanned |
+| Database CRUD | AutoProvision, LoadCharacter, SaveCharacter, FlushPlayerTransform, GetCharacterInventory, IsPlayerBanned, BanAccount, GetStash, SaveStash, UpdateStashContents |
 | Safe zone seeding + detection | 8 cylindrical zones hardcoded, seeded into DB on startup. 2D distance + height check. |
 | UDP listener + worker pool | 8 goroutines, FNV-1a address affinity, sync.Pool buffer recycling, silent drop on full channel |
 | Session management | Dual-index map (by ID + by addr), cached slice for lock-free reads, 30s stale timeout |
@@ -276,7 +283,7 @@ Once in the main menu:
 | Reliable delivery (send + retransmit) | 500ms timeout, 100ms scan interval. Retransmit loop is wired into game loop. |
 | AI pathfinding (A*) | Full implementation with priority queue, 3D Euclidean heuristic, path reconstruction. 4 test cases pass. |
 | DLL injection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege, 11 known exe names |
-| Asset provisioning | Auto-writes DLTX config + UI XML if missing. **Bug: `GetGameRoot()` returns empty — `GetModuleFileNameW` never called.** |
+| Asset provisioning | Auto-writes DLTX config + UI XML if missing. `GetGameRoot()` uses `GetModuleFileNameW` to resolve executable path. |
 | Identity persistence | UUID via UuidCreate, HWID via FNV-1a(MachineGuid + ComputerName), LTX file in %APPDATA% |
 | UDP client (background thread) | 3-state machine (DISCONNECTED/CONNECTING/CONNECTED), select with 10ms timeout, exponential backoff on handshake |
 | Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering |
@@ -286,6 +293,14 @@ Once in the main menu:
 | HUD status overlay | CUIStatic at top-right, 1 Hz update, color-coded states, PDA news on transitions |
 | World event sync | Emission warn/active/clear, raid start/end. Weather changes + siren sounds. |
 | Emission + raid Lua handling | 5 event types parsed, surge API with fallback to weather override |
+| Economy system | Buy/sell transactions, ruble currency, atomic balance checks, tier progression. Fully tested. |
+| Stash manager | World stash CRUD, open/close sessions, JSON item contents, add/deduct with underflow protection. Fully tested. |
+| Admin server (named pipe) | Windows named pipe + Unix socket fallback. Commands: `status`, `kick`, `ban`, `broadcast`. Tested with pipe lifecycle. |
+| DB async write queue | `StartWriteQueue()` wired into `main.go`, routes writes through buffered channel (cap 1000). |
+| Packet dispatch — `CLIENT_TRANSFORM` (0x0010) | Parses transform, updates session position/rotation/velocity/anim, queues periodic DB flush. |
+| Packet dispatch — `CHAT_TEXT` (0x0060) | `BroadcastChat` sends `ChatText` packet to all sessions. |
+| Ping measurement | RTT from heartbeat timestamp round-trip. Client sends `Timestamp`, server echoes it back. |
+| Heartbeat echo | Server parses `HeartbeatPayload`, echoes timestamp back to client (reliable or raw). |
 
 ### To-Do
 
@@ -293,26 +308,18 @@ Once in the main menu:
 |:---|:---:|:---|:---|
 | Handshake response | **High** | Request parsed + logged, no response sent | Send `HANDSHAKE_RES`, create session, call `AutoProvision`, load spawn point |
 | Spatial grid | **High** | `GetNeighbors` always returns `[]uint32{}` | Implement `Insert`, `Remove`, `Update`, cell-key computation, and real neighbor query |
-| Packet dispatch — `CLIENT_TRANSFORM` (0x0010) | **High** | Opcode defined, not handled | Parse transform, update session position, trigger AoI checks |
 | Packet dispatch — `DISCONNECT` (0x0003) | **High** | Opcode defined, not handled | Remove session, broadcast leave to peers |
-| Packet dispatch — `CHAT_TEXT` (0x0060) | Medium | Opcode defined, not handled | Parse sender + message, broadcast to all sessions |
-| Packet dispatch — `STASH_INTERACT` (0x0040) | Medium | Opcode defined, no payload struct in server | Define Go struct, implement stash CRUD, send response |
+| Packet dispatch — `STASH_INTERACT` (0x0040) | Medium | Opcode defined, stash manager exists | Wire opcode handler to StashManager CRUD, send `PKT_STASH_RESPONSE` |
 | Snapshot broadcast | **High** | Code complete but dead (no sessions, empty grid) | Depends on handshake + spatial grid. Then it will work. |
 | ACK receive side | **High** | `AckReceived()` never called | Handle incoming ACK packets to stop retransmission |
 | Emission orchestrator | Medium | Config key loaded, never used | Create orchestrator struct, timer goroutine, emit `WORLD_EVENT` packets |
 | AI squad manager | Medium | Empty struct, no methods | Implement `Tick`, spawn/despawn squads, path following, broadcast AI actions |
 | Anti-cheat | Medium | `ValidateVelocity` exists, never called | Integrate into `CLIENT_TRANSFORM` handler, add more checks |
-| Economy system | Low | Empty struct | Implement buy/sell, currency, tier progression |
-| Stash manager | Low | DB table exists, no Go code | CRUD operations, opcode handlers, contents serialization |
-| Admin server (named pipe) | Low | Config key loaded, no listener | Implement named pipe listener, RPC commands (kick, ban, status, broadcast) |
 | Lua hook wiring | **High** | `lua_hook.cpp` exists but not in CMakeLists, never called from main.cpp | Add to CMakeLists, call `LuaHook::Install()` from InitThread |
 | ZoneNet Lua bindings | **High** | `RegisterZoneNetBindings()` declared but never defined | Implement function body: create Lua table, register C closures, set as global |
 | Dynamic Lua function pointers | **High** | 17 `extern` declarations, never initialized | Add `GetProcAddress` loop in init to populate all function pointers from LuaJIT.dll |
-| AssetProvisioner `GetGameRoot()` | **High** | Returns empty string always | Add `GetModuleFileNameW(hModule, buf, MAX_PATH)` call before path processing |
-| Ping measurement | Low | `g_Ping` always returns 0 | Implement RTT measurement using heartbeat timestamp round-trip |
-| DB async write queue | Low | `StartWriteQueue()` works but never called | Wire into `main.go` startup, route writes through channel |
 | Safe zone server integration | **High** | `CheckSafeZone()` works but never called | Call from game loop or transform handler, set `InSafeZone` on sessions, send `SAFEZONE_STATE` |
-| DB integration in packet handlers | **High** | CRUD methods exist, none called from handlers | Call `AutoProvision` on handshake, `SaveCharacter` on disconnect, `FlushPlayerTransform` periodically |
+| DB integration in packet handlers | **High** | Transform + play time queued via async write, AutoProvision on handshake | Wire `SaveCharacter` on disconnect, periodic `FlushPlayerTransform` |
 
 ---
 
