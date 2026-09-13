@@ -99,7 +99,7 @@ namespace
         "    </background>\n"
         "    \n"
         "    <header_label x=\"200\" y=\"100\" width=\"624\" height=\"30\" font=\"letterica18\" align=\"c\" color=\"gold\">\n"
-        "        <text>ZONE ONLINE — SERVER BROWSER</text>\n"
+        "        <text>ZONE — SERVER BROWSER</text>\n"
         "    </header_label>\n"
         "    \n"
         "    <server_list_frame x=\"175\" y=\"140\" width=\"674\" height=\"250\">\n"
@@ -181,7 +181,7 @@ namespace
         "\n"
         "    <btn_zone_online x=\"40\" y=\"548\" width=\"215\" height=\"30\">\n"
         "        <texture>ui\\ui_common:ui_inGame2_button_e</texture>\n"
-        "        <text font=\"letterica18\" r=\"255\" g=\"255\" b=\"255\">Zone Online</text>\n"
+        "        <text font=\"letterica18\" r=\"255\" g=\"255\" b=\"255\">Zone</text>\n"
         "    </btn_zone_online>\n"
         "</w>\n"
         "\n";

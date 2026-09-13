@@ -57,7 +57,7 @@ function UIZoneServerList:InitControls()
 
     local xml = (CScriptXmlInit and CScriptXmlInit()) or (CUIXml and CUIXml())
     if not xml then
-        printf("ZoneOnline UI Error: Neither CScriptXmlInit nor CUIXml is available!")
+        printf("Zone UI Error: Neither CScriptXmlInit nor CUIXml is available!")
         return
     end
 
@@ -88,7 +88,7 @@ function UIZoneServerList:InitControls()
     if self.list_servers then
         self:Register(self.list_servers, "server_list")
     else
-        printf("ZoneOnline UI Warning: server_list listbox could not be initialized!")
+        printf("Zone UI Warning: server_list listbox could not be initialized!")
     end
 
     -- Direct connect input boxes
@@ -323,18 +323,18 @@ function UIZoneServerList:OnConnect()
 
     if ip == "" then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "ERROR: Server IP address is required.", "ui_inGame2_PDA_icon", 0, 4000, 1)
+            db.actor:give_game_news("Zone", "ERROR: Server IP address is required.", "ui_inGame2_PDA_icon", 0, 4000, 1)
         end
-        printf("ZoneOnline: Cannot connect — empty server IP")
+        printf("Zone: Cannot connect — empty server IP")
         return
     end
 
     local port_n = tonumber(port)
     if not port_n or port_n < 1 or port_n > 65535 then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "ERROR: Invalid port number (1 - 65535).", "ui_inGame2_PDA_icon", 0, 4000, 1)
+            db.actor:give_game_news("Zone", "ERROR: Invalid port number (1 - 65535).", "ui_inGame2_PDA_icon", 0, 4000, 1)
         end
-        printf("ZoneOnline: Cannot connect — invalid port '%s'", tostring(port))
+        printf("Zone: Cannot connect — invalid port '%s'", tostring(port))
         return
     end
 
@@ -343,19 +343,19 @@ function UIZoneServerList:OnConnect()
 
     if type(ZoneNet) == "nil" then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "ERROR: ZoneNet native DLL is not loaded.", "ui_inGame2_PDA_icon", 0, 5000, 1)
+            db.actor:give_game_news("Zone", "ERROR: ZoneNet native DLL is not loaded.", "ui_inGame2_PDA_icon", 0, 5000, 1)
         end
-        printf("ZoneOnline: ZoneNet DLL missing, cannot connect.")
+        printf("Zone: ZoneNet DLL missing, cannot connect.")
         return
     end
 
-    printf("ZoneOnline UI: Connecting to %s:%d as '%s' (UUID: %s, HWID: %s)...", ip, port_n, nick, self.uuid, tostring(self.hwid))
+    printf("Zone UI: Connecting to %s:%d as '%s' (UUID: %s, HWID: %s)...", ip, port_n, nick, self.uuid, tostring(self.hwid))
     ZoneNet:Connect(ip, port_n, self.uuid, self.hwid, nick)
 
     -- Confirmation news tip
     if db.actor then
         db.actor:give_game_news(
-            "Zone Online",
+            "Zone",
             string.format("Connecting to %s:%d as '%s'...", ip, port_n, nick),
             "ui_inGame2_PDA_icon", 0, 5000, 1
         )
@@ -392,7 +392,7 @@ function UIZoneServerList:OnAddFavorite()
 
     if ip == "" or port == "" then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "Please enter both IP and Port before adding.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+            db.actor:give_game_news("Zone", "Please enter both IP and Port before adding.", "ui_inGame2_PDA_icon", 0, 3000, 1)
         end
         return
     end
@@ -400,7 +400,7 @@ function UIZoneServerList:OnAddFavorite()
     local port_n = tonumber(port)
     if not port_n or port_n < 1 or port_n > 65535 then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "ERROR: Invalid port number.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+            db.actor:give_game_news("Zone", "ERROR: Invalid port number.", "ui_inGame2_PDA_icon", 0, 3000, 1)
         end
         return
     end
@@ -408,7 +408,7 @@ function UIZoneServerList:OnAddFavorite()
     for _, e in ipairs(self.favorites) do
         if e.ip == ip and e.port == port_n then
             if db.actor then
-                db.actor:give_game_news("Zone Online", "Server is already in favorites list.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+                db.actor:give_game_news("Zone", "Server is already in favorites list.", "ui_inGame2_PDA_icon", 0, 3000, 1)
             end
             return
         end
@@ -416,7 +416,7 @@ function UIZoneServerList:OnAddFavorite()
 
     if #self.favorites >= MAX_FAVORITES then
         if db.actor then
-            db.actor:give_game_news("Zone Online", string.format("Favorites list is full (%d max).", MAX_FAVORITES), "ui_inGame2_PDA_icon", 0, 3000, 1)
+            db.actor:give_game_news("Zone", string.format("Favorites list is full (%d max).", MAX_FAVORITES), "ui_inGame2_PDA_icon", 0, 3000, 1)
         end
         return
     end
@@ -432,14 +432,14 @@ function UIZoneServerList:OnAddFavorite()
     self:RefreshList()
 
     if db.actor then
-        db.actor:give_game_news("Zone Online", "Server added to favorites.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+        db.actor:give_game_news("Zone", "Server added to favorites.", "ui_inGame2_PDA_icon", 0, 3000, 1)
     end
 end
 
 function UIZoneServerList:OnDelFavorite()
     if not self.sel_idx then
         if db.actor then
-            db.actor:give_game_news("Zone Online", "Select a server entry from the list first.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+            db.actor:give_game_news("Zone", "Select a server entry from the list first.", "ui_inGame2_PDA_icon", 0, 3000, 1)
         end
         return
     end
@@ -454,7 +454,7 @@ function UIZoneServerList:OnDelFavorite()
     self:RefreshList()
 
     if db.actor then
-        db.actor:give_game_news("Zone Online", "Favorite server removed.", "ui_inGame2_PDA_icon", 0, 3000, 1)
+        db.actor:give_game_news("Zone", "Favorite server removed.", "ui_inGame2_PDA_icon", 0, 3000, 1)
     end
 end
 

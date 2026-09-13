@@ -1,5 +1,5 @@
 -- zone_safezone.script
--- Safe zone enforcement and combat protection for Zone Online.
+-- Safe zone enforcement and combat protection for Zone.
 
 local in_safe_zone = false
 local safe_zone_id = ""
