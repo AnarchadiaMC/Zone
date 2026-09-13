@@ -4,13 +4,10 @@
 local config = {}
 
 local function load_config()
-    local appdata = os.getenv("APPDATA")
-    if not appdata then return false end
-    
-    local path = appdata .. "\\zone_identity.ltx"
+    local path = getFS():update_path("$app_data_root$", "zone_identity.ltx")
     local file = io.open(path, "r")
     if not file then
-        printf("Zone: Missing zone_identity.ltx in %APPDATA%")
+        printf("Zone: Missing zone_identity.ltx in appdata")
         return false
     end
     
@@ -50,7 +47,6 @@ function on_game_start()
     
     -- Register callbacks
     RegisterScriptCallback("actor_on_update", zone_net.on_tick)
-    RegisterScriptCallback("on_before_hit", zone_safezone.on_before_hit)
     RegisterScriptCallback("on_key_press", zone_safezone.on_key_press)
 end
 

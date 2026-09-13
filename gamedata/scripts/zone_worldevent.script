@@ -27,6 +27,9 @@ function on_world_event(pkt, offset)
         end
     elseif event_type == 0x03 then -- EMISSION_CLEAR
         active_emission = false
+        if surge_manager and surge_manager.get_surge_manager then
+            surge_manager.get_surge_manager():end_surge(true)
+        end
         level.set_weather("default", true)
     elseif event_type == 0x04 then -- RAID_START
         if db.actor then

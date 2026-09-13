@@ -1,4 +1,5 @@
-﻿#pragma once
+#pragma once
+#include <string>
 
 namespace AssetProvisioner
 {
@@ -6,4 +7,7 @@ namespace AssetProvisioner
     // any missing configuration (DLTX mod_system_zone_online.ltx), UI XML
     // (zone_ui_server_list.xml), and essential scripts.
     void EnsureAssets();
+    
+    // Returns the path to the game root directory
+    std::wstring GetGameRoot();
 }

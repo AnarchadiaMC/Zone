@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <iostream>
@@ -225,6 +225,13 @@ static int ModeWait(const std::wstring& dllPath)
         L"AnomalyDX11.exe",
         L"AnomalyDX11AVX.exe",
         L"VerifiedDX11.exe",
+        L"AnomalyDX10.exe",
+        L"AnomalyDX10AVX.exe",
+        L"AnomalyDX9.exe",
+        L"AnomalyDX9AVX.exe",
+        L"VerifiedDX9.exe",
+        L"AnomalyDX8.exe",
+        L"AnomalyDX8AVX.exe",
         L"xrEngine.exe"
     };
 

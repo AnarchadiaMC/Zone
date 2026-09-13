@@ -54,13 +54,14 @@ function on_ai_action(pkt, offset)
                 obj:kill(obj)
             end
             -- Delay release
+            local release_time = time_global() + 5000
             local function release_corpse()
                 local se = alife():object(entity.se_id)
                 if se then alife():release(se, true) end
                 ai_entities[eid] = nil
                 return true
             end
-            level.add_call(function() return time_global() > time_global() + 5000 end, release_corpse)
+            level.add_call(function() return time_global() > release_time end, release_corpse)
         elseif action == 2 then -- ATTACK
             -- Face target if known
             -- Target facing logic requires target position, we simplify by facing actor if target is actor

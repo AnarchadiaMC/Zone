@@ -1,8 +1,7 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include "provision/asset_provisioner.h"
 #include "identity/identity.h"
 #include "net/udp_client.h"
-#include "hook/lua_hook.h"
 #include <MinHook.h>
 
 namespace
@@ -13,7 +12,6 @@ namespace
     {
         Sleep(500);
         NetClient::Init();
-        LuaHook::Install();
         return 0;
     }
 }
@@ -45,7 +43,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
             if (!lpvReserved)
             {
                 NetClient::Shutdown();
-                LuaHook::Uninstall();
                 MH_Uninitialize();
             }
             break;

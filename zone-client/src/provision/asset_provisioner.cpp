@@ -1,4 +1,4 @@
-﻿#include "asset_provisioner.h"
+#include "asset_provisioner.h"
 #include <windows.h>
 #include <shlwapi.h>
 #include <string>
@@ -7,29 +7,35 @@
 
 #pragma comment(lib, "shlwapi.lib")
 
-namespace
+namespace AssetProvisioner
 {
     std::wstring GetGameRoot()
     {
         wchar_t buf[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, buf, MAX_PATH);
         std::wstring path(buf);
-        
+
         // Strip executable name
         size_t last = path.find_last_of(L"\\/");
-        if (last != std::wstring::npos)
-            path = path.substr(0, last);
-            
-        // If executable is in "bin" or "bin\x64" or similar, go up to game root
-        last = path.find_last_of(L"\\/");
-        if (last != std::wstring::npos)
+        if (last != std::wstring::npos) path = path.substr(0, last);
+
+        // Loop until all binary subdirectories (x64, bin, Win64) are stripped
+        bool stripped = true;
+        while (stripped)
         {
-            std::wstring folder = path.substr(last + 1);
-            if (_wcsicmp(folder.c_str(), L"bin") == 0 ||
-                _wcsicmp(folder.c_str(), L"bin_x64") == 0 ||
-                _wcsicmp(folder.c_str(), L"bin_dedicated") == 0)
+            stripped = false;
+            last = path.find_last_of(L"\\/");
+            if (last != std::wstring::npos)
             {
-                path = path.substr(0, last);
+                std::wstring folder = path.substr(last + 1);
+                if (_wcsicmp(folder.c_str(), L"x64") == 0 ||
+                    _wcsicmp(folder.c_str(), L"Win64") == 0 ||
+                    _wcsicmp(folder.c_str(), L"bin") == 0 ||
+                    _wcsicmp(folder.c_str(), L"bin_x64") == 0 ||
+                    _wcsicmp(folder.c_str(), L"bin_dedicated") == 0)
+                {
+                    path = path.substr(0, last);
+                    stripped = true;
+                }
             }
         }
         return path;

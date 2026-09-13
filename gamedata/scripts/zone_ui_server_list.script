@@ -5,8 +5,7 @@
 if not ui_events then ui_events = {} end
 
 local DIALOG_XML    = "zone_ui_server_list.xml"
-local APPDATA_DIR   = os.getenv("APPDATA") or ""
-local APPDATA_LTX   = APPDATA_DIR .. "\\zone_identity.ltx"
+local APPDATA_LTX   = getFS():update_path("$app_data_root$", "zone_identity.ltx")
 local HISTORY_SEC   = "server_history"
 local IDENTITY_SEC  = "identity"
 local MAX_FAVORITES = 16
@@ -71,14 +70,15 @@ function UIZoneServerList:InitControls()
     safe_init(xml, "InitWindow", "background", 0, self)
 
     -- Column header statics (optional decorative labels from XML)
-    safe_init(xml, "InitStatic", "cap_col_name", self)
-    safe_init(xml, "InitStatic", "cap_col_host", self)
-    safe_init(xml, "InitStatic", "cap_col_port", self)
-    safe_init(xml, "InitStatic", "cap_col_status", self)
-    safe_init(xml, "InitStatic", "cap_direct_connect", self)
-    safe_init(xml, "InitStatic", "cap_ip", self)
-    safe_init(xml, "InitStatic", "cap_port", self)
-    safe_init(xml, "InitStatic", "cap_nick", self)
+    safe_init(xml, "InitStatic", "header_label", self)
+    safe_init(xml, "InitStatic", "server_list_frame:col_name", self)
+    safe_init(xml, "InitStatic", "server_list_frame:col_host", self)
+    safe_init(xml, "InitStatic", "server_list_frame:col_port", self)
+    safe_init(xml, "InitStatic", "server_list_frame:col_status", self)
+    safe_init(xml, "InitStatic", "direct_label", self)
+    safe_init(xml, "InitStatic", "ip_label", self)
+    safe_init(xml, "InitStatic", "port_label", self)
+    safe_init(xml, "InitStatic", "nick_label", self)
 
     -- Server list box (try server_list, then nested variants)
     self.list_servers = safe_init(xml, "InitListBox", "server_list", self)

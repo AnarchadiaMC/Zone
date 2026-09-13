@@ -8,6 +8,7 @@
 #include <chrono>
 #include <vector>
 #include <condition_variable>
+#include <iostream>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -57,6 +58,25 @@ namespace
     } g_Transform;
     std::mutex g_TransformMutex;
 
+    void SendPacket(const char* buf, int len)
+    {
+        if (g_Socket == INVALID_SOCKET) return;
+        int res = sendto(g_Socket, buf, len, 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+        if (res == SOCKET_ERROR)
+        {
+            int err = WSAGetLastError();
+            // WSAEWOULDBLOCK is normal for non-blocking sockets.
+            if (err != WSAEWOULDBLOCK)
+            {
+                g_LastError = "sendto failed: " + std::to_string(err);
+                if (err == WSAECONNRESET) // ICMP port unreachable
+                {
+                    g_State = DISCONNECTED;
+                }
+            }
+        }
+    }
+
     void BackgroundThread()
     {
         using namespace std::chrono;
@@ -95,7 +115,7 @@ namespace
                     memcpy(buf, &hdr, sizeof(hdr));
                     memcpy(buf + sizeof(hdr), &req, sizeof(req));
                     
-                    sendto(g_Socket, buf, sizeof(hdr) + sizeof(req), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+                    SendPacket(buf, sizeof(hdr) + sizeof(req));
                     
                     lastConnect = now;
                     backoff = std::min(backoff * 2, 30000);
@@ -106,7 +126,7 @@ namespace
                 if (duration_cast<milliseconds>(now - lastHeartbeat).count() > 1000)
                 {
                     ZO_Header hdr = { 0x5A4F, 1, 0, ++g_Sequence, (uint16_t)Opcode::HEARTBEAT, 0 };
-                    sendto(g_Socket, (char*)&hdr, sizeof(hdr), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+                    SendPacket((char*)&hdr, sizeof(hdr));
                     lastHeartbeat = now;
                 }
                 
@@ -132,7 +152,7 @@ namespace
                         char buf[1500];
                         memcpy(buf, &hdr, sizeof(hdr));
                         memcpy(buf + sizeof(hdr), &ct, sizeof(ct));
-                        sendto(g_Socket, buf, sizeof(hdr) + sizeof(ct), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+                        SendPacket(buf, sizeof(hdr) + sizeof(ct));
                     }
                     lastTransform = now;
                 }
@@ -170,6 +190,16 @@ namespace
                             {
                                 SafeZoneState* sz = (SafeZoneState*)(recvBuf + sizeof(ZO_Header));
                                 g_InSafeZone = (sz->locked != 0);
+                            }
+                            
+                            // Enqueue for Lua so zone_safezone.script receives it
+                            uint32_t head = g_RingHead.load(std::memory_order_relaxed);
+                            uint32_t nextHead = (head + 1) % 256;
+                            if (nextHead != g_RingTail.load(std::memory_order_acquire))
+                            {
+                                g_Ring[head].len = res;
+                                memcpy(g_Ring[head].data, recvBuf, res);
+                                g_RingHead.store(nextHead, std::memory_order_release);
                             }
                         }
                         else
@@ -248,7 +278,7 @@ namespace NetClient
         if (g_State == CONNECTED)
         {
             ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::DISCONNECT, 0 };
-            sendto(g_Socket, (char*)&hdr, sizeof(hdr), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+            SendPacket((char*)&hdr, sizeof(hdr));
         }
         g_State = DISCONNECTED;
         g_StateCV.notify_all();
@@ -301,6 +331,6 @@ namespace NetClient
         char buf[1500];
         memcpy(buf, &hdr, sizeof(hdr));
         memcpy(buf + sizeof(hdr), &ct, sizeof(ct));
-        sendto(g_Socket, buf, sizeof(hdr) + sizeof(ct), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+        SendPacket(buf, sizeof(hdr) + sizeof(ct));
     }
 }

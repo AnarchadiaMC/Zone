@@ -5,6 +5,7 @@
 #include <sstream>
 #include <Rpc.h>
 #pragma comment(lib, "Rpcrt4.lib")
+#include "../provision/asset_provisioner.h"
 
 namespace
 {
@@ -59,10 +60,15 @@ namespace Identity
 {
     void Init()
     {
-        char path[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path)))
+        std::wstring root = AssetProvisioner::GetGameRoot();
+        if (!root.empty())
         {
-            g_ConfigPath = std::string(path) + "\\zone_identity.ltx";
+            std::wstring appdataPath = root + L"\\appdata";
+            CreateDirectoryW(appdataPath.c_str(), nullptr);
+            
+            char pathA[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, (appdataPath + L"\\zone_identity.ltx").c_str(), -1, pathA, MAX_PATH, nullptr, nullptr);
+            g_ConfigPath = pathA;
             
             std::ifstream in(g_ConfigPath);
             if (in.is_open())
@@ -71,7 +77,11 @@ namespace Identity
                 while (std::getline(in, line))
                 {
                     if (line.find("uuid=") == 0) g_UUID = line.substr(5);
-                    else if (line.find("hwid=") == 0) g_HWID = std::stoul(line.substr(5));
+                    else if (line.find("hwid=") == 0)
+                    {
+                        try { g_HWID = std::stoul(line.substr(5)); }
+                        catch (...) { g_HWID = 0; }
+                    }
                     else if (line.find("nickname=") == 0) g_Nickname = line.substr(9);
                 }
             }

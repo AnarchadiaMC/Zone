@@ -97,7 +97,7 @@ end
 
 function on_game_start()
     if RegisterScriptCallback then
-        RegisterScriptCallback("on_before_hit",  on_before_hit)
+        RegisterScriptCallback("actor_on_before_hit",  on_before_hit)
         RegisterScriptCallback("on_key_press",   on_key_press)
         RegisterScriptCallback("actor_on_update", on_actor_update)
     end

@@ -33,7 +33,7 @@ type ClientTransform struct {
 	VelX      int16
 	VelY      int16
 	VelZ      int16
-	AnimFlags uint16
+	AnimFlags uint8
 }
 
 type SnapshotEntry struct {

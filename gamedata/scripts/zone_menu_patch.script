@@ -89,6 +89,6 @@ function on_game_start()
 
     -- Always register callback as a guarantee across all game states
     if RegisterScriptCallback then
-        RegisterScriptCallback("on_main_menu_on", on_main_menu_on)
+        RegisterScriptCallback("main_menu_on_init", on_main_menu_on)
     end
 end

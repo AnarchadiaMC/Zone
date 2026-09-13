@@ -57,7 +57,7 @@ struct ClientTransform {
     int16_t velX;
     int16_t velY;
     int16_t velZ;
-    uint16_t animFlags;
+    uint8_t animFlags;
 };
 
 struct SnapshotEntry {
@@ -67,18 +67,18 @@ struct SnapshotEntry {
     float posZ;
     int16_t yaw;
     int16_t pitch;
-    uint16_t animFlags;
+    uint8_t animFlags;
     uint8_t health;
 };
 
 struct ServerSnapshot {
     uint8_t count;
-    SnapshotEntry entries[64];
+    SnapshotEntry entries[32];
 };
 
 struct SafeZoneState {
     uint8_t locked;
-    char zoneID[16];
+    char zoneID[32];
 };
 
 struct WorldEvent {
@@ -99,8 +99,8 @@ struct EntityEnterAoI {
     float posX;
     float posY;
     float posZ;
-    uint8_t faction;
-    uint16_t health;
+    char faction[16];
+    uint8_t health;
 };
 
 struct EntityLeaveAoI {

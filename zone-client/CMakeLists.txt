@@ -31,8 +31,6 @@ set(ZONE_CLIENT_SOURCES
     src/protocol/packets.h
     src/net/udp_client.cpp
     src/net/udp_client.h
-    src/hook/lua_hook.cpp
-    src/hook/lua_hook.h
     src/lua/zone_bindings.cpp
     src/lua/zone_bindings.h
     src/provision/asset_provisioner.cpp

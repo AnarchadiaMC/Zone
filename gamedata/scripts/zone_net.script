@@ -23,7 +23,57 @@ end
 
 ffi.cdef[[
     typedef union { float f; uint8_t b[4]; } znet_float_cast;
+    void ZN_Connect(const char* ip, double port, const char* uuid, double hwid, const char* nick);
+    void ZN_Disconnect();
+    void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint8_t animflags);
+    bool ZN_PollEvent(char* buf, size_t* len);
+    bool ZN_IsInSafeZone();
+    bool ZN_IsConnected();
+    void ZN_GetSessionInfo(uint32_t* sessionID, uint32_t* ping);
+    void ZN_SendChatText(const char* text);
 ]]
+
+local zone_client = nil
+pcall(function()
+    zone_client = ffi.load("ZoneClient")
+end)
+
+-- Polyfill ZoneNet global object for compatibility
+_G.ZoneNet = {}
+function ZoneNet:Connect(ip, port, uuid, hwid, nick)
+    if zone_client then zone_client.ZN_Connect(ip, port, uuid, hwid, nick) end
+end
+function ZoneNet:Disconnect()
+    if zone_client then zone_client.ZN_Disconnect() end
+end
+function ZoneNet:SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags)
+    if zone_client then zone_client.ZN_SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags) end
+end
+function ZoneNet:PollEvent()
+    if not zone_client then return nil end
+    local buf = ffi.new("char[1500]")
+    local len = ffi.new("size_t[1]")
+    if zone_client.ZN_PollEvent(buf, len) then
+        return ffi.string(buf, len[0])
+    end
+    return nil
+end
+function ZoneNet:IsInSafeZone()
+    return zone_client and zone_client.ZN_IsInSafeZone() or false
+end
+function ZoneNet:IsConnected()
+    return zone_client and zone_client.ZN_IsConnected() or false
+end
+function ZoneNet:GetSessionInfo()
+    if not zone_client then return 0, 0 end
+    local sid = ffi.new("uint32_t[1]")
+    local ping = ffi.new("uint32_t[1]")
+    zone_client.ZN_GetSessionInfo(sid, ping)
+    return sid[0], ping[0]
+end
+function ZoneNet:SendChatText(text)
+    if zone_client then zone_client.ZN_SendChatText(text) end
+end
 
 function read_float_le(pkt, pos)
     local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
@@ -106,15 +156,13 @@ function on_tick()
         last_pos = vector():set(pos)
         
         local yaw = math.atan2(dir.x, dir.z)
-        local pitch = math.asin(dir.y)
+        local dir_y_clamped = math.max(-1.0, math.min(1.0, dir.y))
+        local pitch = math.asin(dir_y_clamped)
         
         local animflags = 0
         if IsMoveState("mcCrouch") then animflags = bit.bor(animflags, 1) end
         if IsMoveState("mcSprint") then animflags = bit.bor(animflags, 2) end
-        -- Basic aiming detection:
-        if db.actor:active_item() and db.actor:is_zoom_aiming_mode() then
-            animflags = bit.bor(animflags, 4)
-        end
+        -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
         
         ZoneNet:SendTransform(pos.x, pos.y, pos.z, yaw, pitch, vx, vy, vz, animflags)
     end
@@ -126,3 +174,4 @@ function on_tick()
         dispatch_packet(pkt)
     end
 end
+

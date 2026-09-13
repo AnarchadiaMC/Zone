@@ -68,21 +68,21 @@ local function get_or_create_static()
     local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
     if not ui then return nil end
 
-    if hud_static and hud_static:IsShown() ~= nil then
+    if hud_static then
         return hud_static
     end
 
     local s = CUIStatic()
-    s:SetAutoDelete(true)
-    -- Top-right HUD position in 1024x768 / widescreen coordinates
+    -- DO NOT USE SetAutoDelete(true) because we are maintaining a Lua reference
+    -- s:SetAutoDelete(true)
     s:SetWndRect(Frect():set(800, 8, 1016, 30))
 
     if GetFontLetterica16Russian then
         s:SetFont(GetFontLetterica16Russian())
     end
 
-    s:SetTextColor(COLOR_CONNECTED)
-    s:SetText("")
+    s:TextControl():SetTextColor(COLOR_CONNECTED)
+    s:TextControl():SetText("")
     s:Show(true)
 
     ui:AttachChild(s)
@@ -94,14 +94,9 @@ local function update_hud_display(text, color)
     local s = get_or_create_static()
     if not s then return end
 
-    if s.SetText then
-        pcall(function() s:SetText(text) end)
-    end
     if s.TextControl then
-        pcall(function() s:TextControl():SetText(text) end)
-    end
-    if s.SetTextColor then
-        pcall(function() s:SetTextColor(color) end)
+        s:TextControl():SetText(text)
+        s:TextControl():SetTextColor(color)
     end
     s:Show(true)
 end
