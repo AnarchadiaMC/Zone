@@ -106,7 +106,6 @@ func (s *Server) Tick(now time.Time) {
 		}
 	}
 	s.aoi.BroadcastSnapshots(s.sessions, s.grid, s.udp, &s.seq)
-	s.squads.Tick(s.sessions, s.grid)
 }
 
 func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{}) {
