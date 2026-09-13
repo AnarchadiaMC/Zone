@@ -7,60 +7,11 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type incomingPacket struct {
 	data []byte
 	addr *net.UDPAddr
-}
-
-type AckEntry struct {
-	data   []byte
-	addr   *net.UDPAddr
-	sentAt time.Time
-	seq    uint32
-}
-
-type AckQueue struct {
-	mu      sync.Mutex
-	pending map[uint32]*AckEntry
-}
-
-func NewAckQueue() *AckQueue {
-	return &AckQueue{
-		pending: make(map[uint32]*AckEntry),
-	}
-}
-
-func (aq *AckQueue) EnqueueReliable(seq uint32, addr *net.UDPAddr, data []byte) {
-	aq.mu.Lock()
-	defer aq.mu.Unlock()
-	b := make([]byte, len(data))
-	copy(b, data)
-	aq.pending[seq] = &AckEntry{
-		data:   b,
-		addr:   addr,
-		sentAt: time.Now(),
-		seq:    seq,
-	}
-}
-
-func (aq *AckQueue) AckReceived(seq uint32) {
-	aq.mu.Lock()
-	defer aq.mu.Unlock()
-	delete(aq.pending, seq)
-}
-
-func (aq *AckQueue) RetransmitExpired(now time.Time, listener *UDPListener) {
-	aq.mu.Lock()
-	defer aq.mu.Unlock()
-	for _, entry := range aq.pending {
-		if now.Sub(entry.sentAt) > 500*time.Millisecond {
-			_ = listener.Send(entry.addr, entry.data)
-			entry.sentAt = now
-		}
-	}
 }
 
 type UDPListener struct {

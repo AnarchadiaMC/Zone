@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"net"
 	"strings"
@@ -26,6 +27,27 @@ type PacketRecorder interface {
 }
 
 var activeSink PacketRecorder
+
+// SafezoneState carries safe zone transition state.
+type SafezoneState struct {
+	InSafeZone uint8
+}
+
+// LeaveAoI carries entity leave notification payload.
+type LeaveAoI struct {
+	SessionID uint32
+}
+
+const (
+	OpLeave = protocol.OpEntityLeaveAoI
+)
+
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 type EventManager struct{}
 
@@ -176,6 +198,18 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if cleanUUID == "" {
 				cleanUUID = string(bytes.Trim(req.UUID[:], "\x00"))
 			}
+
+			if s.cfg != nil && s.cfg.MaxPlayers > 0 && len(s.sessions.GetAll()) >= s.cfg.MaxPlayers {
+				s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
+				res := protocol.HandshakeRes{
+					Status:    1,
+					WorldTime: uint64(time.Now().Unix()),
+				}
+				tempSess := &network.PlayerSession{UDPAddr: addr}
+				s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+				return
+			}
+
 			sessID := s.seq.Add(1)
 			sess := &network.PlayerSession{
 				SessionID:    sessID,
@@ -185,18 +219,74 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				Health:       100.0,
 				CurrentLevel: "l01_escape",
 			}
+			if s.db != nil {
+				nick := nullTermString(req.Nickname[:])
+				if nick == "" {
+					nick = "Stalker"
+				}
+				hwid := fmt.Sprintf("%x", req.HWIDHash)
+				_ = s.db.AutoProvision(cleanUUID, hwid, nick)
+				if char, err := s.db.LoadCharacter(cleanUUID); err == nil && char != nil {
+					if char.LevelName != "" {
+						sess.CurrentLevel = char.LevelName
+					}
+					sess.Position = [3]float32{char.PosX, char.PosY, char.PosZ}
+					sess.Health = char.Health
+				}
+			}
 			s.sessions.AddSession(sess)
 
 			res := protocol.HandshakeRes{
 				Status:    0,
-				SpawnX:    0,
-				SpawnY:    0,
-				SpawnZ:    0,
+				SpawnX:    sess.Position[0],
+				SpawnY:    sess.Position[1],
+				SpawnZ:    sess.Position[2],
 				WorldTime: uint64(time.Now().Unix()),
 				EcoTier:   1,
 			}
 			binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
+
+			s.grid.Insert(sessID, sess.Position[0], sess.Position[2])
+			inSZ := (CheckSafeZone(sess.Position[0], sess.Position[1], sess.Position[2], sess.CurrentLevel) != nil)
+			sess.InSafeZone = inSZ
+
 			s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+		}
+	case protocol.OpDisconnect:
+		if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
+			sess.Lock()
+			sessID := sess.SessionID
+			uuid := sess.AccountID
+			pos := sess.Position
+			yaw := sess.Rotation[0]
+			health := sess.Health
+			level := sess.CurrentLevel
+			sess.Unlock()
+
+			if uuid != "" {
+				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+			}
+			s.grid.Remove(sessID)
+			s.aoi.RemoveSession(sessID)
+
+			leavePkt := protocol.EntityLeaveAoI{EntityID: sessID}
+			for _, other := range s.sessions.GetAll() {
+				if other.SessionID == sessID {
+					continue
+				}
+				other.Lock()
+				sameLevel := (other.CurrentLevel == level)
+				other.Unlock()
+				if sameLevel {
+					s.SendToSession(other, protocol.OpEntityLeaveAoI, protocol.FlagReliable, leavePkt)
+				}
+			}
+
+			s.sessions.RemoveSession(sessID)
+			s.logger.Info("Client disconnected",
+				zap.Uint32("session_id", sessID),
+				zap.String("addr", addr.String()),
+			)
 		}
 	case protocol.OpHeartbeat:
 		var hb protocol.HeartbeatPayload
@@ -230,6 +320,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			}
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
+				sessID := sess.SessionID
 				sess.Position = [3]float32{ct.PosX, ct.PosY, ct.PosZ}
 				sess.Rotation = [2]float32{float32(ct.Yaw) / 100.0, float32(ct.Pitch) / 100.0}
 				sess.Velocity = [3]float32{float32(ct.VelX) / 100.0, float32(ct.VelY) / 100.0, float32(ct.VelZ) / 100.0}
@@ -237,7 +328,20 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.LastSeen = time.Now()
 				uuid := sess.AccountID
 				health := sess.Health
+				level := sess.CurrentLevel
+				prevSafe := sess.InSafeZone
 				sess.Unlock()
+
+				s.grid.Update(sessID, ct.PosX, ct.PosZ)
+
+				isSafe := (CheckSafeZone(ct.PosX, ct.PosY, ct.PosZ, level) != nil)
+				if isSafe != prevSafe {
+					sess.Lock()
+					sess.InSafeZone = isSafe
+					sess.Unlock()
+
+					s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, SafezoneState{InSafeZone: boolToUint8(isSafe)})
+				}
 
 				if uuid != "" {
 					s.QueuePlayerTransform(uuid, ct.PosX, ct.PosY, ct.PosZ, float32(ct.Yaw)/100.0, health)
@@ -341,11 +445,14 @@ func (s *Server) Tick(now time.Time) {
 	// Timeout stale sessions & queue periodic stats
 	for _, sess := range s.sessions.GetAll() {
 		sess.Lock()
+		sessID := sess.SessionID
 		uuid := sess.AccountID
 		stale := now.Sub(sess.LastSeen) > 30*time.Second
 		sess.Unlock()
 		if stale {
-			s.sessions.RemoveSession(sess.SessionID)
+			s.grid.Remove(sessID)
+			s.aoi.RemoveSession(sessID)
+			s.sessions.RemoveSession(sessID)
 		} else if isSecondTick && uuid != "" {
 			s.QueuePeriodicStats(uuid, 1)
 		}
@@ -451,6 +558,8 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	}
 
 	s.SendToSession(sess, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
+	s.grid.Remove(sessionID)
+	s.aoi.RemoveSession(sessionID)
 	s.sessions.RemoveSession(sessionID)
 	return true
 }

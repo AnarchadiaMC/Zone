@@ -436,23 +436,24 @@ Features and subsystems scheduled for upcoming milestones.
 
 | Subsystem | Priority | Current State | What Needs Doing |
 |:---|:---:|:---|:---|
-| Handshake response | **High** | Request parsed + logged, initial session created | Send `HANDSHAKE_RES`, wire spawn point and world time response |
-| Spatial grid | **High** | Basic grid struct exists | Complete `Insert`, `Remove`, `Update`, and radius neighbor query |
-| Packet dispatch — `DISCONNECT` (0x0003) | **High** | Client sends disconnect on unload | Wire server handler to broadcast leave to peers and flush state |
-| Packet dispatch — `STASH_INTERACT` (0x0040) | Medium | Opcode defined, stash manager tested | Wire opcode handler to StashManager CRUD, send `PKT_STASH_RESPONSE` |
-| Snapshot broadcast | **High** | Sparse packet serialization complete | Wire AoI spatial grid queries to broadcast snapshots to nearby peers |
-| ACK receive side | **High** | Reliable delivery queue tested | Handle incoming ACK packets on server to stop retransmissions |
-| Per-IP rate limiting | Medium | None | Add per-IP token bucket or connection cap to prevent flood-based DoS |
-| Packet authentication | Low | Sequence numbers validated | Add challenge-response handshake or HMAC session tokens |
+| Handshake response | **High** | **Complete** | Handshake sends `OpHandshakeRes`, spawns character, auto-provisions DB, sets world time |
+| Spatial grid | **High** | **Complete** | Full 2D spatial partitioning (`Insert`, `Remove`, `Update`, `GetNeighbors`) with exact Euclidean filtering |
+| Packet dispatch — `DISCONNECT` (0x0003) | **High** | **Complete** | Server handler flushes transform to DB, removes from grid/AoI, broadcasts `OpLeave` |
+| Packet dispatch — `STASH_INTERACT` (0x0040) | Medium | **Complete** | Opcode wired to StashManager CRUD (open, take, store), sends `StashResponsePayload` |
+| Reliable delivery ACK queue | **High** | **Complete** | Thread-safe `AckQueue` with 500ms retransmit, 5 retry limit, drop callback, and packet ACK cleanup |
+| Snapshot broadcast | **High** | Complete | Sparse packet serialization wired with AoI spatial grid queries to broadcast snapshots |
+| Protocol packet serialization | **High** | **Complete** | Comprehensive unit test suite covering roundtrip encoding/decoding for all wire opcodes |
+| Per-IP rate limiting | Medium | Pending | Add per-IP token bucket or connection cap to prevent flood-based DoS |
+| Packet authentication | Low | Sequence validated | Add challenge-response handshake or HMAC session tokens |
 
 #### Game Logic & World Simulation
 
 | Subsystem | Priority | Current State | What Needs Doing |
 |:---|:---:|:---|:---|
+| Safe zone server integration | **High** | **Complete** | Evaluated on client transform, updates session state, transmits `OpSafezoneState` (0x0020) |
+| `max_players` enforcement | Medium | **Complete** | Rejects handshake with Status 1 when session count reaches configured `max_players` |
 | Emission orchestrator | Medium | EmissionOrchestrator implemented | Wire orchestrator timer to game loop and broadcast `WORLD_EVENT` |
 | AI squad manager | Medium | SquadManager with patrol pathing implemented | Wire `Tick` to spawn/despawn squads and broadcast AI actions |
-| Safe zone server integration | **High** | `CheckSafeZone()` functional and tested | Call from transform handler, update `InSafeZone`, send `SAFEZONE_STATE` |
-| `max_players` enforcement | Medium | Validated in config | Reject handshake when session count reaches `max_players` |
 | `log_level` config | Medium | Config loaded | Wire to logger level filter |
 | `emission_interval_min` config | Medium | Config loaded | Wire to emission orchestrator timer |
 
@@ -462,6 +463,7 @@ Features and subsystems scheduled for upcoming milestones.
 |:---|:---:|:---|:---|
 | Master Server Browser | Low | Direct IP connect + local favorites complete | Add central HTTP master server listing for public community servers |
 | Dedicated Headless Linux VM Deployment | Low | Cross-compilation Makefile target ready | Deploy to headless Ubuntu container and verify LAN latency |
+
 
 
 ---
