@@ -1,125 +1,92 @@
-<?xml version="1.0" encoding="windows-1251"?>
-<!--
-    zone_ui_server_list.xml
-    Zone Online Native S.T.A.L.K.E.R. Server Browser Dialog Layout
-    Coordinates use virtual 1024x768 UI space.
--->
-<w>
-    <!-- Background dialog window frame (centered: 700x500 at 162, 134) -->
-    <background x="162" y="134" width="700" height="500">
-        <texture>ui_inGame2_main_window</texture>
+<?xml version="1.0" encoding="UTF-8"?>
+<w x="0" y="0" width="1024" height="768">
+    <background x="163" y="84" width="698" height="600" stretch="1">
+        <texture>ui\ui_actor_multiplayer_game_menu</texture>
     </background>
 
-    <!-- Dialog Header -->
-    <header x="172" y="146" width="680" height="30">
-        <text align="c" vert_align="c" font="letterica18">ZONE ONLINE — SERVER BROWSER</text>
-    </header>
+    <header_label x="200" y="100" width="624" height="30" font="letterica18" align="c" color="gold">
+        <text>ZONE ONLINE — SERVER BROWSER</text>
+    </header_label>
 
-    <!-- Server List Frame -->
-    <server_list_frame x="180" y="186" width="485" height="425">
-        <texture>ui_inGame2_main_window</texture>
+    <server_list_frame x="175" y="140" width="674" height="250">
+        <col_name x="0" y="0" width="280" height="20" font="letterica16"><text>Server Name</text></col_name>
+        <col_host x="280" y="0" width="220" height="20" font="letterica16"><text>Host / IP</text></col_host>
+        <col_port x="500" y="0" width="80" height="20" font="letterica16"><text>Port</text></col_port>
+        <col_status x="580" y="0" width="80" height="20" font="letterica16"><text>Status</text></col_status>
+        <list id="server_list" x="0" y="22" width="674" height="228" item_height="22" show_by_need="1">
+            <font font="letterica16" r="200" g="200" b="200" />
+            <text_color>
+                <e r="100" g="220" b="255" />
+                <d r="140" g="140" b="140" />
+            </text_color>
+        </list>
     </server_list_frame>
 
-    <!-- Column Headers -->
-    <cap_col_name x="188" y="192" width="180" height="20">
-        <text font="letterica16" r="238" g="155" b="23" align="l" vert_align="c">Server Name</text>
-    </cap_col_name>
-    <cap_col_host x="372" y="192" width="130" height="20">
-        <text font="letterica16" r="238" g="155" b="23" align="l" vert_align="c">Host</text>
-    </cap_col_host>
-    <cap_col_port x="506" y="192" width="65" height="20">
-        <text font="letterica16" r="238" g="155" b="23" align="l" vert_align="c">Port</text>
-    </cap_col_port>
-    <cap_col_status x="575" y="192" width="80" height="20">
-        <text font="letterica16" r="238" g="155" b="23" align="l" vert_align="c">Status</text>
-    </cap_col_status>
-
-    <!-- Scrollable Server ListBox -->
-    <server_list x="184" y="216" width="477" height="390" item_height="22" always_show_scroll="0" can_select="1">
-        <font font="letterica16" r="200" g="200" b="200" />
-        <text_color>
-            <e r="100" g="220" b="255" />
-            <d r="140" g="140" b="140" />
-        </text_color>
-    </server_list>
-
-    <!-- Direct Connect Header -->
-    <cap_direct_connect x="680" y="186" width="170" height="22">
-        <text font="letterica16" r="238" g="155" b="23" align="l" vert_align="c">Direct Connect</text>
-    </cap_direct_connect>
-
-    <!-- Direct Connect Input: Server IP -->
-    <cap_ip x="680" y="212" width="170" height="18">
-        <text font="letterica16" align="l" r="180" g="180" b="180">Server IP:</text>
-    </cap_ip>
-    <edit_ip x="680" y="232" width="170" height="24">
+    <direct_label x="175" y="400" width="300" height="22" font="letterica16"><text>Direct Connect:</text></direct_label>
+    <ip_label x="175" y="428" width="80" height="22" font="letterica16"><text>IP Address:</text></ip_label>
+    <edit_ip id="edit_ip" x="260" y="428" width="240" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>64</max_symb_count>
     </edit_ip>
-    <!-- Backward compatibility alias -->
-    <ip_edit x="680" y="232" width="170" height="24">
+    <ip_edit id="ip_edit" x="260" y="428" width="240" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>64</max_symb_count>
     </ip_edit>
 
-    <!-- Direct Connect Input: Port -->
-    <cap_port x="680" y="262" width="170" height="18">
-        <text font="letterica16" align="l" r="180" g="180" b="180">Port:</text>
-    </cap_port>
-    <edit_port x="680" y="282" width="170" height="24">
+    <port_label x="175" y="458" width="80" height="22" font="letterica16"><text>Port:</text></port_label>
+    <edit_port id="edit_port" x="260" y="458" width="100" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>5</max_symb_count>
     </edit_port>
-    <!-- Backward compatibility alias -->
-    <port_edit x="680" y="282" width="170" height="24">
+    <port_edit id="port_edit" x="260" y="458" width="100" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>5</max_symb_count>
     </port_edit>
 
-    <!-- Direct Connect Input: Nickname -->
-    <cap_nick x="680" y="312" width="170" height="18">
-        <text font="letterica16" align="l" r="180" g="180" b="180">Nickname:</text>
-    </cap_nick>
-    <edit_nick x="680" y="332" width="170" height="24">
+    <nick_label x="175" y="488" width="80" height="22" font="letterica16"><text>Callsign:</text></nick_label>
+    <edit_nick id="edit_nick" x="260" y="488" width="200" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>32</max_symb_count>
     </edit_nick>
-    <!-- Backward compatibility alias -->
-    <nick_edit x="680" y="332" width="170" height="24">
+    <nick_edit id="nick_edit" x="260" y="488" width="200" height="24">
         <texture>ui_inGame2_edit_box</texture>
         <font font="letterica16" />
         <text_color r="230" g="230" b="230" />
         <max_symb_count>32</max_symb_count>
     </nick_edit>
 
-    <!-- Action Buttons -->
-    <btn_connect x="680" y="375" width="170" height="32">
-        <texture>ui_inGame2_button</texture>
-        <text font="letterica18" r="80" g="220" b="80">Connect</text>
+    <btn_connect id="btn_connect" x="175" y="524" width="140" height="36" font="letterica18">
+        <text>Connect</text>
+        <texture>ui\ui_common:ui_inGame2_button_e</texture>
     </btn_connect>
 
-    <btn_add_fav x="680" y="415" width="170" height="28">
-        <texture>ui_inGame2_button</texture>
-        <text font="letterica16" r="180" g="180" b="255">Add Favorite</text>
+    <btn_add_fav id="btn_add_fav" x="325" y="524" width="140" height="36" font="letterica18">
+        <text>Add Favorite</text>
+        <texture>ui\ui_common:ui_inGame2_button_e</texture>
     </btn_add_fav>
 
-    <btn_del_fav x="680" y="450" width="170" height="28">
-        <texture>ui_inGame2_button</texture>
-        <text font="letterica16" r="255" g="140" b="100">Remove</text>
+    <btn_del_fav id="btn_del_fav" x="475" y="524" width="155" height="36" font="letterica18">
+        <text>Remove Fav</text>
+        <texture>ui\ui_common:ui_inGame2_button_e</texture>
     </btn_del_fav>
 
-    <btn_back x="680" y="580" width="170" height="28">
-        <texture>ui_inGame2_button</texture>
-        <text font="letterica16" r="200" g="200" b="200">Back</text>
+    <btn_back id="btn_back" x="175" y="572" width="140" height="36" font="letterica18">
+        <text>Back</text>
+        <texture>ui\ui_common:ui_inGame2_button_e</texture>
     </btn_back>
+
+    <btn_zone_online x="40" y="548" width="215" height="30">
+        <texture>ui\ui_common:ui_inGame2_button_e</texture>
+        <text font="letterica18" r="255" g="255" b="255">Zone Online</text>
+    </btn_zone_online>
 </w>

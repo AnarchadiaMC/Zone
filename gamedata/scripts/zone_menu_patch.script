@@ -18,31 +18,12 @@ local function attach_zone_button(menu_wnd)
     local existing = menu_wnd[BUTTON_REG_NAME]
     if existing then return end
 
-    -- Build CUI3tButton programmatically
-    local btn = CUI3tButton()
+    -- Build CUI3tButton from XML to match native Anomaly style
+    local xml = CScriptXmlInit()
+    xml:ParseFile("zone_ui_server_list.xml")
+
+    local btn = xml:Init3tButton("btn_zone_online", menu_wnd)
     btn:SetAutoDelete(true)
-
-    -- Anomaly 1024x768 UI: position below standard menu items (y=548)
-    btn:SetWndRect(Frect():set(40, 548, 215, 578))
-
-    if GetFontLetterica18Russian then
-        btn:SetFont(GetFontLetterica18Russian())
-    elseif GetFontLetterica16Russian then
-        btn:SetFont(GetFontLetterica16Russian())
-    end
-
-    if btn.SetText then
-        pcall(function() btn:SetText(BUTTON_TEXT) end)
-    end
-    if btn.TextControl then
-        pcall(function() btn:TextControl():SetText(BUTTON_TEXT) end)
-    end
-
-    if GetARGB then
-        btn:SetTextColor(GetARGB(255, 100, 200, 255))
-    end
-
-    menu_wnd:AttachChild(btn)
     menu_wnd:Register(btn, BUTTON_REG_NAME)
     menu_wnd:AddCallback(
         BUTTON_REG_NAME,
