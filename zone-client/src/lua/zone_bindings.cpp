@@ -72,16 +72,17 @@ namespace
 
     int ZN_SendTransform(lua_State* L)
     {
-        float x = (float)luaL_checknumber(L, 1);
-        float y = (float)luaL_checknumber(L, 2);
-        float z = (float)luaL_checknumber(L, 3);
-        int16_t yaw = (int16_t)luaL_checknumber(L, 4);
-        int16_t pitch = (int16_t)luaL_checknumber(L, 5);
-        int16_t vx = (int16_t)luaL_checknumber(L, 6);
-        int16_t vy = (int16_t)luaL_checknumber(L, 7);
-        int16_t vz = (int16_t)luaL_checknumber(L, 8);
-        uint16_t animflags = (uint16_t)luaL_checknumber(L, 9);
-        NetClient::SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags);
+        NetClient::Transform transform;
+        transform.x = (float)luaL_checknumber(L, 1);
+        transform.y = (float)luaL_checknumber(L, 2);
+        transform.z = (float)luaL_checknumber(L, 3);
+        transform.yaw = (int16_t)luaL_checknumber(L, 4);
+        transform.pitch = (int16_t)luaL_checknumber(L, 5);
+        transform.vx = (int16_t)luaL_checknumber(L, 6);
+        transform.vy = (int16_t)luaL_checknumber(L, 7);
+        transform.vz = (int16_t)luaL_checknumber(L, 8);
+        transform.animflags = (uint16_t)luaL_checknumber(L, 9);
+        NetClient::SendTransform(transform);
         return 0;
     }
 

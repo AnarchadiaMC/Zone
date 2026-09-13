@@ -245,13 +245,13 @@ namespace NetClient
         g_State = DISCONNECTED;
     }
 
-    void SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint16_t animflags)
+    void SendTransform(const Transform& transform)
     {
         std::lock_guard<std::mutex> lock(g_TransformMutex);
-        g_Transform.x = x; g_Transform.y = y; g_Transform.z = z;
-        g_Transform.yaw = yaw; g_Transform.pitch = pitch;
-        g_Transform.vx = vx; g_Transform.vy = vy; g_Transform.vz = vz;
-        g_Transform.animflags = animflags;
+        g_Transform.x = transform.x; g_Transform.y = transform.y; g_Transform.z = transform.z;
+        g_Transform.yaw = transform.yaw; g_Transform.pitch = transform.pitch;
+        g_Transform.vx = transform.vx; g_Transform.vy = transform.vy; g_Transform.vz = transform.vz;
+        g_Transform.animflags = transform.animflags;
         g_Transform.updated = true;
     }
 
