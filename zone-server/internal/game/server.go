@@ -1,26 +1,25 @@
 package game
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"net"
-	"time"
 	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"go.uber.org/zap"
+	"zone-online/zone-server/internal/ai"
 	"zone-online/zone-server/internal/config"
 	"zone-online/zone-server/internal/database"
 	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
-	"zone-online/zone-server/internal/ai"
-	"go.uber.org/zap"
 )
 
 type EventManager struct{}
 func NewEventManager() *EventManager { return &EventManager{} }
-
-type AntiCheatManager struct{}
-func NewAntiCheatManager() *AntiCheatManager { return &AntiCheatManager{} }
 
 type Server struct {
 	cfg       *config.Config
@@ -137,6 +136,92 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 		}
+	case protocol.OpChatText:
+		var pkt protocol.ChatText
+		if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
+			return
+		}
+		// Extract text up to the declared length, capped at 255.
+		textLen := int(pkt.Len)
+		if textLen > 255 {
+			textLen = 255
+		}
+		raw := string(pkt.Text[:textLen])
+
+		// Sanitize: strip non-printable runes and ensure valid UTF-8.
+		sanitized := sanitizeChatText(raw)
+
+		s.logger.Info("chat",
+			zap.Uint32("sender_session", pkt.SenderID),
+			zap.String("text", sanitized),
+		)
+		s.BroadcastChat(pkt.SenderID, sanitized)
+	case protocol.OpStashInteract:
+		var pkt protocol.StashInteractPayload
+		if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
+			s.logger.Warn("OpStashInteract: failed to parse payload", zap.Error(err))
+			return
+		}
+
+		sess := s.sessions.GetByAddr(addr.String())
+		var sessionID uint32
+		if sess != nil {
+			sess.Lock()
+			sessionID = sess.SessionID
+			sess.Unlock()
+		}
+
+		stashID := pkt.StashID
+		section := nullTermString(pkt.ItemSection[:])
+		count := int(pkt.Count)
+
+		var status uint8
+		var contents []byte
+
+		switch pkt.Action {
+		case 1: // Open
+			s.logger.Info("Stash opened", zap.Uint32("stash_id", stashID), zap.Uint32("session_id", sessionID))
+			var err error
+			contents, err = s.stashMgr.OpenStash(stashID, sessionID)
+			if err != nil {
+				if err == ErrStashNotFound {
+					status = 1
+				} else {
+					status = 2
+				}
+			}
+		case 2: // Take
+			s.logger.Info("Stash take", zap.Uint32("stash_id", stashID), zap.String("section", section), zap.Int("count", count))
+			if err := s.stashMgr.ModifyStashItem(stashID, section, -count); err != nil {
+				if err == ErrStashNotFound {
+					status = 1
+				} else {
+					status = 2
+				}
+			}
+		case 3: // Store
+			s.logger.Info("Stash store", zap.Uint32("stash_id", stashID), zap.String("section", section), zap.Int("count", count))
+			if err := s.stashMgr.ModifyStashItem(stashID, section, +count); err != nil {
+				if err == ErrStashNotFound {
+					status = 1
+				} else {
+					status = 2
+				}
+			}
+		default:
+			s.logger.Warn("OpStashInteract: unknown action", zap.Uint8("action", pkt.Action))
+			status = 2
+		}
+
+		resp := protocol.StashResponsePayload{
+			StashID: stashID,
+			Status:  status,
+			Count:   pkt.Count,
+		}
+		if len(contents) > 0 && len(contents) <= len(resp.Data) {
+			copy(resp.Data[:], contents)
+		}
+		s.sendStashResponse(addr, resp)
 	}
 }
 
@@ -246,4 +331,35 @@ func (s *Server) BanPlayer(uuid string, reason string) error {
 		}
 	}
 	return nil
+}
+
+// sendStashResponse serialises resp as OpStashResponse and sends it directly
+// to addr without requiring an established session (client may not be registered yet).
+func (s *Server) sendStashResponse(addr *net.UDPAddr, resp protocol.StashResponsePayload) {
+	if s.udp == nil {
+		return
+	}
+	seq := s.seq.Add(1)
+	var buf bytes.Buffer
+	if err := protocol.WritePacket(&buf, protocol.OpStashResponse, seq, protocol.FlagReliable, resp); err != nil {
+		s.logger.Error("sendStashResponse: failed to write packet", zap.Error(err))
+		return
+	}
+	data := buf.Bytes()
+	if s.ackQueue != nil {
+		s.ackQueue.EnqueueReliable(seq, addr, data)
+	}
+	if err := s.udp.Send(addr, data); err != nil {
+		s.logger.Error("sendStashResponse: send failed", zap.Error(err))
+	}
+}
+
+// nullTermString converts a null-terminated fixed-width byte slice to a Go string.
+func nullTermString(b []byte) string {
+	for i, c := range b {
+		if c == 0 {
+			return string(b[:i])
+		}
+	}
+	return string(b)
 }
