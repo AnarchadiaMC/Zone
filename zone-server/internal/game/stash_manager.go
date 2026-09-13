@@ -96,9 +96,6 @@ func (m *StashManager) SaveStash(stashID uint32, level string, x, y, z float32, 
 		return err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	contentsJSON := string(contents)
 	if len(contents) == 0 {
 		contentsJSON = "[]"
@@ -106,6 +103,7 @@ func (m *StashManager) SaveStash(stashID uint32, level string, x, y, z float32, 
 
 	return db.SaveStash(stashID, level, x, y, z, contentsJSON)
 }
+
 
 // OpenStash marks the stash as opened by sessionID and returns its contents.
 func (m *StashManager) OpenStash(stashID uint32, sessionID uint32) ([]byte, error) {

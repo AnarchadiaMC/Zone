@@ -59,6 +59,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
+	defer db.Close()
 	
 	if err := game.SeedSafeZones(db.RawDB()); err != nil {
 		log.Fatalf("Failed to seed safe zones: %v", err)
