@@ -36,6 +36,22 @@ type ClientTransform struct {
 	AnimFlags uint16
 }
 
+type SnapshotEntry struct {
+	SessionID uint32
+	PosX      float32
+	PosY      float32
+	PosZ      float32
+	Yaw       int16
+	Pitch     int16
+	AnimFlags uint16
+	Health    uint8
+}
+
+type ServerSnapshot struct {
+	Count   uint8
+	Entries [64]SnapshotEntry
+}
+
 func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interface{}) error {
 	var buf bytes.Buffer
 	if payload != nil {
