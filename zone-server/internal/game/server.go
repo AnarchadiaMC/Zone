@@ -22,9 +22,6 @@ func NewEventManager() *EventManager { return &EventManager{} }
 type AntiCheatManager struct{}
 func NewAntiCheatManager() *AntiCheatManager { return &AntiCheatManager{} }
 
-type EconomyManager struct{}
-func NewEconomyManager() *EconomyManager { return &EconomyManager{} }
-
 type Server struct {
 	cfg       *config.Config
 	db        *database.DB
