@@ -90,9 +90,75 @@ func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *
 }
 
 func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info EntityInfo, udp *network.UDPListener, seq *atomic.Uint32) {
-	// Stubs for enter aoi
+	if session == nil {
+		return
+	}
+	session.Lock()
+	sessID := session.SessionID
+	udpAddr := session.UDPAddr
+	session.Unlock()
+
+	if udpAddr == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if _, ok := a.entries[sessID]; !ok {
+		a.entries[sessID] = make(map[uint32]bool)
+	}
+	if a.entries[sessID][info.ID] {
+		a.mu.Unlock()
+		return
+	}
+	a.entries[sessID][info.ID] = true
+	a.mu.Unlock()
+
+	var sec [32]byte
+	copy(sec[:], info.Section)
+	var fac [16]byte
+	fac[0] = info.Faction
+
+	pkt := protocol.EntityEnterAoI{
+		EntityID:   info.ID,
+		EntityType: info.Type,
+		Section:    sec,
+		PosX:       info.Pos[0],
+		PosY:       info.Pos[1],
+		PosZ:       info.Pos[2],
+		Faction:    fac,
+		Health:     uint8(info.Health),
+	}
+
+	var buf bytes.Buffer
+	seqID := seq.Add(1)
+	if err := protocol.WritePacket(&buf, protocol.OpEntityEnterAoI, seqID, protocol.FlagReliable, pkt); err == nil {
+		_ = udp.Send(udpAddr, buf.Bytes())
+	}
 }
 
 func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID uint32, udp *network.UDPListener, seq *atomic.Uint32) {
-	// Stubs for leave aoi
+	if session == nil {
+		return
+	}
+	session.Lock()
+	sessID := session.SessionID
+	udpAddr := session.UDPAddr
+	session.Unlock()
+
+	if udpAddr == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if set, ok := a.entries[sessID]; ok {
+		delete(set, entityID)
+	}
+	a.mu.Unlock()
+
+	var buf bytes.Buffer
+	pkt := protocol.EntityLeaveAoI{EntityID: entityID}
+	seqID := seq.Add(1)
+	if err := protocol.WritePacket(&buf, protocol.OpEntityLeaveAoI, seqID, protocol.FlagReliable, pkt); err == nil {
+		_ = udp.Send(udpAddr, buf.Bytes())
+	}
 }

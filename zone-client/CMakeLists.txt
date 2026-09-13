@@ -49,6 +49,7 @@ target_link_libraries(ZoneClient PRIVATE
     shlwapi
     winmm
     wbemuuid
+    rpcrt4
 )
 target_compile_definitions(ZoneClient PRIVATE ZO_INJECTABLE)
 
@@ -56,4 +57,4 @@ target_compile_definitions(ZoneClient PRIVATE ZO_INJECTABLE)
 # Target 2: ZoneClient_Injector (EXE)
 # ----------------------------------------------------------------------
 add_executable(ZoneClient_Injector injector/injector_main.cpp)
-target_link_libraries(ZoneClient_Injector PRIVATE psapi)
+target_link_libraries(ZoneClient_Injector PRIVATE psapi rpcrt4)

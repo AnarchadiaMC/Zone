@@ -103,11 +103,9 @@ namespace
                 {
                     // Send Handshake
                     HandshakeReq req = {};
-                    strncpy(req.uuid, g_UUID.c_str(), sizeof(req.uuid) - 1);
-                    req.uuid[sizeof(req.uuid) - 1] = '\0';
+                    snprintf(req.uuid, sizeof(req.uuid), "%s", g_UUID.c_str());
                     req.hwid = g_HWID;
-                    strncpy(req.nick, g_Nick.c_str(), sizeof(req.nick) - 1);
-                    req.nick[sizeof(req.nick) - 1] = '\0';
+                    snprintf(req.nick, sizeof(req.nick), "%s", g_Nick.c_str());
                     req.protoVer = 1;
                     
                     ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::HANDSHAKE_REQ, sizeof(req) };
@@ -323,9 +321,8 @@ namespace NetClient
         if (g_State != CONNECTED) return;
         ChatText ct = {};
         ct.senderID = g_SessionID;
-        ct.len = (uint8_t)std::min(text.length(), (size_t)(sizeof(ct.text) - 1));
-        strncpy(ct.text, text.c_str(), sizeof(ct.text) - 1);
-        ct.text[sizeof(ct.text) - 1] = '\0';
+        ct.len = (uint8_t)std::min(text.length(), sizeof(ct.text) - 1);
+        snprintf(ct.text, sizeof(ct.text), "%s", text.c_str());
         
         ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::CHAT_TEXT, sizeof(ct) };
         char buf[1500];

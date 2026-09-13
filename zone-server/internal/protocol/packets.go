@@ -52,6 +52,21 @@ type ServerSnapshot struct {
 	Entries [64]SnapshotEntry
 }
 
+type EntityEnterAoI struct {
+	EntityID   uint32
+	EntityType uint8
+	Section    [32]byte
+	PosX       float32
+	PosY       float32
+	PosZ       float32
+	Faction    [16]byte
+	Health     uint8
+}
+
+type EntityLeaveAoI struct {
+	EntityID uint32
+}
+
 func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interface{}) error {
 	var buf bytes.Buffer
 	if payload != nil {

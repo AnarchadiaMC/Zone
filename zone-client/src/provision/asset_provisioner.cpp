@@ -75,7 +75,7 @@ namespace AssetProvisioner
             EnsureDirectoryTree(path.substr(0, slash));
         }
 
-        std::ofstream file(path, std::ios::out | std::ios::binary);
+        std::ofstream file(path.c_str(), std::ios::out | std::ios::binary);
         if (!file.is_open())
             return false;
 

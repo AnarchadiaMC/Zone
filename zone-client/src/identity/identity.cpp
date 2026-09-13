@@ -3,7 +3,7 @@
 #include <shlobj.h>
 #include <fstream>
 #include <sstream>
-#include <Rpc.h>
+#include <rpc.h>
 #pragma comment(lib, "Rpcrt4.lib")
 #include "../provision/asset_provisioner.h"
 

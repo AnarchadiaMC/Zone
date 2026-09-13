@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"hash/fnv"
 	"net"
 	"strconv"
 	"sync"
@@ -122,9 +121,16 @@ func (l *UDPListener) Start(ctx context.Context) {
 			copy(data, buf[:n])
 			l.pool.Put(bufPtr)
 
-			h := fnv.New32a()
-			h.Write([]byte(addr.String()))
-			workerIdx := h.Sum32() % 8
+			var hash uint32 = 2166136261
+			for _, c := range addr.IP {
+				hash ^= uint32(c)
+				hash *= 16777619
+			}
+			hash ^= uint32(addr.Port & 0xff)
+			hash *= 16777619
+			hash ^= uint32((addr.Port >> 8) & 0xff)
+			hash *= 16777619
+			workerIdx := hash % 8
 
 			select {
 			case l.workers[workerIdx] <- &incomingPacket{data: data, addr: addr}:
