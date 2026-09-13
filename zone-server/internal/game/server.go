@@ -39,7 +39,9 @@ type LeaveAoI struct {
 }
 
 const (
-	OpLeave = protocol.OpEntityLeaveAoI
+	OpLeave    = protocol.OpEntityLeaveAoI
+	OpAiAction = protocol.OpAIActionEvent
+	OpAck      = 0x0005
 )
 
 func boolToUint8(b bool) uint8 {
@@ -54,24 +56,25 @@ type EventManager struct{}
 func NewEventManager() *EventManager { return &EventManager{} }
 
 type Server struct {
-	cfg       *config.Config
-	db        *database.DB
-	dbQueue   chan *database.DBWriteJob
-	udp       *network.UDPListener
-	udpMu     sync.RWMutex
-	sessions  *network.SessionManager
-	grid      *SpatialGrid
-	events    *EventManager
-	economy   *EconomyManager
-	stashMgr  *StashManager
-	anticheat *AntiCheatManager
-	aoi       *AoIManager
-	squads    *ai.SquadManager
-	logger    *zap.Logger
-	seq       atomic.Uint32
-	ackQueue  *network.AckQueue
-	startTime time.Time
-	tickCount atomic.Uint64
+	cfg         *config.Config
+	db          *database.DB
+	dbQueue     chan *database.DBWriteJob
+	udp         *network.UDPListener
+	udpMu       sync.RWMutex
+	sessions    *network.SessionManager
+	grid        *SpatialGrid
+	events      *EventManager
+	economy     *EconomyManager
+	stashMgr    *StashManager
+	anticheat   *AntiCheatManager
+	aoi         *AoIManager
+	squads      *ai.SquadManager
+	logger      *zap.Logger
+	seq         atomic.Uint32
+	ackQueue    *network.AckQueue
+	emissionMgr *EmissionOrchestrator
+	startTime   time.Time
+	tickCount   atomic.Uint64
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {
@@ -80,23 +83,60 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		q = dbQueue[0]
 	}
 	s := &Server{
-		cfg:       cfg,
-		db:        db,
-		dbQueue:   q,
-		sessions:  network.NewSessionManager(),
-		grid:      NewSpatialGrid(64.0),
-		events:    NewEventManager(),
-		economy:   NewEconomyManager(db),
-		stashMgr:  NewStashManager(db),
-		anticheat: NewAntiCheatManager(),
-		aoi:       NewAoIManager(),
-		squads:    ai.NewSquadManager(),
-		logger:    logger,
-		ackQueue:  network.NewAckQueue(),
-		startTime: time.Now(),
+		cfg:         cfg,
+		db:          db,
+		dbQueue:     q,
+		sessions:    network.NewSessionManager(),
+		grid:        NewSpatialGrid(64.0),
+		events:      NewEventManager(),
+		economy:     NewEconomyManager(db),
+		stashMgr:    NewStashManager(db),
+		anticheat:   NewAntiCheatManager(),
+		aoi:         NewAoIManager(),
+		squads:      ai.NewSquadManager(),
+		logger:      logger,
+		ackQueue:    network.NewAckQueue(),
+		emissionMgr: NewEmissionOrchestrator(),
+		startTime:   time.Now(),
+	}
+
+	s.ackQueue.SetSendFunc(func(addr *net.UDPAddr, data []byte) error {
+		if activeSink != nil {
+			activeSink.Record(data)
+		}
+		if u := s.GetUDP(); u != nil {
+			return u.Send(addr, data)
+		}
+		return nil
+	})
+	s.ackQueue.SetOnDrop(func(seq uint32, addr *net.UDPAddr) {
+		s.logger.Warn("Reliable packet dropped after max retries",
+			zap.Uint32("seq", seq),
+			zap.String("addr", addr.String()),
+		)
+	})
+
+	if cfg != nil && cfg.EmissionIntervalMin > 0 {
+		s.emissionMgr.SetDormantDuration(time.Duration(cfg.EmissionIntervalMin) * time.Minute)
 	}
 	return s
 }
+
+// EmissionMgr returns the active EmissionOrchestrator instance.
+func (s *Server) EmissionMgr() *EmissionOrchestrator {
+	return s.emissionMgr
+}
+
+// Squads returns the active SquadManager instance.
+func (s *Server) Squads() *ai.SquadManager {
+	return s.squads
+}
+
+// AckQueue returns the active AckQueue instance.
+func (s *Server) AckQueue() *network.AckQueue {
+	return s.ackQueue
+}
+
 
 // GetUDP safely retrieves the active UDPListener.
 func (s *Server) GetUDP() *network.UDPListener {
@@ -434,6 +474,18 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			copy(resp.Data[:], contents)
 		}
 		s.sendStashResponse(addr, resp)
+	case OpAck:
+		if s.ackQueue != nil {
+			var ackSeq uint32
+			if binary.Read(buf, binary.LittleEndian, &ackSeq) == nil && ackSeq != 0 {
+				s.ackQueue.Acknowledge(ackSeq)
+			}
+			s.ackQueue.Acknowledge(hdr.SequenceNum)
+		}
+	default:
+		if s.ackQueue != nil && (hdr.FlagsChannel&protocol.FlagReliable != 0 || hdr.Opcode == 0) {
+			s.ackQueue.Acknowledge(hdr.SequenceNum)
+		}
 	}
 }
 
@@ -460,6 +512,39 @@ func (s *Server) Tick(now time.Time) {
 	if udp := s.GetUDP(); udp != nil {
 		s.aoi.BroadcastSnapshots(s.sessions, s.grid, udp, &s.seq)
 	}
+
+	if s.emissionMgr != nil {
+		s.emissionMgr.Tick(now, s.sessions, s.GetUDP(), &s.seq)
+	}
+
+	if s.ackQueue != nil {
+		s.ackQueue.Tick(now)
+	}
+
+	if udp := s.GetUDP(); udp != nil {
+		if s.squads != nil {
+			s.squads.Tick(now, func(squadID uint32, state ai.AIState, pos [3]float32) {
+				s.broadcastSquadAction(squadID, state, pos)
+			})
+		}
+	}
+}
+
+func (s *Server) broadcastSquadAction(squadID uint32, state ai.AIState, pos [3]float32) {
+	payload := protocol.AIActionPayload{
+		SquadID: squadID,
+		State:   uint8(state),
+		PosX:    pos[0],
+		PosY:    pos[1],
+		PosZ:    pos[2],
+	}
+	for _, sess := range s.sessions.GetAll() {
+		s.SendToSession(sess, OpAiAction, protocol.FlagUnreliable, payload)
+	}
+}
+
+func (s *Server) BroadcastSquadAction(squadID uint32, state ai.AIState, pos [3]float32) {
+	s.broadcastSquadAction(squadID, state, pos)
 }
 
 func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{}) {

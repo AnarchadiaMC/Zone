@@ -5,22 +5,41 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"zone-online/zone-server/internal/config"
 	"zone-online/zone-server/internal/database"
 	"zone-online/zone-server/internal/game"
-	"go.uber.org/zap"
 )
 
 func main() {
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
-
 	cfg, err := config.Load("zone_server.yaml")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	level := zapcore.InfoLevel
+	switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
+	case "debug":
+		level = zapcore.DebugLevel
+	case "info":
+		level = zapcore.InfoLevel
+	case "warn":
+		level = zapcore.WarnLevel
+	case "error":
+		level = zapcore.ErrorLevel
+	}
+
+	zapCfg := zap.NewProductionConfig()
+	zapCfg.Level = zap.NewAtomicLevelAt(level)
+	logger, err := zapCfg.Build()
+	if err != nil {
+		log.Fatalf("Failed to build logger: %v", err)
+	}
+	defer logger.Sync()
 
 	logger.Info("Starting Zone Server", zap.Int("port", cfg.Port))
 

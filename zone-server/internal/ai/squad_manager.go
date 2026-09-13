@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -15,6 +16,23 @@ const (
 	AIStateFlee   AIState = 3
 	AIStateDead   AIState = 4
 )
+
+func (s AIState) String() string {
+	switch s {
+	case AIStateIdle:
+		return "Idle"
+	case AIStatePatrol:
+		return "Patrol"
+	case AIStateAttack:
+		return "Attack"
+	case AIStateFlee:
+		return "Flee"
+	case AIStateDead:
+		return "Dead"
+	default:
+		return "Unknown"
+	}
+}
 
 // patrolStepSize is the world-unit distance advanced per Tick along a patrol path.
 const patrolStepSize float32 = 2.0
@@ -101,25 +119,25 @@ func (sm *SquadManager) GetSquad(id uint32) (*Squad, bool) {
 	return sq, ok
 }
 
-// Tick advances all squad AI states and movement, then calls broadcastFn for
-// every live squad so the caller can fan out packets to nearby sessions.
-// broadcastFn receives (squadID, currentState, currentPosition).
-//
-// Tick deliberately does not import internal/game to avoid circular imports.
-func (sm *SquadManager) Tick(_ time.Time, broadcastFn func(squadID uint32, state AIState, pos [3]float32)) {
+// GetAllSquads returns a slice of all active squads.
+func (sm *SquadManager) GetAllSquads() []*Squad {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	squads := make([]*Squad, 0, len(sm.squads))
+	for _, sq := range sm.squads {
+		squads = append(squads, sq)
+	}
+	return squads
+}
+
+// SetSquadState updates the AI state of the squad with the given ID.
+func (sm *SquadManager) SetSquadState(id uint32, state AIState) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	for _, sq := range sm.squads {
-		if sq.State == AIStateDead {
-			continue
-		}
-
-		if sq.State == AIStatePatrol {
-			sq.advancePatrol()
-		}
-
-		broadcastFn(sq.ID, sq.State, sq.Position)
+	if sq, ok := sm.squads[id]; ok {
+		sq.State = state
 	}
 }
 
@@ -130,6 +148,51 @@ func (sm *SquadManager) Count() int {
 	return len(sm.squads)
 }
 
+type squadBroadcast struct {
+	id    uint32
+	state AIState
+	pos   [3]float32
+}
+
+// Tick advances all squad AI states and movement, then calls broadcastFn for
+// every live squad so the caller can fan out packets to nearby sessions.
+// broadcastFn receives (squadID, currentState, currentPosition).
+//
+// Tick safely skips AIStateDead squads and deliberately avoids importing
+// internal/game to prevent circular imports.
+func (sm *SquadManager) Tick(_ time.Time, broadcastFn func(squadID uint32, state AIState, pos [3]float32)) {
+	sm.mu.Lock()
+	var broadcasts []squadBroadcast
+	if broadcastFn != nil && len(sm.squads) > 0 {
+		broadcasts = make([]squadBroadcast, 0, len(sm.squads))
+	}
+
+	for _, sq := range sm.squads {
+		if sq.State == AIStateDead {
+			continue
+		}
+
+		if sq.State == AIStatePatrol {
+			sq.advancePatrol()
+		}
+
+		if broadcastFn != nil {
+			broadcasts = append(broadcasts, squadBroadcast{
+				id:    sq.ID,
+				state: sq.State,
+				pos:   sq.Position,
+			})
+		}
+	}
+	sm.mu.Unlock()
+
+	if broadcastFn != nil {
+		for _, b := range broadcasts {
+			broadcastFn(b.id, b.state, b.pos)
+		}
+	}
+}
+
 // advancePatrol moves the squad one step along its path, looping when the end
 // is reached so the squad continuously patrols the circuit.
 func (sq *Squad) advancePatrol() {
@@ -137,13 +200,27 @@ func (sq *Squad) advancePatrol() {
 		return
 	}
 
+	if sq.PathIndex >= len(sq.Path) {
+		sq.PathIndex = 0
+	}
+
 	target := sq.Path[sq.PathIndex]
 	dx := target.X - sq.Position[0]
 	dy := target.Y - sq.Position[1]
 	dz := target.Z - sq.Position[2]
+	distSq := dx*dx + dy*dy + dz*dz
+
+	// If already at the current waypoint, advance to the next waypoint.
+	if distSq < 1e-4 {
+		sq.PathIndex = (sq.PathIndex + 1) % len(sq.Path)
+		target = sq.Path[sq.PathIndex]
+		dx = target.X - sq.Position[0]
+		dy = target.Y - sq.Position[1]
+		dz = target.Z - sq.Position[2]
+		distSq = dx*dx + dy*dy + dz*dz
+	}
 
 	// Euclidean distance to the next waypoint.
-	distSq := dx*dx + dy*dy + dz*dz
 	if distSq <= patrolStepSize*patrolStepSize {
 		// Snap to waypoint and advance the index (loop).
 		sq.Position = [3]float32{target.X, target.Y, target.Z}
@@ -152,16 +229,7 @@ func (sq *Squad) advancePatrol() {
 	}
 
 	// Move patrolStepSize units toward the target.
-	var dist float32
-	for v := distSq; ; {
-		dist = v
-		v = (v + distSq/v) / 2
-		if v >= dist {
-			break
-		}
-		dist = v
-	}
-
+	dist := float32(math.Sqrt(float64(distSq)))
 	if dist > 0 {
 		sq.Position[0] += (dx / dist) * patrolStepSize
 		sq.Position[1] += (dy / dist) * patrolStepSize
