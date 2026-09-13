@@ -3,8 +3,12 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 )
+
+var ErrPayloadTooLarge = errors.New("payload exceeds uint16 maximum")
+
 
 type HandshakeReq struct {
 	UUID        [36]byte
@@ -145,11 +149,44 @@ type EntityAoIPayload struct {
 func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interface{}) error {
 	var buf bytes.Buffer
 	if payload != nil {
-		if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
-			return err
+		switch p := payload.(type) {
+		case *ServerSnapshot:
+			if err := binary.Write(&buf, binary.LittleEndian, p.Count); err != nil {
+				return err
+			}
+			count := int(p.Count)
+			if count > len(p.Entries) {
+				count = len(p.Entries)
+			}
+			if count > 0 {
+				if err := binary.Write(&buf, binary.LittleEndian, p.Entries[:count]); err != nil {
+					return err
+				}
+			}
+		case ServerSnapshot:
+			if err := binary.Write(&buf, binary.LittleEndian, p.Count); err != nil {
+				return err
+			}
+			count := int(p.Count)
+			if count > len(p.Entries) {
+				count = len(p.Entries)
+			}
+			if count > 0 {
+				if err := binary.Write(&buf, binary.LittleEndian, p.Entries[:count]); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
+				return err
+			}
 		}
 	}
-	
+
+	if buf.Len() > 65535 {
+		return ErrPayloadTooLarge
+	}
+
 	hdr := PacketHeader{
 		Magic:         HeaderMagic,
 		Protocol:      ProtocolVer,
@@ -162,9 +199,30 @@ func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interf
 	if err := binary.Write(w, binary.LittleEndian, &hdr); err != nil {
 		return err
 	}
-	
+
 	_, err := w.Write(buf.Bytes())
 	return err
+}
+
+func WriteServerSnapshot(w io.Writer, seq uint32, flags uint8, snap *ServerSnapshot) error {
+	return WritePacket(w, OpServerSnapshot, seq, flags, snap)
+}
+
+func ReadServerSnapshot(r io.Reader) (*ServerSnapshot, error) {
+	var snap ServerSnapshot
+	if err := binary.Read(r, binary.LittleEndian, &snap.Count); err != nil {
+		return nil, err
+	}
+	count := int(snap.Count)
+	if count > len(snap.Entries) {
+		count = len(snap.Entries)
+	}
+	for i := 0; i < count; i++ {
+		if err := binary.Read(r, binary.LittleEndian, &snap.Entries[i]); err != nil {
+			return nil, err
+		}
+	}
+	return &snap, nil
 }
 
 func ReadHeader(r io.Reader) (*PacketHeader, error) {

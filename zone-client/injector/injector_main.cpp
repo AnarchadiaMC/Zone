@@ -110,7 +110,7 @@ static DWORD FindProcessId(const std::wstring& processName)
 // ---------------------------------------------------------------------------
 // Injection: Win32 CreateRemoteThread + LoadLibraryW
 // ---------------------------------------------------------------------------
-static bool InjectDLL(DWORD processID, const std::wstring& rawDllPath)
+static bool InjectDLL(HANDLE hProcess, const std::wstring& rawDllPath)
 {
     std::wstring dllPath = GetFullPath(rawDllPath);
 
@@ -120,6 +120,93 @@ static bool InjectDLL(DWORD processID, const std::wstring& rawDllPath)
         return false;
     }
 
+    EnableDebugPrivilege();
+
+    const size_t pathBytes = (dllPath.length() + 1) * sizeof(wchar_t);
+    void* pRemoteBuf = VirtualAllocEx(hProcess, nullptr, pathBytes,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemoteBuf)
+    {
+        std::wcerr << L"[!] VirtualAllocEx failed (error " << GetLastError() << L")\n";
+        return false;
+    }
+
+    if (!WriteProcessMemory(hProcess, pRemoteBuf, dllPath.c_str(), pathBytes, nullptr))
+    {
+        std::wcerr << L"[!] WriteProcessMemory failed (error " << GetLastError() << L")\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        return false;
+    }
+
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel32)
+    {
+        std::wcerr << L"[!] GetModuleHandleW(kernel32.dll) failed\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        return false;
+    }
+
+    FARPROC pLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!pLoadLibraryW)
+    {
+        std::wcerr << L"[!] GetProcAddress(LoadLibraryW) failed\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        return false;
+    }
+
+    HANDLE hThread = CreateRemoteThread(
+        hProcess,
+        nullptr,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(pLoadLibraryW),
+        pRemoteBuf,
+        0,
+        nullptr
+    );
+
+    if (!hThread)
+    {
+        std::wcerr << L"[!] CreateRemoteThread failed (error " << GetLastError() << L")\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        return false;
+    }
+
+    std::wcout << L"[*] Remote thread started, awaiting LoadLibraryW completion...\n";
+    DWORD waitResult = WaitForSingleObject(hThread, 15000);
+    if (waitResult == WAIT_TIMEOUT)
+    {
+        std::wcerr << L"[!] Remote thread execution timed out.\n";
+        // C-14: Do NOT call VirtualFreeEx on timeout because the remote thread
+        // may still be running and dereferencing pRemoteBuf.
+        CloseHandle(hThread);
+        return false;
+    }
+    else if (waitResult != WAIT_OBJECT_0)
+    {
+        std::wcerr << L"[!] WaitForSingleObject failed (error " << GetLastError() << L")\n";
+        CloseHandle(hThread);
+        return false;
+    }
+
+    DWORD exitCode = 0;
+    GetExitCodeThread(hThread, &exitCode);
+    CloseHandle(hThread);
+
+    // C-14: Only free remote buffer if WaitForSingleObject returned WAIT_OBJECT_0
+    VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+
+    if (exitCode == 0)
+    {
+        std::wcerr << L"[!] Remote LoadLibraryW returned NULL (exit code 0).\n"
+                   << L"    Check DLL dependencies and bitness (must match 64-bit target process).\n";
+        return false;
+    }
+
+    return true;
+}
+
+static bool InjectDLL(DWORD processID, const std::wstring& rawDllPath)
+{
     EnableDebugPrivilege();
 
     HANDLE hProcess = OpenProcess(
@@ -138,82 +225,9 @@ static bool InjectDLL(DWORD processID, const std::wstring& rawDllPath)
         return false;
     }
 
-    const size_t pathBytes = (dllPath.length() + 1) * sizeof(wchar_t);
-    void* pRemoteBuf = VirtualAllocEx(hProcess, nullptr, pathBytes,
-                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!pRemoteBuf)
-    {
-        std::wcerr << L"[!] VirtualAllocEx failed (error " << GetLastError() << L")\n";
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    if (!WriteProcessMemory(hProcess, pRemoteBuf, dllPath.c_str(), pathBytes, nullptr))
-    {
-        std::wcerr << L"[!] WriteProcessMemory failed (error " << GetLastError() << L")\n";
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel32)
-    {
-        std::wcerr << L"[!] GetModuleHandleW(kernel32.dll) failed\n";
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    FARPROC pLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
-    if (!pLoadLibraryW)
-    {
-        std::wcerr << L"[!] GetProcAddress(LoadLibraryW) failed\n";
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    HANDLE hThread = CreateRemoteThread(
-        hProcess,
-        nullptr,
-        0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(pLoadLibraryW),
-        pRemoteBuf,
-        0,
-        nullptr
-    );
-
-    if (!hThread)
-    {
-        std::wcerr << L"[!] CreateRemoteThread failed (error " << GetLastError() << L")\n";
-        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    std::wcout << L"[*] Remote thread started, awaiting LoadLibraryW completion...\n";
-    DWORD waitResult = WaitForSingleObject(hThread, 15000);
-    if (waitResult == WAIT_TIMEOUT)
-    {
-        std::wcerr << L"[!] Remote thread execution timed out.\n";
-    }
-
-    DWORD exitCode = 0;
-    GetExitCodeThread(hThread, &exitCode);
-    CloseHandle(hThread);
-
-    VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+    bool result = InjectDLL(hProcess, rawDllPath);
     CloseHandle(hProcess);
-
-    if (exitCode == 0)
-    {
-        std::wcerr << L"[!] Remote LoadLibraryW returned NULL (exit code 0).\n"
-                   << L"    Check DLL dependencies and bitness (must match 64-bit target process).\n";
-        return false;
-    }
-
-    return true;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +385,6 @@ static int ModeLaunch(const std::wstring& rawExePath,
 
     std::wcout << L"[+] Process created (PID: " << pi.dwProcessId << L"), resuming main thread...\n";
     ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
 
     std::wcout << L"[*] Waiting for game engine initialization...\n";
     WaitForInputIdle(pi.hProcess, 5000);
@@ -382,13 +395,18 @@ static int ModeLaunch(const std::wstring& rawExePath,
     if (GetExitCodeProcess(pi.hProcess, &procExitCode) && procExitCode != STILL_ACTIVE)
     {
         std::wcerr << L"[!] Target process terminated prematurely (exit code " << procExitCode << L")\n";
+        CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         return 1;
     }
+
+    // C-26: Keep pi.hProcess and pi.hThread open and pass pi.hProcess directly to eliminate TOCTOU PID reuse race
+    std::wcout << L"[*] Injecting " << dllPath << L" into PID " << pi.dwProcessId << L"...\n";
+    bool injected = InjectDLL(pi.hProcess, dllPath);
+    CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    std::wcout << L"[*] Injecting " << dllPath << L" into PID " << pi.dwProcessId << L"...\n";
-    if (InjectDLL(pi.dwProcessId, dllPath))
+    if (injected)
     {
         std::wcout << L"[+] Injection successful!\n";
         return 0;

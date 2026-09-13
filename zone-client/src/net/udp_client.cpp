@@ -18,12 +18,12 @@ namespace
     std::thread g_NetThread;
     
     SOCKET g_Socket = INVALID_SOCKET;
-    sockaddr_in g_ServerAddr;
+    sockaddr_in g_ServerAddr = {};
     
     enum State { DISCONNECTED, CONNECTING, CONNECTED };
     std::atomic<State> g_State = DISCONNECTED;
     
-    uint32_t g_SessionID = 0;
+    std::atomic<uint32_t> g_SessionID = 0;
     std::atomic<uint32_t> g_Ping = 0;
     std::atomic<bool> g_InSafeZone = false;
     
@@ -37,17 +37,25 @@ namespace
     RingBufferEntry g_Ring[256];
     std::atomic<uint32_t> g_RingHead = 0;
     std::atomic<uint32_t> g_RingTail = 0;
+    std::atomic<uint64_t> g_DroppedPackets = 0;
     
     std::mutex g_StateMutex;
     std::condition_variable g_StateCV;
+    std::mutex g_SendMutex;
     
     std::string g_TargetIP;
-    uint16_t g_TargetPort;
+    uint16_t g_TargetPort = 0;
     std::string g_UUID;
-    uint32_t g_HWID;
+    uint32_t g_HWID = 0;
     std::string g_Nick;
     
-    uint32_t g_Sequence = 0;
+    std::atomic<uint32_t> g_Sequence = 0;
+    
+    int g_ConnectRetries = 0;
+    int g_ConnectBackoffMs = 1000;
+    std::chrono::steady_clock::time_point g_LastConnectTime;
+    std::chrono::steady_clock::time_point g_ConnectStartTime;
+    std::chrono::steady_clock::time_point g_LastPacketReceivedTime;
     
     struct CachedTransform {
         float x = 0, y = 0, z = 0;
@@ -61,16 +69,28 @@ namespace
     void SendPacket(const char* buf, int len)
     {
         if (g_Socket == INVALID_SOCKET) return;
-        int res = sendto(g_Socket, buf, len, 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
+
+        sockaddr_in targetAddr;
+        {
+            std::lock_guard<std::mutex> stateLock(g_StateMutex);
+            targetAddr = g_ServerAddr;
+        }
+
+        std::lock_guard<std::mutex> sendLock(g_SendMutex);
+        int res = sendto(g_Socket, buf, len, 0, (sockaddr*)&targetAddr, sizeof(targetAddr));
         if (res == SOCKET_ERROR)
         {
             int err = WSAGetLastError();
             // WSAEWOULDBLOCK is normal for non-blocking sockets.
             if (err != WSAEWOULDBLOCK)
             {
-                g_LastError = "sendto failed: " + std::to_string(err);
+                {
+                    std::lock_guard<std::mutex> stateLock(g_StateMutex);
+                    g_LastError = "sendto failed: " + std::to_string(err);
+                }
                 if (err == WSAECONNRESET) // ICMP port unreachable
                 {
+                    std::lock_guard<std::mutex> stateLock(g_StateMutex);
                     g_State = DISCONNECTED;
                 }
             }
@@ -83,8 +103,6 @@ namespace
         
         auto lastHeartbeat = steady_clock::now();
         auto lastTransform = steady_clock::now();
-        auto lastConnect = steady_clock::now();
-        int backoff = 3000;
         
         while (g_Running)
         {
@@ -99,13 +117,50 @@ namespace
             
             if (g_State == CONNECTING)
             {
-                if (duration_cast<milliseconds>(now - lastConnect).count() > backoff)
+                int retries = 0;
+                int backoff = 1000;
+                steady_clock::time_point lastConnect;
+                steady_clock::time_point connectStart;
                 {
+                    std::lock_guard<std::mutex> lock(g_StateMutex);
+                    retries = g_ConnectRetries;
+                    backoff = g_ConnectBackoffMs;
+                    lastConnect = g_LastConnectTime;
+                    connectStart = g_ConnectStartTime;
+                }
+
+                auto elapsedSec = duration_cast<seconds>(now - connectStart).count();
+                if (retries >= 5 || elapsedSec >= 15)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(g_StateMutex);
+                        g_State = DISCONNECTED;
+                        g_LastError = "Connection handshake failed: retry limit exceeded";
+                    }
+                    g_StateCV.notify_all();
+                    continue;
+                }
+
+                if (duration_cast<milliseconds>(now - lastConnect).count() >= backoff)
+                {
+                    std::string uuidCopy;
+                    std::string nickCopy;
+                    uint32_t hwidCopy = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(g_StateMutex);
+                        uuidCopy = g_UUID;
+                        nickCopy = g_Nick;
+                        hwidCopy = g_HWID;
+                        g_ConnectRetries++;
+                        g_LastConnectTime = now;
+                        g_ConnectBackoffMs = std::min(backoff * 2, 8000);
+                    }
+
                     // Send Handshake
                     HandshakeReq req = {};
-                    snprintf(req.uuid, sizeof(req.uuid), "%s", g_UUID.c_str());
-                    req.hwid = g_HWID;
-                    snprintf(req.nick, sizeof(req.nick), "%s", g_Nick.c_str());
+                    snprintf(req.uuid, sizeof(req.uuid), "%s", uuidCopy.c_str());
+                    req.hwid = hwidCopy;
+                    snprintf(req.nick, sizeof(req.nick), "%s", nickCopy.c_str());
                     req.protoVer = 1;
                     
                     ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::HANDSHAKE_REQ, sizeof(req) };
@@ -114,13 +169,26 @@ namespace
                     memcpy(buf + sizeof(hdr), &req, sizeof(req));
                     
                     SendPacket(buf, sizeof(hdr) + sizeof(req));
-                    
-                    lastConnect = now;
-                    backoff = std::min(backoff * 2, 30000);
                 }
             }
             else if (g_State == CONNECTED)
             {
+                steady_clock::time_point lastRecv;
+                {
+                    std::lock_guard<std::mutex> lock(g_StateMutex);
+                    lastRecv = g_LastPacketReceivedTime;
+                }
+                if (duration_cast<seconds>(now - lastRecv).count() >= 10)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(g_StateMutex);
+                        g_State = DISCONNECTED;
+                        g_LastError = "Server connection timed out";
+                    }
+                    g_StateCV.notify_all();
+                    continue;
+                }
+
                 if (duration_cast<milliseconds>(now - lastHeartbeat).count() > 1000)
                 {
                     uint64_t ts = (uint64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -173,23 +241,32 @@ namespace
                 int fromLen = sizeof(from);
                 char recvBuf[1500];
                 int res = recvfrom(g_Socket, recvBuf, sizeof(recvBuf), 0, (sockaddr*)&from, &fromLen);
-                if (res >= sizeof(ZO_Header))
+                if (res >= (int)sizeof(ZO_Header))
                 {
                     ZO_Header* hdr = (ZO_Header*)recvBuf;
                     if (hdr->magic == 0x5A4F)
                     {
+                        {
+                            std::lock_guard<std::mutex> lock(g_StateMutex);
+                            g_LastPacketReceivedTime = steady_clock::now();
+                        }
+
                         if (hdr->opcode == (uint16_t)Opcode::HANDSHAKE_RES)
                         {
-                            if (res >= sizeof(ZO_Header) + sizeof(HandshakeRes))
+                            if (res >= (int)(sizeof(ZO_Header) + sizeof(HandshakeRes)))
                             {
                                 HandshakeRes* hr = (HandshakeRes*)(recvBuf + sizeof(ZO_Header));
                                 g_SessionID = hr->sessionID;
-                                g_State = CONNECTED;
+                                {
+                                    std::lock_guard<std::mutex> lock(g_StateMutex);
+                                    g_State = CONNECTED;
+                                }
+                                g_StateCV.notify_all();
                             }
                         }
                         else if (hdr->opcode == (uint16_t)Opcode::SAFEZONE_STATE)
                         {
-                            if (res >= sizeof(ZO_Header) + sizeof(SafeZoneState))
+                            if (res >= (int)(sizeof(ZO_Header) + sizeof(SafeZoneState)))
                             {
                                 SafeZoneState* sz = (SafeZoneState*)(recvBuf + sizeof(ZO_Header));
                                 g_InSafeZone = (sz->locked != 0);
@@ -200,14 +277,18 @@ namespace
                             uint32_t nextHead = (head + 1) % 256;
                             if (nextHead != g_RingTail.load(std::memory_order_acquire))
                             {
-                                g_Ring[head].len = res;
+                                g_Ring[head].len = (size_t)res;
                                 memcpy(g_Ring[head].data, recvBuf, res);
                                 g_RingHead.store(nextHead, std::memory_order_release);
+                            }
+                            else
+                            {
+                                g_DroppedPackets.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
                         else if (hdr->opcode == (uint16_t)Opcode::HEARTBEAT)
                         {
-                            if (res >= sizeof(ZO_Header) + sizeof(uint64_t))
+                            if (res >= (int)(sizeof(ZO_Header) + sizeof(uint64_t)))
                             {
                                 uint64_t sentTs = *(uint64_t*)(recvBuf + sizeof(ZO_Header));
                                 uint64_t nowMs = (uint64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -224,9 +305,13 @@ namespace
                             uint32_t nextHead = (head + 1) % 256;
                             if (nextHead != g_RingTail.load(std::memory_order_acquire))
                             {
-                                g_Ring[head].len = res;
+                                g_Ring[head].len = (size_t)res;
                                 memcpy(g_Ring[head].data, recvBuf, res);
                                 g_RingHead.store(nextHead, std::memory_order_release);
+                            }
+                            else
+                            {
+                                g_DroppedPackets.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
                     }
@@ -240,20 +325,73 @@ namespace NetClient
 {
     void Init()
     {
+        if (g_Running || g_Socket != INVALID_SOCKET)
+            return;
+
         WSADATA wsaData;
-        WSAStartup(MAKEWORD(2,2), &wsaData);
+        int wsaRes = WSAStartup(MAKEWORD(2,2), &wsaData);
+        if (wsaRes != 0)
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_LastError = "WSAStartup failed: " + std::to_string(wsaRes);
+            return;
+        }
         
         g_Socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_Socket == INVALID_SOCKET)
+        {
+            int err = WSAGetLastError();
+            {
+                std::lock_guard<std::mutex> lock(g_StateMutex);
+                g_LastError = "Failed to create UDP socket: " + std::to_string(err);
+            }
+            WSACleanup();
+            return;
+        }
         
         u_long mode = 1;
-        ioctlsocket(g_Socket, FIONBIO, &mode);
+        if (ioctlsocket(g_Socket, FIONBIO, &mode) != 0)
+        {
+            int err = WSAGetLastError();
+            {
+                std::lock_guard<std::mutex> lock(g_StateMutex);
+                g_LastError = "ioctlsocket FIONBIO failed: " + std::to_string(err);
+            }
+            closesocket(g_Socket);
+            g_Socket = INVALID_SOCKET;
+            WSACleanup();
+            return;
+        }
         
         g_Running = true;
         g_NetThread = std::thread(BackgroundThread);
     }
 
+    void Disconnect()
+    {
+        bool sendDisconnect = false;
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            if (g_State == CONNECTED || g_State == CONNECTING)
+            {
+                sendDisconnect = true;
+            }
+            g_State = DISCONNECTED;
+            g_SessionID = 0;
+        }
+        g_StateCV.notify_all();
+
+        if (sendDisconnect)
+        {
+            ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::DISCONNECT, 0 };
+            SendPacket((char*)&hdr, sizeof(hdr));
+        }
+    }
+
     void Shutdown()
     {
+        Disconnect();
+
         {
             std::lock_guard<std::mutex> lock(g_StateMutex);
             g_Running = false;
@@ -279,23 +417,20 @@ namespace NetClient
         g_HWID = hwid;
         g_Nick = nick;
         
+        memset(&g_ServerAddr, 0, sizeof(g_ServerAddr));
         g_ServerAddr.sin_family = AF_INET;
         g_ServerAddr.sin_port = htons(port);
         inet_pton(AF_INET, ip.c_str(), &g_ServerAddr.sin_addr);
         
-        g_State = CONNECTING;
-        g_StateCV.notify_all();
-    }
+        g_ConnectRetries = 0;
+        g_ConnectBackoffMs = 1000;
+        g_ConnectStartTime = std::chrono::steady_clock::now();
+        g_LastConnectTime = g_ConnectStartTime - std::chrono::milliseconds(g_ConnectBackoffMs + 1);
+        g_LastPacketReceivedTime = g_ConnectStartTime;
+        g_SessionID = 0;
+        g_LastError.clear();
 
-    void Disconnect()
-    {
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        if (g_State == CONNECTED)
-        {
-            ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::DISCONNECT, 0 };
-            SendPacket((char*)&hdr, sizeof(hdr));
-        }
-        g_State = DISCONNECTED;
+        g_State = CONNECTING;
         g_StateCV.notify_all();
     }
 
@@ -309,15 +444,51 @@ namespace NetClient
         g_Transform.updated = true;
     }
 
-    bool PollEvent(char* outBuf, size_t& outLen)
+    bool PollEvent(char* outBuf, size_t maxLen, size_t& outLen)
     {
         uint32_t tail = g_RingTail.load(std::memory_order_relaxed);
         if (tail == g_RingHead.load(std::memory_order_acquire))
             return false;
             
-        outLen = g_Ring[tail].len;
+        size_t packetLen = g_Ring[tail].len;
+        if (packetLen > maxLen)
+        {
+            g_DroppedPackets.fetch_add(1, std::memory_order_relaxed);
+            g_RingTail.store((tail + 1) % 256, std::memory_order_release);
+            return false;
+        }
+
+        outLen = packetLen;
         memcpy(outBuf, g_Ring[tail].data, outLen);
         
+        g_RingTail.store((tail + 1) % 256, std::memory_order_release);
+        return true;
+    }
+
+    bool PollEvent(char* outBuf, size_t& outLen)
+    {
+        return PollEvent(outBuf, 1500, outLen);
+    }
+
+    bool PollEvent(int a, int& b)
+    {
+        uint32_t tail = g_RingTail.load(std::memory_order_relaxed);
+        if (tail == g_RingHead.load(std::memory_order_acquire))
+            return false;
+
+        size_t packetLen = g_Ring[tail].len;
+        if (packetLen >= sizeof(ZO_Header))
+        {
+            ZO_Header* hdr = (ZO_Header*)g_Ring[tail].data;
+            a = (int)hdr->opcode;
+            b = (int)hdr->payload_len;
+        }
+        else
+        {
+            a = 0;
+            b = (int)packetLen;
+        }
+
         g_RingTail.store((tail + 1) % 256, std::memory_order_release);
         return true;
     }
@@ -327,17 +498,26 @@ namespace NetClient
     
     void GetSessionInfo(uint32_t& outSessionID, uint32_t& outPing)
     {
-        outSessionID = g_SessionID;
-        outPing = g_Ping;
+        outSessionID = g_SessionID.load(std::memory_order_relaxed);
+        outPing = g_Ping.load(std::memory_order_relaxed);
     }
     
-    std::string GetLastError() { return g_LastError; }
+    std::string GetLastError()
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        return g_LastError;
+    }
+
+    uint64_t GetDroppedPackets()
+    {
+        return g_DroppedPackets.load(std::memory_order_relaxed);
+    }
     
     void SendChatText(const std::string& text)
     {
         if (g_State != CONNECTED) return;
         ChatText ct = {};
-        ct.senderID = g_SessionID;
+        ct.senderID = g_SessionID.load(std::memory_order_relaxed);
         ct.len = (uint8_t)std::min(text.length(), sizeof(ct.text) - 1);
         snprintf(ct.text, sizeof(ct.text), "%s", text.c_str());
         

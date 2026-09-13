@@ -60,48 +60,89 @@ func heuristic(a, b Waypoint) float32 {
 	return float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
 }
 
+// PointKey is a quantized [3]int32 coordinate key used for robust map indexing
+// without fragile floating-point struct equality.
+type PointKey [3]int32
+
+// QuantizeWaypoint converts a Waypoint with float32 coordinates into a PointKey
+// using millimeter-level precision (scale factor 1000).
+func QuantizeWaypoint(w Waypoint) PointKey {
+	const scale = 1000.0
+	return PointKey{
+		int32(math.Round(float64(w.X * scale))),
+		int32(math.Round(float64(w.Y * scale))),
+		int32(math.Round(float64(w.Z * scale))),
+	}
+}
+
+const MaxIterations = 5000
+
 // AStar calculates a path from start to goal using the A* algorithm.
 func AStar(start, goal Waypoint, graph Graph) []Waypoint {
+	startKey := QuantizeWaypoint(start)
+	goalKey := QuantizeWaypoint(goal)
+
 	pq := make(PriorityQueue, 0)
 	heap.Init(&pq)
 	heap.Push(&pq, &Item{value: start, priority: 0})
 
-	cameFrom := make(map[Waypoint]Waypoint)
-	costSoFar := make(map[Waypoint]float32)
+	cameFrom := make(map[PointKey]Waypoint)
+	waypointMap := make(map[PointKey]Waypoint)
+	gScore := make(map[PointKey]float32)
+	fScore := make(map[PointKey]float32)
+	openSet := make(map[PointKey]bool)
 
-	cameFrom[start] = start
-	costSoFar[start] = 0
+	cameFrom[startKey] = start
+	waypointMap[startKey] = start
+	gScore[startKey] = 0
+	fScore[startKey] = heuristic(start, goal)
+	openSet[startKey] = true
 
+	iterations := 0
 	for pq.Len() > 0 {
-		current := heap.Pop(&pq).(*Item).value
+		iterations++
+		if iterations > MaxIterations {
+			return nil // iteration limit exceeded on pathological graphs
+		}
 
-		if current == goal {
+		current := heap.Pop(&pq).(*Item).value
+		currentKey := QuantizeWaypoint(current)
+		delete(openSet, currentKey)
+
+		if currentKey == goalKey {
 			break
 		}
 
 		for _, next := range graph.GetNeighbors(current) {
-			// Cost is distance from current to next
-			newCost := costSoFar[current] + heuristic(current, next)
+			nextKey := QuantizeWaypoint(next)
+			tentativeGScore := gScore[currentKey] + heuristic(current, next)
 
-			if prevCost, exists := costSoFar[next]; !exists || newCost < prevCost {
-				costSoFar[next] = newCost
-				priority := newCost + heuristic(next, goal)
-				heap.Push(&pq, &Item{value: next, priority: priority})
-				cameFrom[next] = current
+			prevG, exists := gScore[nextKey]
+			if !exists || tentativeGScore < prevG {
+				cameFrom[nextKey] = current
+				waypointMap[nextKey] = next
+				gScore[nextKey] = tentativeGScore
+				h := heuristic(next, goal)
+				f := tentativeGScore + h
+				fScore[nextKey] = f
+
+				heap.Push(&pq, &Item{value: next, priority: f})
+				openSet[nextKey] = true
 			}
 		}
 	}
 
 	// Reconstruct path
-	if _, exists := cameFrom[goal]; !exists {
+	if _, exists := cameFrom[goalKey]; !exists {
 		return []Waypoint{} // No path found
 	}
 
 	path := []Waypoint{}
-	current := goal
-	for current != start {
-		path = append(path, current)
-		current = cameFrom[current]
+	currKey := goalKey
+	for currKey != startKey {
+		path = append(path, waypointMap[currKey])
+		pred := cameFrom[currKey]
+		currKey = QuantizeWaypoint(pred)
 	}
 	path = append(path, start)
 
@@ -111,4 +152,9 @@ func AStar(start, goal Waypoint, graph Graph) []Waypoint {
 	}
 
 	return path
+}
+
+// FindPath calculates a path from start to goal using the A* algorithm with iteration limit safety.
+func FindPath(start, goal Waypoint, graph Graph) []Waypoint {
+	return AStar(start, goal, graph)
 }

@@ -1,4 +1,4 @@
-﻿# ZoneClient — S.T.A.L.K.E.R. Anomaly Multiplayer Client & Injector
+# ZoneClient — S.T.A.L.K.E.R. Anomaly Multiplayer Client & Injector
 
 `ZoneClient` is the client-side runtime layer for **Zone**, an authoritative multiplayer survival architecture for *S.T.A.L.K.E.R. Anomaly 1.5.3*.
 
@@ -26,7 +26,7 @@ Unlike traditional mods that require manual file extraction, directory creation,
   - Renders HUD network status and safe zone alerts natively via X-Ray PDA news tips and HUD statics (`zone_hud.script`).
 
 ### 3. Dynamic LuaJIT Runtime Hooking
-- Uses **MinHook** to detour `luaL_openlibs` in `LuaJIT.dll`.
+- Uses **MinHook** to detour `luaL_openlibs` in `LuaJIT.dll` (`src/hook/lua_hook.cpp`, compiled directly into `ZoneClient.dll` via `ZONE_CLIENT_SOURCES` in `CMakeLists.txt`).
 - Uses dynamic runtime symbol resolution via `GetProcAddress` on `LuaJIT.dll` for all Lua C API functions (`lua_push*`, `luaL_check*`, `lua_newtable`, etc.), eliminating external `.lib` file dependencies.
 - Injects the global `ZoneNet` table into `_G` exposing 8 C functions:
   - `ZoneNet:Connect(ip, port, uuid, hwid, nick)`
@@ -58,7 +58,7 @@ zone-client/
 ├── src/
 │   ├── hook/
 │   │   ├── lua_hook.h      # Detour interface for luaL_openlibs
-│   │   └── lua_hook.cpp
+│   │   └── lua_hook.cpp    # MinHook detour implementation (compiled in ZONE_CLIENT_SOURCES)
 │   ├── identity/
 │   │   ├── identity.h      # HWID (FNV-1a) & UUID v4 identity engine
 │   │   └── identity.cpp

@@ -1,3 +1,5 @@
+//go:build windows
+
 package game
 
 import (
@@ -134,6 +136,53 @@ func TestAdminServer_ExecuteCommand(t *testing.T) {
 		resp := admin.ExecuteCommand("invalid_cmd foo bar")
 		if !strings.HasPrefix(resp, "ERR unknown command: invalid_cmd") {
 			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Authentication Required for Privileged Commands", func(t *testing.T) {
+		authedAdmin := NewAdminServer(server)
+		authedAdmin.SetAuthToken("secret-admin-pass")
+
+		// Status does not require auth
+		statusResp := authedAdmin.ExecuteCommand("status")
+		if !strings.HasPrefix(statusResp, "OK active_sessions=") {
+			t.Errorf("Expected status to succeed without auth: %q", statusResp)
+		}
+
+		// Kick fails without auth
+		kickResp := authedAdmin.ExecuteCommand("kick 42")
+		if !strings.HasPrefix(kickResp, "ERR unauthorized") {
+			t.Errorf("Expected kick to fail without auth: %q", kickResp)
+		}
+
+		// Ban fails without auth
+		banResp := authedAdmin.ExecuteCommand("ban user-1 reason")
+		if !strings.HasPrefix(banResp, "ERR unauthorized") {
+			t.Errorf("Expected ban to fail without auth: %q", banResp)
+		}
+
+		// Broadcast fails without auth
+		bcResp := authedAdmin.ExecuteCommand("broadcast hello")
+		if !strings.HasPrefix(bcResp, "ERR unauthorized") {
+			t.Errorf("Expected broadcast to fail without auth: %q", bcResp)
+		}
+
+		// Auth with wrong token fails
+		authResp := authedAdmin.ExecuteCommand("auth wrong-token")
+		if !strings.HasPrefix(authResp, "ERR invalid token") {
+			t.Errorf("Expected auth failure on wrong token: %q", authResp)
+		}
+
+		// Auth with correct token succeeds
+		authResp = authedAdmin.ExecuteCommand("auth secret-admin-pass")
+		if !strings.HasPrefix(authResp, "OK authenticated") {
+			t.Errorf("Expected auth success on correct token: %q", authResp)
+		}
+
+		// Now kick succeeds or returns not found (not unauthorized)
+		kickResp = authedAdmin.ExecuteCommand("kick 99999")
+		if strings.HasPrefix(kickResp, "ERR unauthorized") {
+			t.Errorf("Expected kick to be authorized after auth: %q", kickResp)
 		}
 	})
 }

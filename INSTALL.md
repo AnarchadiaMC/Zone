@@ -1,4 +1,4 @@
-﻿# Zone — Installation & User Guide
+# Zone — Installation & User Guide
 
 > A dedicated multiplayer survival server and injectable client DLL for S.T.A.L.K.E.R. Anomaly 1.5.3.
 
@@ -18,14 +18,14 @@ Zone uses an **autonomous client injection architecture**:
 
 ### Windows
 ```bat
-cd F:\AnomalyDev\zone-online\zone-server
+cd zone-server
 go build -o zone-server.exe ./cmd/server
 zone-server.exe
 ```
 
 ### Linux (Headless)
 ```bash
-cd zone-online/zone-server
+cd zone-server
 GOOS=linux GOARCH=amd64 go build -o zone-server ./cmd/server
 ./zone-server
 ```
@@ -49,7 +49,7 @@ The server automatically initializes the embedded SQLite database (`zone_world.d
 Build the client using CMake and Visual Studio 2022:
 
 ```bat
-cd F:\AnomalyDev\zone-online\zone-client
+cd zone-client
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
@@ -66,11 +66,11 @@ Output binaries in `zone-client\build\Release\`:
 You can use `ZoneClient_Injector.exe` to launch your modified Anomaly executable and inject `ZoneClient.dll` automatically:
 
 ```bat
-ZoneClient_Injector.exe --launch "D:\Anomaly\bin\AnomalyDX11.exe"
+ZoneClient_Injector.exe --launch "<path-to-anomaly>\bin\AnomalyDX11.exe"
 ```
 Or with custom launch arguments:
 ```bat
-ZoneClient_Injector.exe --launch "D:\Anomaly\bin\AnomalyDX11.exe" -smap4096 -dbg
+ZoneClient_Injector.exe --launch "<path-to-anomaly>\bin\AnomalyDX11.exe" -smap4096 -dbg
 ```
 
 ### Option B: Background Wait Mode

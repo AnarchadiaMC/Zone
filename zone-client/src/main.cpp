@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <exception>
 #include "provision/asset_provisioner.h"
 #include "identity/identity.h"
 #include "net/udp_client.h"
@@ -10,8 +11,30 @@ namespace
 
     DWORD WINAPI InitThread(LPVOID /*lpParam*/)
     {
-        Sleep(500);
-        NetClient::Init();
+        try
+        {
+            Sleep(500);
+
+            MH_STATUS mhStatus = MH_Initialize();
+            if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED)
+            {
+                OutputDebugStringA("[ZoneClient] Failed to initialize MinHook!\n");
+            }
+
+            Identity::Init();
+            AssetProvisioner::EnsureAssets();
+            NetClient::Init();
+        }
+        catch (const std::exception& e)
+        {
+            OutputDebugStringA("[ZoneClient] Exception in InitThread: ");
+            OutputDebugStringA(e.what());
+            OutputDebugStringA("\n");
+        }
+        catch (...)
+        {
+            OutputDebugStringA("[ZoneClient] Unknown exception in InitThread!\n");
+        }
         return 0;
     }
 }
@@ -24,10 +47,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         {
             g_hModule = hinstDLL;
             DisableThreadLibraryCalls(hinstDLL);
-
-            MH_Initialize();
-            Identity::Init();
-            AssetProvisioner::EnsureAssets();
 
             HANDLE hThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
             if (hThread)

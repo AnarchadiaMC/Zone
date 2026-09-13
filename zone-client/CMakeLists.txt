@@ -26,6 +26,8 @@ target_include_directories(minhook PUBLIC
 # ----------------------------------------------------------------------
 set(ZONE_CLIENT_SOURCES
     src/main.cpp
+    src/hook/lua_hook.cpp
+    src/hook/lua_hook.h
     src/identity/identity.cpp
     src/identity/identity.h
     src/protocol/packets.h
@@ -35,6 +37,7 @@ set(ZONE_CLIENT_SOURCES
     src/lua/zone_bindings.h
     src/provision/asset_provisioner.cpp
     src/provision/asset_provisioner.h
+    3rdparty/lua/lua_bindings.cpp
 )
 
 add_library(ZoneClient SHARED ${ZONE_CLIENT_SOURCES})

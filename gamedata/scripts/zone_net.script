@@ -33,17 +33,35 @@ ffi.cdef[[
     void ZN_SendChatText(const char* text);
 ]]
 
+-- L-31: Pre-allocated FFI buffers at file/module scope
+local g_poll_buf = ffi.new("char[1500]")
+local g_poll_len = ffi.new("size_t[1]")
+local g_float_cast = ffi.new("znet_float_cast")
+
 local zone_client = nil
 pcall(function()
     zone_client = ffi.load("ZoneClient")
 end)
 
+-- Expose is_client_loaded() so zone_main.script can detect it
+function is_client_loaded()
+    return zone_client ~= nil
+end
+
+-- L-06: Exported reset_state for reconnecting
+function reset_state()
+    last_tick = 0
+    last_pos = nil
+end
+
 -- Polyfill ZoneNet global object for compatibility
 _G.ZoneNet = {}
 function ZoneNet:Connect(ip, port, uuid, hwid, nick)
+    reset_state()
     if zone_client then zone_client.ZN_Connect(ip, port, uuid, hwid, nick) end
 end
 function ZoneNet:Disconnect()
+    reset_state()
     if zone_client then zone_client.ZN_Disconnect() end
 end
 function ZoneNet:SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags)
@@ -51,10 +69,8 @@ function ZoneNet:SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags)
 end
 function ZoneNet:PollEvent()
     if not zone_client then return nil end
-    local buf = ffi.new("char[1500]")
-    local len = ffi.new("size_t[1]")
-    if zone_client.ZN_PollEvent(buf, len) then
-        return ffi.string(buf, len[0])
+    if zone_client.ZN_PollEvent(g_poll_buf, g_poll_len) then
+        return ffi.string(g_poll_buf, g_poll_len[0])
     end
     return nil
 end
@@ -74,12 +90,17 @@ end
 function ZoneNet:SendChatText(text)
     if zone_client then zone_client.ZN_SendChatText(text) end
 end
+function ZoneNet:IsClientLoaded()
+    return is_client_loaded()
+end
 
 function read_float_le(pkt, pos)
     local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
-    local cast = ffi.new("znet_float_cast")
-    cast.b[0] = b1; cast.b[1] = b2; cast.b[2] = b3; cast.b[3] = b4;
-    return cast.f, pos + 4
+    g_float_cast.b[0] = b1
+    g_float_cast.b[1] = b2
+    g_float_cast.b[2] = b3
+    g_float_cast.b[3] = b4
+    return g_float_cast.f, pos + 4
 end
 
 function read_string(pkt, pos, len)
@@ -97,6 +118,16 @@ function dispatch_packet(pkt)
     local seq, pos = read_uint32_le(pkt, pos)
     local opcode, pos = read_uint16_le(pkt, pos)
     local paylen, pos = read_uint16_le(pkt, pos)
+    
+    -- L-10: Validate magic == 0x5A4F and proto == 1
+    if magic ~= 0x5A4F or proto ~= 1 then
+        return
+    end
+    
+    -- L-02: Validate payload length (drop truncated packets)
+    if string.len(pkt) < 12 + paylen then
+        return
+    end
     
     local offset = 13 -- 1-based index after 12 bytes
     
@@ -119,8 +150,10 @@ function dispatch_packet(pkt)
             zone_dummy.on_damage_notify(target_id, attacker_id, damage, bone_id)
         end
     elseif opcode == 0x0060 then
-        -- Chat text
-        local txt, _ = read_string(pkt, offset, paylen)
+        -- L-03: Chat text: sender ID (4 bytes) + text length (1 byte) + text
+        local sender_id, cpos = read_uint32_le(pkt, offset)
+        local text_len, cpos = read_uint8(pkt, cpos)
+        local txt, _ = read_string(pkt, cpos, text_len)
         if db.actor then
             db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
         end
@@ -133,7 +166,9 @@ function on_tick()
     local tg = time_global()
     
     -- Let dummy system interpolate every frame
-    zone_dummy.interpolate_proxies()
+    if zone_dummy and zone_dummy.interpolate_proxies then
+        zone_dummy.interpolate_proxies()
+    end
     
     if tg - last_tick < TICK_RATE_MS then
         return
@@ -142,6 +177,7 @@ function on_tick()
     last_tick = tg
     
     if type(ZoneNet) == "nil" or not ZoneNet:IsConnected() then
+        last_pos = nil
         return
     end
     
@@ -161,12 +197,15 @@ function on_tick()
         local dir_y_clamped = math.max(-1.0, math.min(1.0, dir.y))
         local pitch = math.asin(dir_y_clamped)
         
+        -- L-04: Moving state bitmask detection (mcCrouch = 0x10, mcSprint = 0x1000)
         local animflags = 0
-        if IsMoveState("mcCrouch") then animflags = bit.bor(animflags, 1) end
-        if IsMoveState("mcSprint") then animflags = bit.bor(animflags, 2) end
+        local mstate = (level.actor_moving_state and level.actor_moving_state()) or 0
+        if bit.band(mstate, 16) ~= 0 then animflags = bit.bor(animflags, 1) end -- Crouch (mcCrouch = 0x10)
+        if bit.band(mstate, 4096) ~= 0 then animflags = bit.bor(animflags, 2) end -- Sprint (mcSprint = 0x1000)
         -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
         
-        ZoneNet:SendTransform(pos.x, pos.y, pos.z, yaw, pitch, vx, vy, vz, animflags)
+        -- Send yaw * 100 and pitch * 100 matching server decoding float32(ct.Yaw)/100.0
+        ZoneNet:SendTransform(pos.x, pos.y, pos.z, yaw * 100, pitch * 100, vx, vy, vz, animflags)
     end
     
     -- Poll all pending events

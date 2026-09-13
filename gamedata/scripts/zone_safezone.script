@@ -53,7 +53,6 @@ function on_before_hit(npc, s_hit, bone_id)
     -- Check if it is the local player taking damage inside a safe zone
     if npc and npc:id() == db.actor:id() and in_safe_zone then
         s_hit.power = 0
-        s_hit.ignore_flag = true
     end
 end
 
@@ -75,12 +74,35 @@ end
 local function on_actor_update()
     if not in_safe_zone or not db.actor then return end
 
-    local active_item = db.actor:active_item()
-    if active_item and IsWeapon and IsWeapon(active_item) then
+    local wpn = db.actor:active_item()
+    if (IsWeapon and wpn and IsWeapon(wpn)) or (wpn and wpn.is_weapon and wpn:is_weapon()) then
         if db.actor.hide_weapon then
             pcall(function() db.actor:hide_weapon() end)
         end
     end
+end
+
+--- Resets safe zone state (e.g. on level transition or disconnect).
+function reset()
+    if in_safe_zone then
+        in_safe_zone = false
+        safe_zone_id = ""
+        if zone_hud and zone_hud.notify_safezone then
+            zone_hud.notify_safezone(false)
+        end
+    else
+        in_safe_zone = false
+        safe_zone_id = ""
+    end
+end
+
+--- Handle player or network disconnect
+function on_disconnect()
+    reset()
+end
+
+local function on_level_changing()
+    reset()
 end
 
 --- Query if local player is currently within a safe zone.
@@ -98,7 +120,9 @@ end
 function on_game_start()
     if RegisterScriptCallback then
         RegisterScriptCallback("actor_on_before_hit",  on_before_hit)
-        RegisterScriptCallback("on_key_press",   on_key_press)
-        RegisterScriptCallback("actor_on_update", on_actor_update)
+        RegisterScriptCallback("on_key_press",         on_key_press)
+        RegisterScriptCallback("actor_on_update",      on_actor_update)
+        RegisterScriptCallback("on_level_changing",    on_level_changing)
+        RegisterScriptCallback("actor_on_net_destroy", reset)
     end
 end

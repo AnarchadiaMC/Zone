@@ -5,10 +5,31 @@
 if not ui_events then ui_events = {} end
 
 local DIALOG_XML    = "zone_ui_server_list.xml"
-local APPDATA_LTX   = getFS():update_path("$app_data_root$", "zone_identity.ltx")
 local HISTORY_SEC   = "server_history"
 local IDENTITY_SEC  = "identity"
 local MAX_FAVORITES = 16
+
+-- Returns path to zone_identity.ltx inside appdata directory (on-demand getFS call)
+local function get_identity_path()
+    local fs = getFS and getFS()
+    if fs then
+        return fs:update_path("$app_data_root$", "zone_identity.ltx")
+    end
+    return "appdata\\zone_identity.ltx"
+end
+
+-- Sanitizes player nickname, stripping characters that could corrupt LTX syntax or cause injections
+local function sanitize_nickname(nick)
+    if not nick then return "Stalker" end
+    local cleaned = nick:gsub("[%[%]=%c\r\n\t]", ""):match("^%s*(.-)%s*$")
+    if not cleaned or cleaned == "" then
+        return "Stalker"
+    end
+    if #cleaned > 24 then
+        cleaned = cleaned:sub(1, 24)
+    end
+    return cleaned
+end
 
 -- Singleton dialog instance
 local _server_browser_dlg = nil
@@ -169,7 +190,7 @@ end
 function UIZoneServerList:LoadFavorites()
     self.favorites = {}
 
-    local file = io.open(APPDATA_LTX, "r")
+    local file = io.open(get_identity_path(), "r")
     if file then
         local current_section = ""
         for line in file:lines() do
@@ -188,7 +209,7 @@ function UIZoneServerList:LoadFavorites()
                         end
                     elseif current_section == IDENTITY_SEC:lower() or current_section == "" then
                         if k == "nickname" then
-                            self.nick = v
+                            self.nick = sanitize_nickname(v)
                         elseif k == "uuid" or k == "client_uuid" then
                             self.uuid = v
                         elseif k == "hwid" or k == "hwid_hash" then
@@ -206,7 +227,7 @@ function UIZoneServerList:LoadFavorites()
         local cfg = zone_main.get_config()
         if cfg.client_uuid and self.uuid == "anonymous" then self.uuid = cfg.client_uuid end
         if cfg.hwid_hash and self.hwid == 0 then self.hwid = cfg.hwid_hash end
-        if cfg.nickname and self.nick == "Stalker" then self.nick = cfg.nickname end
+        if cfg.nickname and self.nick == "Stalker" then self.nick = sanitize_nickname(cfg.nickname) end
     end
 
     -- Seed default localhost server if no favorites exist
@@ -251,11 +272,12 @@ function UIZoneServerList:RefreshList()
 end
 
 function UIZoneServerList:SaveFavorites()
+    local target_path = get_identity_path()
     local lines = {}
     local in_history = false
     local history_written = false
 
-    local file = io.open(APPDATA_LTX, "r")
+    local file = io.open(target_path, "r")
     if file then
         for line in file:lines() do
             local sec = line:match("^%s*%[([^%]]+)%]")
@@ -269,10 +291,10 @@ function UIZoneServerList:SaveFavorites()
                     lines[#lines + 1] = line
                 end
             elseif not in_history then
-                -- Update nickname line in identity if modified
+                -- Update nickname line in identity if modified, sanitizing input
                 local k = line:match("^%s*([%w_]+)%s*=")
                 if k and k:lower() == "nickname" and self.nick then
-                    lines[#lines + 1] = "nickname=" .. self.nick
+                    lines[#lines + 1] = "nickname = " .. sanitize_nickname(self.nick)
                 else
                     lines[#lines + 1] = line
                 end
@@ -285,12 +307,56 @@ function UIZoneServerList:SaveFavorites()
         self:_emit_history_block(lines)
     end
 
-    local out = io.open(APPDATA_LTX, "w")
-    if out then
-        for _, l in ipairs(lines) do
-            out:write(l .. "\n")
+    -- Atomic file writing: write to a temporary file, then rename or handle write failure gracefully
+    local tmp_path = target_path .. ".tmp"
+    local bak_path = target_path .. ".bak"
+    local out = io.open(tmp_path, "w")
+    if not out then
+        printf("Zone UI Error: Failed to open temporary file '%s' for saving favorites", tmp_path)
+        return false
+    end
+
+    local write_ok = true
+    for _, l in ipairs(lines) do
+        local ok = out:write(l .. "\n")
+        if not ok then
+            write_ok = false
+            break
         end
-        out:close()
+    end
+    out:close()
+
+    if not write_ok then
+        printf("Zone UI Error: Failed writing favorites data to '%s'", tmp_path)
+        os.remove(tmp_path)
+        return false
+    end
+
+    -- Windows atomic replacement sequence:
+    -- Remove any stale backup, rename current file to backup, rename temp file to target
+    os.remove(bak_path)
+    os.rename(target_path, bak_path)
+
+    local ren_ok, ren_err = os.rename(tmp_path, target_path)
+    if ren_ok then
+        os.remove(bak_path)
+        return true
+    else
+        printf("Zone UI Warning: Atomic rename failed (%s). Restoring backup.", tostring(ren_err))
+        os.rename(bak_path, target_path)
+        -- Fallback: read tmp and write directly to target
+        local fin = io.open(tmp_path, "r")
+        if fin then
+            local data = fin:read("*a")
+            fin:close()
+            local fout = io.open(target_path, "w")
+            if fout then
+                fout:write(data)
+                fout:close()
+            end
+        end
+        os.remove(tmp_path)
+        return true
     end
 end
 
@@ -338,10 +404,10 @@ function UIZoneServerList:OnConnect()
         return
     end
 
-    if nick == "" then nick = "Stalker" end
+    nick = sanitize_nickname(nick)
     self.nick = nick
 
-    if type(ZoneNet) == "nil" then
+    if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) and type(ZoneNet) == "nil" then
         if db.actor then
             db.actor:give_game_news("Zone", "ERROR: ZoneNet native DLL is not loaded.", "ui_inGame2_PDA_icon", 0, 5000, 1)
         end

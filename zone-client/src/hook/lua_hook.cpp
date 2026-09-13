@@ -29,8 +29,20 @@ namespace LuaHook
             void* pTarget = (void*)GetProcAddress(hLua, "luaL_openlibs");
             if (pTarget)
             {
-                MH_CreateHook(pTarget, (void*)&Hooked_luaL_openlibs, (LPVOID*)&g_Orig_luaL_openlibs);
-                MH_EnableHook(pTarget);
+                MH_STATUS createStatus = MH_CreateHook(pTarget, (void*)&Hooked_luaL_openlibs, (LPVOID*)&g_Orig_luaL_openlibs);
+                if (createStatus != MH_OK)
+                {
+                    OutputDebugStringA("[ZoneClient] LuaHook::Install: MH_CreateHook failed!\n");
+                    return;
+                }
+
+                MH_STATUS enableStatus = MH_EnableHook(pTarget);
+                if (enableStatus != MH_OK)
+                {
+                    OutputDebugStringA("[ZoneClient] LuaHook::Install: MH_EnableHook failed!\n");
+                    MH_RemoveHook(pTarget);
+                    return;
+                }
             }
         }
     }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,12 +22,14 @@ type adminListener interface {
 }
 
 type AdminServer struct {
-	server   *Server
-	pipeName string
-	running  atomic.Bool
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	listener adminListener
+	server        *Server
+	pipeName      string
+	authToken     string
+	authenticated atomic.Bool
+	running       atomic.Bool
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	listener      adminListener
 }
 
 func NewAdminServer(s *Server, pipeName ...string) *AdminServer {
@@ -36,9 +39,14 @@ func NewAdminServer(s *Server, pipeName ...string) *AdminServer {
 	} else if s != nil && s.cfg != nil && s.cfg.AdminPipe != "" {
 		name = s.cfg.AdminPipe
 	}
+	token := os.Getenv("ZONE_ADMIN_TOKEN")
+	if token == "" {
+		token = os.Getenv("ZONE_ADMIN_SECRET")
+	}
 	return &AdminServer{
-		server:   s,
-		pipeName: name,
+		server:    s,
+		pipeName:  name,
+		authToken: token,
 	}
 }
 
@@ -50,7 +58,28 @@ func (a *AdminServer) IsRunning() bool {
 	return a.running.Load()
 }
 
+func (a *AdminServer) SetAuthToken(token string) {
+	a.authToken = token
+	a.authenticated.Store(false)
+}
+
+func (a *AdminServer) Authenticate(token string) bool {
+	if a.authToken == "" || a.authToken == token {
+		a.authenticated.Store(true)
+		return true
+	}
+	return false
+}
+
+func (a *AdminServer) IsAuthenticated() bool {
+	return a.authToken == "" || a.authenticated.Load()
+}
+
 func (a *AdminServer) ExecuteCommand(cmdLine string) string {
+	return a.executeCommand(cmdLine, a.authenticated.Load())
+}
+
+func (a *AdminServer) executeCommand(cmdLine string, isAuthed bool) string {
 	cmdLine = strings.TrimSpace(cmdLine)
 	if cmdLine == "" {
 		return ""
@@ -68,11 +97,26 @@ func (a *AdminServer) ExecuteCommand(cmdLine string) string {
 	}
 
 	switch cmd {
+	case "auth":
+		if a.authToken == "" {
+			return "OK no authentication required\n"
+		}
+		if args == "" {
+			return "ERR usage: auth <token>\n"
+		}
+		if a.Authenticate(args) {
+			return "OK authenticated\n"
+		}
+		return "ERR invalid token\n"
+
 	case "status":
 		active, tickRate, uptime := a.server.GetStats()
 		return fmt.Sprintf("OK active_sessions=%d tick_rate=%d uptime=%s\n", active, tickRate, uptime.Round(time.Second))
 
 	case "kick":
+		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+			return "ERR unauthorized: authentication required\n"
+		}
 		if args == "" {
 			return "ERR usage: kick <session_id>\n"
 		}
@@ -86,6 +130,9 @@ func (a *AdminServer) ExecuteCommand(cmdLine string) string {
 		return fmt.Sprintf("ERR session %d not found\n", sessID)
 
 	case "ban":
+		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+			return "ERR unauthorized: authentication required\n"
+		}
 		if args == "" {
 			return "ERR usage: ban <uuid> <reason>\n"
 		}
@@ -101,6 +148,9 @@ func (a *AdminServer) ExecuteCommand(cmdLine string) string {
 		return fmt.Sprintf("OK account %s banned: %s\n", uuid, reason)
 
 	case "broadcast":
+		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+			return "ERR unauthorized: authentication required\n"
+		}
 		if args == "" {
 			return "ERR usage: broadcast <message>\n"
 		}
@@ -136,6 +186,7 @@ func (a *AdminServer) Start(ctx context.Context) error {
 				if !a.running.Load() {
 					return
 				}
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 			go a.handleConnection(conn)
@@ -165,10 +216,33 @@ func (a *AdminServer) Stop() {
 
 func (a *AdminServer) handleConnection(conn io.ReadWriteCloser) {
 	defer conn.Close()
+	connAuthed := (a.authToken == "")
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		line := scanner.Text()
-		resp := a.ExecuteCommand(line)
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		parts := strings.SplitN(trimmed, " ", 2)
+		cmd := strings.ToLower(parts[0])
+		if cmd == "auth" {
+			token := ""
+			if len(parts) > 1 {
+				token = strings.TrimSpace(parts[1])
+			}
+			if a.authToken == "" {
+				connAuthed = true
+				_, _ = conn.Write([]byte("OK no authentication required\n"))
+			} else if a.Authenticate(token) {
+				connAuthed = true
+				_, _ = conn.Write([]byte("OK authenticated\n"))
+			} else {
+				_, _ = conn.Write([]byte("ERR invalid token\n"))
+			}
+			continue
+		}
+		resp := a.executeCommand(line, connAuthed)
 		if resp != "" {
 			_, _ = conn.Write([]byte(resp))
 		}

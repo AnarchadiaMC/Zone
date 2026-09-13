@@ -1,4 +1,4 @@
-﻿# Zone — .gitignore
+# Zone — .gitignore
 
 # Binaries and Executables
 *.exe
@@ -22,7 +22,9 @@
 build/
 bin/
 out/
-dist/
+dist/*
+!dist/.gitkeep
+dist/*.zip
 zone-client/build/
 zone-server/build/
 cmake-build-*/

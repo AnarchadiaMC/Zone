@@ -21,12 +21,26 @@ function on_entity_enter(pkt, offset)
         local lvid = db.actor and db.actor:level_vertex_id() or 0
         local gvid = db.actor and db.actor:game_vertex_id() or 0
         
-        local se_obj = alife():create(section, vector():set(x,y,z), lvid, gvid)
+        -- L-17: Validate section name in system_ini before alife():create
+        local sec = section
+        if not (system_ini() and system_ini():section_exist(sec)) then
+            printf("[zone_ai_proxy] Warning: Section '%s' does not exist in system_ini! Falling back to sim_default_stalker_0", tostring(sec))
+            sec = "sim_default_stalker_0"
+            if not (system_ini() and system_ini():section_exist(sec)) then
+                printf("[zone_ai_proxy] Error: Fallback section '%s' does not exist in system_ini!", sec)
+                return
+            end
+        end
+        
+        local sim = alife()
+        if not sim then return end
+        
+        local se_obj = sim:create(sec, vector():set(x,y,z), lvid, gvid)
         if se_obj then
             se_obj.is_zone_ai_proxy = true
             ai_entities[eid] = {
                 se_id = se_obj.id,
-                section = section,
+                section = sec,
                 pos = vector():set(x,y,z),
                 faction = faction,
                 action = 0,
@@ -65,8 +79,10 @@ function on_ai_action(pkt, offset)
         elseif action == 2 then -- ATTACK
             -- Face target if known
             -- Target facing logic requires target position, we simplify by facing actor if target is actor
-            if target_id == 0 or target_id == db.actor:id() then
-                local dir = db.actor:position():sub(obj:position()):normalize()
+            -- L-16: Check db.actor ~= nil before checking target_id == db.actor:id()
+            -- L-01: Fix in-place actor position mutation
+            if db.actor and (target_id == 0 or target_id == db.actor:id()) then
+                local dir = vector():set(db.actor:position()):sub(obj:position()):normalize()
                 obj:set_desired_direction(dir)
             end
         end
@@ -82,5 +98,25 @@ function on_entity_leave(pkt, offset)
             alife():release(se, true)
         end
         ai_entities[eid] = nil
+    end
+end
+
+-- L-14: Release all spawned AI entities on level change and clear table
+function on_level_changing()
+    local sim = alife()
+    for eid, entity in pairs(ai_entities) do
+        if sim and entity.se_id then
+            local se = sim:object(entity.se_id)
+            if se then
+                sim:release(se, true)
+            end
+        end
+    end
+    ai_entities = {}
+end
+
+function on_game_start()
+    if RegisterScriptCallback then
+        RegisterScriptCallback("on_level_changing", on_level_changing)
     end
 end

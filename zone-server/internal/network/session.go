@@ -49,8 +49,15 @@ func (sm *SessionManager) updateCache() {
 func (sm *SessionManager) AddSession(s *PlayerSession) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if old, exists := sm.sessions[s.SessionID]; exists && old != nil {
+		if old.UDPAddr != nil {
+			delete(sm.byAddr, old.UDPAddr.String())
+		}
+	}
 	sm.sessions[s.SessionID] = s
-	sm.byAddr[s.UDPAddr.String()] = s
+	if s.UDPAddr != nil {
+		sm.byAddr[s.UDPAddr.String()] = s
+	}
 	sm.updateCache()
 }
 
@@ -59,7 +66,9 @@ func (sm *SessionManager) RemoveSession(id uint32) {
 	defer sm.mu.Unlock()
 	if s, ok := sm.sessions[id]; ok {
 		delete(sm.sessions, id)
-		delete(sm.byAddr, s.UDPAddr.String())
+		if s.UDPAddr != nil {
+			delete(sm.byAddr, s.UDPAddr.String())
+		}
 		sm.updateCache()
 	}
 }

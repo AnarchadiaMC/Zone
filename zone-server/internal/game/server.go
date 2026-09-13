@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -18,7 +21,14 @@ import (
 	"zone-online/zone-server/internal/protocol"
 )
 
+type PacketRecorder interface {
+	Record(data []byte)
+}
+
+var activeSink PacketRecorder
+
 type EventManager struct{}
+
 func NewEventManager() *EventManager { return &EventManager{} }
 
 type Server struct {
@@ -26,6 +36,7 @@ type Server struct {
 	db        *database.DB
 	dbQueue   chan *database.DBWriteJob
 	udp       *network.UDPListener
+	udpMu     sync.RWMutex
 	sessions  *network.SessionManager
 	grid      *SpatialGrid
 	events    *EventManager
@@ -38,6 +49,7 @@ type Server struct {
 	seq       atomic.Uint32
 	ackQueue  *network.AckQueue
 	startTime time.Time
+	tickCount atomic.Uint64
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {
@@ -64,17 +76,85 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	return s
 }
 
-func (s *Server) Run(ctx context.Context) error {
-	udp, err := network.NewUDPListener(s.cfg.Port, s.HandlePacket)
+// GetUDP safely retrieves the active UDPListener.
+func (s *Server) GetUDP() *network.UDPListener {
+	s.udpMu.RLock()
+	defer s.udpMu.RUnlock()
+	return s.udp
+}
+
+// SetUDP safely sets the UDPListener.
+func (s *Server) SetUDP(u *network.UDPListener) {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	s.udp = u
+}
+
+// InitUDP initializes the UDP listener for the server (S-04).
+func (s *Server) InitUDP() error {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	if s.udp != nil {
+		return nil
+	}
+	port := 0
+	if s.cfg != nil {
+		port = s.cfg.Port
+	}
+	udp, err := network.NewUDPListener(port, s.HandlePacket)
 	if err != nil {
 		return err
 	}
 	s.udp = udp
-	s.udp.Start(ctx)
-	
+	return nil
+}
+
+func (s *Server) Run(ctx context.Context) error {
+	if s.GetUDP() == nil {
+		if err := s.InitUDP(); err != nil {
+			return err
+		}
+	}
+	udp := s.GetUDP()
+	udp.Start(ctx)
+
 	s.logger.Info("Server started")
 	<-ctx.Done()
-	return s.udp.Close()
+	return udp.Close()
+}
+
+// isValidTransform validates client coordinates and velocities against NaN, Inf, and plausible bounds (S-09).
+func isValidTransform(ct *protocol.ClientTransform) bool {
+	coords := [3]float64{float64(ct.PosX), float64(ct.PosY), float64(ct.PosZ)}
+	for _, c := range coords {
+		if math.IsNaN(c) || math.IsInf(c, 0) || math.Abs(c) > 10000.0 {
+			return false
+		}
+	}
+	vels := [3]float64{float64(ct.VelX) / 100.0, float64(ct.VelY) / 100.0, float64(ct.VelZ) / 100.0}
+	for _, v := range vels {
+		if math.IsNaN(v) || math.IsInf(v, 0) || math.Abs(v) > 1000.0 {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeChatText strips non-printable ASCII/control runes except newline and tab, ensuring valid UTF-8.
+func sanitizeChatText(raw string) string {
+	if !utf8.ValidString(raw) {
+		raw = strings.ToValidUTF8(raw, "")
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if r == '\n' || r == '\t' {
+			b.WriteRune(r)
+		} else if unicode.IsPrint(r) && !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
@@ -87,13 +167,36 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	// Simple dispatch
 	switch hdr.Opcode {
 	case protocol.OpHandshakeReq:
-		// Implementation for HandshakeReq
 		var req protocol.HandshakeReq
 		if err := binary.Read(buf, binary.LittleEndian, &req); err == nil {
 			s.logger.Info("Handshake", zap.String("addr", addr.String()))
+			cleanUUID := nullTermString(req.UUID[:])
+			if cleanUUID == "" {
+				cleanUUID = string(bytes.Trim(req.UUID[:], "\x00"))
+			}
+			sessID := s.seq.Add(1)
+			sess := &network.PlayerSession{
+				SessionID:    sessID,
+				AccountID:    cleanUUID,
+				UDPAddr:      addr,
+				LastSeen:     time.Now(),
+				Health:       100.0,
+				CurrentLevel: "l01_escape",
+			}
+			s.sessions.AddSession(sess)
+
+			res := protocol.HandshakeRes{
+				Status:    0,
+				SpawnX:    0,
+				SpawnY:    0,
+				SpawnZ:    0,
+				WorldTime: uint64(time.Now().Unix()),
+				EcoTier:   1,
+			}
+			binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
+			s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
 		}
 	case protocol.OpHeartbeat:
 		var hb protocol.HeartbeatPayload
@@ -103,13 +206,8 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.LastSeen = time.Now()
 				sess.Unlock()
 				s.SendToSession(sess, protocol.OpHeartbeat, protocol.FlagUnreliable, hb)
-			} else {
-				var respBuf bytes.Buffer
-				seq := s.seq.Add(1)
-				if err := protocol.WritePacket(&respBuf, protocol.OpHeartbeat, seq, protocol.FlagUnreliable, hb); err == nil && s.udp != nil {
-					_ = s.udp.Send(addr, respBuf.Bytes())
-				}
 			}
+			// S-08: Drop heartbeat from unknown/unregistered session to prevent UDP amplification/reflection attacks.
 		} else {
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
@@ -120,6 +218,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 	case protocol.OpClientTransform:
 		var ct protocol.ClientTransform
 		if err := binary.Read(buf, binary.LittleEndian, &ct); err == nil {
+			// S-09: Validate transform data bounds and NaN/Inf
+			if !isValidTransform(&ct) {
+				s.logger.Warn("Dropped invalid client transform",
+					zap.String("addr", addr.String()),
+					zap.Float32("x", ct.PosX),
+					zap.Float32("y", ct.PosY),
+					zap.Float32("z", ct.PosZ),
+				)
+				return
+			}
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
 				sess.Position = [3]float32{ct.PosX, ct.PosY, ct.PosZ}
@@ -226,6 +334,10 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 }
 
 func (s *Server) Tick(now time.Time) {
+	// S-01: Only increment play time once per second (every 30 ticks at 30Hz)
+	tick := s.tickCount.Add(1)
+	isSecondTick := (tick%30 == 0)
+
 	// Timeout stale sessions & queue periodic stats
 	for _, sess := range s.sessions.GetAll() {
 		sess.Lock()
@@ -234,15 +346,18 @@ func (s *Server) Tick(now time.Time) {
 		sess.Unlock()
 		if stale {
 			s.sessions.RemoveSession(sess.SessionID)
-		} else if uuid != "" {
+		} else if isSecondTick && uuid != "" {
 			s.QueuePeriodicStats(uuid, 1)
 		}
 	}
-	s.aoi.BroadcastSnapshots(s.sessions, s.grid, s.udp, &s.seq)
+	if udp := s.GetUDP(); udp != nil {
+		s.aoi.BroadcastSnapshots(s.sessions, s.grid, udp, &s.seq)
+	}
 }
 
 func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{}) {
-	if sess == nil || sess.UDPAddr == nil || s.udp == nil {
+	udp := s.GetUDP()
+	if sess == nil || sess.UDPAddr == nil || (udp == nil && activeSink == nil) {
 		return
 	}
 
@@ -256,14 +371,20 @@ func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags
 
 	data := buf.Bytes()
 
+	if activeSink != nil {
+		activeSink.Record(data)
+	}
+
 	if (flags & protocol.FlagReliable) != 0 {
 		if s.ackQueue != nil {
 			s.ackQueue.EnqueueReliable(seq, sess.UDPAddr, data)
 		}
 	}
 
-	if err := s.udp.Send(sess.UDPAddr, data); err != nil {
-		s.logger.Error("Failed to send packet", zap.Error(err))
+	if udp != nil {
+		if err := udp.Send(sess.UDPAddr, data); err != nil {
+			s.logger.Error("Failed to send packet", zap.Error(err))
+		}
 	}
 }
 
@@ -310,6 +431,25 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	if sess == nil {
 		return false
 	}
+
+	// S-16: Save player character state before removing session
+	sess.Lock()
+	uuid := sess.AccountID
+	pos := sess.Position
+	yaw := sess.Rotation[0]
+	health := sess.Health
+	sess.Unlock()
+
+	if uuid != "" {
+		s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+		if s.db != nil && s.dbQueue == nil {
+			_, _ = s.db.RawDB().Exec(
+				"UPDATE characters SET pos_x=?, pos_y=?, pos_z=?, yaw=?, health=?, updated_at=? WHERE client_uuid=?",
+				pos[0], pos[1], pos[2], yaw, health, time.Now().Unix(), uuid,
+			)
+		}
+	}
+
 	s.SendToSession(sess, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
 	s.sessions.RemoveSession(sessionID)
 	return true
@@ -321,6 +461,7 @@ func (s *Server) BanPlayer(uuid string, reason string) error {
 			return err
 		}
 	}
+	// S-16 & S-24: Flush state via KickSession and break immediately upon finding matching session
 	for _, sess := range s.sessions.GetAll() {
 		sess.Lock()
 		accID := sess.AccountID
@@ -328,6 +469,7 @@ func (s *Server) BanPlayer(uuid string, reason string) error {
 		sess.Unlock()
 		if accID == uuid {
 			s.KickSession(sessID)
+			break
 		}
 	}
 	return nil
@@ -336,7 +478,8 @@ func (s *Server) BanPlayer(uuid string, reason string) error {
 // sendStashResponse serialises resp as OpStashResponse and sends it directly
 // to addr without requiring an established session (client may not be registered yet).
 func (s *Server) sendStashResponse(addr *net.UDPAddr, resp protocol.StashResponsePayload) {
-	if s.udp == nil {
+	udp := s.GetUDP()
+	if udp == nil && activeSink == nil {
 		return
 	}
 	seq := s.seq.Add(1)
@@ -346,11 +489,16 @@ func (s *Server) sendStashResponse(addr *net.UDPAddr, resp protocol.StashRespons
 		return
 	}
 	data := buf.Bytes()
+	if activeSink != nil {
+		activeSink.Record(data)
+	}
 	if s.ackQueue != nil {
 		s.ackQueue.EnqueueReliable(seq, addr, data)
 	}
-	if err := s.udp.Send(addr, data); err != nil {
-		s.logger.Error("sendStashResponse: send failed", zap.Error(err))
+	if udp != nil {
+		if err := udp.Send(addr, data); err != nil {
+			s.logger.Error("sendStashResponse: send failed", zap.Error(err))
+		}
 	}
 }
 

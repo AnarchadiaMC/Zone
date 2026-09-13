@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 #  Zone - Root Build Orchestrator
 #  Usage:
 #    make server        - build zone-server.exe (Windows)
@@ -46,19 +46,22 @@ dist: server client
 	@mkdir -p $(DIST_DIR)/client/bin
 	@mkdir -p $(DIST_DIR)/gamedata/scripts
 	@mkdir -p $(DIST_DIR)/gamedata/configs
-	@cp zone-server/zone-server.exe $(DIST_DIR)/server/ 2>/dev/null || true
-	@cp zone-server/zone_server.yaml $(DIST_DIR)/server/ 2>/dev/null || true
-	@cp zone-client/build/Release/ZoneClient.dll $(DIST_DIR)/client/bin/ 2>/dev/null || true
-	@cp zone-client/build/Release/ZoneClient_Injector.exe $(DIST_DIR)/client/bin/ 2>/dev/null || true
-	@cp gamedata/scripts/*.script $(DIST_DIR)/gamedata/scripts/ 2>/dev/null || true
-	@cp gamedata/configs/*.ltx $(DIST_DIR)/gamedata/configs/ 2>/dev/null || true
+	@mkdir -p $(DIST_DIR)/gamedata/configs/ui
+	@cp zone-server/zone-server.exe $(DIST_DIR)/server/
+	@cp zone-server/zone_server.yaml $(DIST_DIR)/server/
+	@cp zone-client/build/Release/ZoneClient.dll $(DIST_DIR)/client/bin/
+	@cp zone-client/build/Release/ZoneClient_Injector.exe $(DIST_DIR)/client/bin/
+	@cp gamedata/scripts/*.script $(DIST_DIR)/gamedata/scripts/
+	@cp gamedata/configs/*.ltx $(DIST_DIR)/gamedata/configs/
+	@cp -r gamedata/configs/ui/* $(DIST_DIR)/gamedata/configs/ui/
+	@cp LICENSE $(DIST_DIR)/
+	@cp VERSION.txt $(DIST_DIR)/
 	@cp INSTALL.md $(DIST_DIR)/
-	@echo "$(VERSION)" > $(DIST_DIR)/VERSION.txt
 	@echo "[+] Distribution assembled at $(DIST_DIR)/"
 
 clean:
 	@echo "[*] Cleaning build artifacts..."
 	$(MAKE) -C zone-server clean 2>/dev/null || true
 	@rm -rf zone-client/build/
-	@rm -rf dist/
+	@rm -rf dist/zone-online-* dist/*.zip
 	@echo "[+] Clean complete."

@@ -2,9 +2,11 @@ package network
 
 import (
 	"context"
+	"log"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,10 +64,15 @@ func (aq *AckQueue) RetransmitExpired(now time.Time, listener *UDPListener) {
 }
 
 type UDPListener struct {
-	conn    *net.UDPConn
-	pool    sync.Pool
-	workers [8]chan *incomingPacket
-	handler func(data []byte, addr *net.UDPAddr)
+	conn           *net.UDPConn
+	pool           sync.Pool
+	workers        [8]chan *incomingPacket
+	handler        func(data []byte, addr *net.UDPAddr)
+	droppedPackets atomic.Uint64
+}
+
+func (l *UDPListener) DroppedPackets() uint64 {
+	return l.droppedPackets.Load()
 }
 
 func NewUDPListener(port int, handler func([]byte, *net.UDPAddr)) (*UDPListener, error) {
@@ -135,6 +142,10 @@ func (l *UDPListener) Start(ctx context.Context) {
 			select {
 			case l.workers[workerIdx] <- &incomingPacket{data: data, addr: addr}:
 			default:
+				dropped := l.droppedPackets.Add(1)
+				if dropped == 1 || dropped%100 == 0 {
+					log.Printf("[WARN] UDP listener: worker queue full, packet dropped (total dropped: %d)", dropped)
+				}
 			}
 		}
 	}()

@@ -35,7 +35,7 @@ struct HeartbeatPayload {
 };
 
 struct HandshakeReq {
-    char uuid[36];
+    char uuid[37];
     uint32_t hwid;
     char nick[32];
     uint8_t protoVer;

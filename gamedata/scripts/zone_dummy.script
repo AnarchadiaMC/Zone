@@ -2,22 +2,87 @@
 -- Proxy stalker system with Hermite Spline Interpolation
 
 local spawned_proxies = {}
+local peer_factions = {}
 local MAX_HISTORY = 8
 local JITTER_BUFFER_MS = 100
+
+-- Ring buffer helper functions (L-30: avoid table.remove(tbl, 1) in hot path)
+local function add_history_sample(proxy, sample)
+    if proxy.hist_count < MAX_HISTORY then
+        proxy.hist_count = proxy.hist_count + 1
+        local idx = ((proxy.hist_head + proxy.hist_count - 2) % MAX_HISTORY) + 1
+        proxy.pos_history[idx] = sample
+    else
+        -- Ring buffer full: overwrite oldest sample at hist_head and advance
+        proxy.pos_history[proxy.hist_head] = sample
+        proxy.hist_head = (proxy.hist_head % MAX_HISTORY) + 1
+    end
+end
+
+local function get_history_sample(proxy, i)
+    if i < 1 or i > proxy.hist_count then return nil end
+    local idx = ((proxy.hist_head + i - 2) % MAX_HISTORY) + 1
+    return proxy.pos_history[idx]
+end
+
+local function get_latest_sample(proxy)
+    if proxy.hist_count == 0 then return nil end
+    return get_history_sample(proxy, proxy.hist_count)
+end
+
+-- Resolve entity by ID (attacker lookup: db.actor, remote proxy, or level entity) (L-18)
+local function resolve_entity(id)
+    if not id then return nil end
+    if db.actor and (id == db.actor:id()) then
+        return db.actor
+    end
+    local proxy = spawned_proxies[id]
+    if proxy then
+        local gid = proxy.game_id or proxy.se_id
+        if gid and level and level.object_by_id then
+            local obj = level.object_by_id(gid)
+            if obj then return obj end
+        end
+    end
+    if level and level.object_by_id then
+        local obj = level.object_by_id(id)
+        if obj then return obj end
+    end
+    return nil
+end
+
+-- Helper to select valid profile section for faction (L-25)
+local function get_proxy_section(faction)
+    if faction and faction ~= "" then
+        local s = "sim_default_" .. faction
+        if ini_sys and ini_sys:section_exist(s) then return s end
+        local s0 = s .. "_0"
+        if ini_sys and ini_sys:section_exist(s0) then return s0 end
+    end
+    if ini_sys and ini_sys:section_exist("sim_default_stalker") then
+        return "sim_default_stalker"
+    elseif ini_sys and ini_sys:section_exist("sim_default_stalker_0") then
+        return "sim_default_stalker_0"
+    end
+    return "stalker"
+end
 
 function spawn_proxy(session_id, pos, faction)
     if spawned_proxies[session_id] then return end
     
-    local section = "sim_default_" .. (faction or "stalker")
-    -- Fallback to standard stalker if generic section doesn't exist (relies on zone_proxy_stalker in system.ltx ideally)
-    if not ini_sys:section_exist(section) then
-        section = "sim_default_stalker"
-    end
+    local resolved_faction = (faction and faction ~= "") and faction or (peer_factions[session_id] or "stalker")
+    peer_factions[session_id] = resolved_faction
     
-    local lvid = db.actor and db.actor:level_vertex_id() or 0
+    local section = get_proxy_section(resolved_faction)
+    
+    -- L-15: if db.actor is nil (loading screen), don't pass vertex 0: use level default vertex IDs or safe coordinates
+    local lvid = db.actor and db.actor:level_vertex_id() or (level and level.vertex_id and level.vertex_id(pos)) or 0
     local gvid = db.actor and db.actor:game_vertex_id() or 0
     
-    local se_obj = alife():create(section, pos, lvid, gvid)
+    local sim = alife()
+    if not sim then return end
+
+    local se_obj = sim:create(section, pos, lvid, gvid)
     if se_obj then
         -- Tag for death manager bypass (needs integration in death_manager.script)
         se_obj.is_zone_proxy = true
@@ -26,6 +91,10 @@ function spawn_proxy(session_id, pos, faction)
             se_id = se_obj.id,
             game_id = nil,
             pos_history = {},
+            hist_head = 1,
+            hist_count = 0,
+            faction = resolved_faction,
+            last_attacker_id = nil,
             last_update = time_global()
         }
     end
@@ -34,9 +103,12 @@ end
 function despawn_proxy(session_id)
     local proxy = spawned_proxies[session_id]
     if proxy then
-        local se_obj = alife():object(proxy.se_id)
-        if se_obj then
-            alife():release(se_obj, true)
+        local sim = alife()
+        if sim and proxy.se_id then
+            local se_obj = sim:object(proxy.se_id)
+            if se_obj then
+                sim:release(se_obj, true)
+            end
         end
         spawned_proxies[session_id] = nil
     end
@@ -46,79 +118,129 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     local proxy = spawned_proxies[session_id]
     if not proxy then return end
     
-    table.insert(proxy.pos_history, {
-        x = x, y = y, z = z, yaw = yaw, health = health, t = time_global()
+    add_history_sample(proxy, {
+        x = x, y = y, z = z, yaw = yaw, pitch = pitch, animflags = animflags, health = health, t = time_global()
     })
-    
-    while #proxy.pos_history > MAX_HISTORY do
-        table.remove(proxy.pos_history, 1)
-    end
     
     proxy.last_update = time_global()
     
     -- Resolve game_id once online
-    if not proxy.game_id then
+    if not proxy.game_id and level and level.object_by_id then
         local obj = level.object_by_id(proxy.se_id)
         if obj then proxy.game_id = proxy.se_id end
     end
     
     -- Apply anim flags / health if game object exists
-    local obj = proxy.game_id and level.object_by_id(proxy.game_id) or nil
+    local obj = (proxy.game_id and level and level.object_by_id) and level.object_by_id(proxy.game_id) or nil
     if obj then
         if health <= 0 and obj:alive() then
-            obj:kill(obj)
+            -- L-18: Attribute killer to actual attacker entity instead of self
+            local killer_obj = resolve_entity(proxy.last_attacker_id) or obj
+            obj:kill(killer_obj)
         end
-        -- We could force set movement here if needed, but we focus on interpolation.
     end
 end
 
--- Hermite spline interpolation for smooth proxy movement
+-- Hermite spline interpolation for smooth proxy movement (L-05 & L-24)
 function interpolate_proxies()
     local tg = time_global()
     local target_t = tg - JITTER_BUFFER_MS
     
     for sid, proxy in pairs(spawned_proxies) do
-        local hist = proxy.pos_history
-        if #hist >= 4 then
-            -- Find the interval
+        -- Resolve game_id once online if not yet resolved
+        if not proxy.game_id and level and level.object_by_id then
+            local obj = level.object_by_id(proxy.se_id)
+            if obj then proxy.game_id = proxy.se_id end
+        end
+
+        local count = proxy.hist_count
+        if count >= 2 then
+            local s_first = get_history_sample(proxy, 1)
+            local s_last = get_history_sample(proxy, count)
+            
+            -- Find the interval [idx, idx+1]
             local idx = 1
-            for i = 1, #hist - 1 do
-                if hist[i].t <= target_t and hist[i+1].t >= target_t then
-                    idx = i
-                    break
+            if target_t <= s_first.t then
+                idx = 1
+            elseif target_t >= s_last.t then
+                idx = count - 1
+            else
+                for i = 1, count - 1 do
+                    local s1 = get_history_sample(proxy, i)
+                    local s2 = get_history_sample(proxy, i + 1)
+                    if s1.t <= target_t and s2.t >= target_t then
+                        idx = i
+                        break
+                    end
                 end
             end
             
-            -- Need 4 points for Hermite: idx-1, idx, idx+1, idx+2
-            if idx > 1 and idx < #hist - 1 then
-                local p0 = hist[idx-1]
-                local p1 = hist[idx]
-                local p2 = hist[idx+1]
-                local p3 = hist[idx+2]
-                
-                local dt = p2.t - p1.t
-                local t = (dt > 0) and ((target_t - p1.t) / dt) or 0
-                t = math.max(0, math.min(1, t))
-                
-                -- Tangents
-                local m1x = 0.5 * (p2.x - p0.x); local m1y = 0.5 * (p2.y - p0.y); local m1z = 0.5 * (p2.z - p0.z)
-                local m2x = 0.5 * (p3.x - p1.x); local m2y = 0.5 * (p3.y - p1.y); local m2z = 0.5 * (p3.z - p1.z)
-                
-                -- Basis functions
-                local h00 = (2*t^3 - 3*t^2 + 1)
-                local h10 = (t^3 - 2*t^2 + t)
-                local h01 = (-2*t^3 + 3*t^2)
-                local h11 = (t^3 - t^2)
-                
-                local ix = h00*p1.x + h10*m1x + h01*p2.x + h11*m2x
-                local iy = h00*p1.y + h10*m1y + h01*p2.y + h11*m2y
-                local iz = h00*p1.z + h10*m1z + h01*p2.z + h11*m2z
-                
-                if proxy.game_id then
-                    local obj = level.object_by_id(proxy.game_id)
-                    if obj and obj:alive() then
-                        obj:set_npc_position(vector():set(ix, iy, iz))
-                    end
+            local p1 = get_history_sample(proxy, idx)
+            local p2 = get_history_sample(proxy, idx + 1)
+            
+            local dt12 = p2.t - p1.t
+            local t = 0
+            if dt12 > 0 then
+                t = math.max(0, math.min(1, (target_t - p1.t) / dt12))
+            else
+                t = 1
+            end
+            
+            -- Time-scaled Catmull-Rom tangents with clamped/linear edge handling (L-05 & L-24)
+            local m1x, m1y, m1z
+            if idx > 1 then
+                local p0 = get_history_sample(proxy, idx - 1)
+                local dt02 = p2.t - p0.t
+                local scale1 = (dt02 > 0) and (dt12 / dt02) or 0.5
+                m1x = (p2.x - p0.x) * scale1
+                m1y = (p2.y - p0.y) * scale1
+                m1z = (p2.z - p0.z) * scale1
+            else
+                -- Clamped Catmull-Rom / linear tangent at start interval
+                m1x = p2.x - p1.x
+                m1y = p2.y - p1.y
+                m1z = p2.z - p1.z
+            end
+            
+            local m2x, m2y, m2z
+            if idx < count - 1 then
+                local p3 = get_history_sample(proxy, idx + 2)
+                local dt13 = p3.t - p1.t
+                local scale2 = (dt13 > 0) and (dt12 / dt13) or 0.5
+                m2x = (p3.x - p1.x) * scale2
+                m2y = (p3.y - p1.y) * scale2
+                m2z = (p3.z - p1.z) * scale2
+            else
+                -- Clamped Catmull-Rom / linear tangent at end interval
+                m2x = p2.x - p1.x
+                m2y = p2.y - p1.y
+                m2z = p2.z - p1.z
+            end
+            
+            -- Hermite basis functions
+            local t2 = t * t
+            local t3 = t2 * t
+            local h00 = (2 * t3 - 3 * t2 + 1)
+            local h10 = (t3 - 2 * t2 + t)
+            local h01 = (-2 * t3 + 3 * t2)
+            local h11 = (t3 - t2)
+            
+            local ix = h00 * p1.x + h10 * m1x + h01 * p2.x + h11 * m2x
+            local iy = h00 * p1.y + h10 * m1y + h01 * p2.y + h11 * m2y
+            local iz = h00 * p1.z + h10 * m1z + h01 * p2.z + h11 * m2z
+            
+            if proxy.game_id and level and level.object_by_id then
+                local obj = level.object_by_id(proxy.game_id)
+                if obj and obj:alive() and obj.set_npc_position then
+                    obj:set_npc_position(vector():set(ix, iy, iz))
+                end
+            end
+        elseif count == 1 then
+            local p1 = get_history_sample(proxy, 1)
+            if proxy.game_id and level and level.object_by_id then
+                local obj = level.object_by_id(proxy.game_id)
+                if obj and obj:alive() and obj.set_npc_position then
+                    obj:set_npc_position(vector():set(p1.x, p1.y, p1.z))
                 end
             end
         end
@@ -142,9 +264,10 @@ function on_snapshot(pkt, offset)
         if yaw > 32767 then yaw = yaw - 65536 end
         if pitch > 32767 then pitch = pitch - 65536 end
         
-        -- If not spawned (maybe missed ENTER), we could spawn, but faction is missing. We skip or spawn generic.
+        -- If not spawned (maybe missed ENTER), use stored faction if available (L-25)
         if not spawned_proxies[sid] then
-            spawn_proxy(sid, vector():set(x,y,z), "stalker")
+            local faction = peer_factions[sid] or "stalker"
+            spawn_proxy(sid, vector():set(x, y, z), faction)
         end
         update_proxy(sid, x, y, z, yaw / 100.0, pitch / 100.0, animflags, health)
     end
@@ -165,8 +288,24 @@ function on_entity_enter(pkt, offset)
     faction = faction:gsub("%z+", "")
     local health, pos = zone_net.read_uint8(pkt, pos)
     
+    -- Store peer faction (L-25)
+    if faction and faction ~= "" then
+        peer_factions[eid] = faction
+    end
+    
     if typ == 1 then -- Player
-        spawn_proxy(eid, vector():set(x,y,z), faction)
+        local proxy = spawned_proxies[eid]
+        if proxy then
+            proxy.faction = faction
+            if proxy.game_id and level and level.object_by_id then
+                local obj = level.object_by_id(proxy.game_id)
+                if obj and obj.set_character_community then
+                    pcall(function() obj:set_character_community(faction, 0, 0) end)
+                end
+            end
+        else
+            spawn_proxy(eid, vector():set(x, y, z), faction)
+        end
     end
 end
 
@@ -174,31 +313,27 @@ function on_damage_notify(target_id, attacker_id, damage, bone_id)
     local proxy = spawned_proxies[target_id]
     if not proxy then return end
 
-    local hist_len = #proxy.pos_history
-    local current_health = 100
-    if hist_len > 0 then
-        current_health = proxy.pos_history[hist_len].health
+    if attacker_id then
+        proxy.last_attacker_id = attacker_id
     end
+
+    local latest = get_latest_sample(proxy)
+    local current_health = latest and latest.health or 100
     local new_health = math.max(0, current_health - damage)
-    if hist_len > 0 then
-        proxy.pos_history[hist_len].health = new_health
+    
+    if latest then
+        latest.health = new_health
     else
-        table.insert(proxy.pos_history, {
-            x = 0, y = 0, z = 0, yaw = 0, health = new_health, t = time_global()
+        add_history_sample(proxy, {
+            x = 0, y = 0, z = 0, yaw = 0, pitch = 0, animflags = 0, health = new_health, t = time_global()
         })
     end
 
-    if new_health <= 0 and proxy.game_id then
+    if new_health <= 0 and proxy.game_id and level and level.object_by_id then
         local obj = level.object_by_id(proxy.game_id)
         if obj and obj:alive() then
-            local killer_obj = obj
-            local attacker_proxy = spawned_proxies[attacker_id]
-            if attacker_proxy and attacker_proxy.game_id then
-                local a_obj = level.object_by_id(attacker_proxy.game_id)
-                if a_obj then
-                    killer_obj = a_obj
-                end
-            end
+            -- L-18: Attribute killer to actual attacker entity instead of self
+            local killer_obj = resolve_entity(attacker_id) or obj
             obj:kill(killer_obj)
         end
     end
@@ -210,11 +345,21 @@ function on_entity_leave(pkt, offset)
 end
 
 function on_level_changing()
-    for sid, _ in pairs(spawned_proxies) do
-        despawn_proxy(sid)
+    local sim = alife()
+    for sid, proxy in pairs(spawned_proxies) do
+        if sim and proxy.se_id then
+            local se_obj = sim:object(proxy.se_id)
+            if se_obj then
+                sim:release(se_obj, true)
+            end
+        end
     end
+    spawned_proxies = {}
+    peer_factions = {}
 end
 
 function on_game_start()
-    RegisterScriptCallback("actor_on_level_changing", on_level_changing)
+    if RegisterScriptCallback then
+        RegisterScriptCallback("actor_on_level_changing", on_level_changing)
+    end
 end

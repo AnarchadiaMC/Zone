@@ -52,13 +52,13 @@ func (ac *AntiCheatManager) ValidateMove(sess *network.PlayerSession, newPos [3]
 		return false, "vertical teleport"
 	}
 
-	// Horizontal speed check (XZ plane).
-	dx := float64(newPos[0] - oldPos[0])
-	dz := float64(newPos[2] - oldPos[2])
-	dist := math.Sqrt(dx*dx + dz*dz)
-	speed := dist / float64(dt)
-	if speed > acMaxHorizontalSpeed {
-		return false, fmt.Sprintf("speed violation: %.2f m/s", speed)
+	// Total 3D speed magnitude check (S-13).
+	vx := float64(newPos[0]-oldPos[0]) / float64(dt)
+	vy := float64(newPos[1]-oldPos[1]) / float64(dt)
+	vz := float64(newPos[2]-oldPos[2]) / float64(dt)
+	totalSpeed := math.Sqrt(float64(vx*vx + vy*vy + vz*vz))
+	if totalSpeed > acMaxHorizontalSpeed {
+		return false, fmt.Sprintf("speed violation: %.2f m/s", totalSpeed)
 	}
 
 	return true, ""

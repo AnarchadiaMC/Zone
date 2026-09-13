@@ -3,12 +3,52 @@
 
 local config = {}
 
+local function generate_random_uuid()
+    math.randomseed(os.time() + (time_global and time_global() or 0))
+    local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+    return string.gsub(template, "[xy]", function (c)
+        local v = (c == "x") and math.random(0, 0xf) or math.random(8, 0xb)
+        return string.format("%x", v)
+    end)
+end
+
+local function generate_random_hwid()
+    math.randomseed(os.time() + (time_global and time_global() or 0))
+    return math.random(100000000, 999999999)
+end
+
+local function save_identity_config(cfg, path)
+    local file = io.open(path, "w")
+    if file then
+        file:write("[identity]\n")
+        file:write(string.format("client_uuid = %s\n", cfg.client_uuid or ""))
+        file:write(string.format("hwid_hash = %d\n", cfg.hwid_hash or 0))
+        file:write(string.format("nickname = %s\n", cfg.nickname or "Stalker"))
+        file:write(string.format("server_ip = %s\n", cfg.server_ip or "127.0.0.1"))
+        file:write(string.format("server_port = %d\n", cfg.server_port or 27015))
+        file:close()
+        printf("Zone: Generated and saved identity to %s", path)
+    end
+end
+
 local function load_config()
-    local path = getFS():update_path("$app_data_root$", "zone_identity.ltx")
+    local fs = getFS and getFS()
+    if not fs then
+        printf("Zone: FileSystem not available")
+        return false
+    end
+    local path = fs:update_path("$app_data_root$", "zone_identity.ltx")
     local file = io.open(path, "r")
     if not file then
-        printf("Zone: Missing zone_identity.ltx in appdata")
-        return false
+        printf("Zone: [WARNING] Missing zone_identity.ltx in appdata! Generating unique client credentials.")
+        config.client_uuid = generate_random_uuid()
+        config.hwid_hash = generate_random_hwid()
+        config.nickname = "Stalker"
+        config.server_ip = "127.0.0.1"
+        config.server_port = 27015
+        save_identity_config(config, path)
+        printf("Zone: [WARNING] Callsign set to default 'Stalker'. Please configure your callsign in Server Browser or zone_identity.ltx.")
+        return true
     end
     
     for line in file:lines() do
@@ -22,12 +62,38 @@ local function load_config()
         end
     end
     file:close()
+
+    local updated = false
+    if not config.client_uuid or config.client_uuid == "default_uuid" or config.client_uuid == "" then
+        config.client_uuid = generate_random_uuid()
+        printf("Zone: [WARNING] Unconfigured client_uuid. Generated random UUID: %s", config.client_uuid)
+        updated = true
+    end
+
+    if not config.hwid_hash or config.hwid_hash == 123456789 or config.hwid_hash == 0 then
+        config.hwid_hash = generate_random_hwid()
+        printf("Zone: [WARNING] Unconfigured hwid_hash. Generated random HWID: %d", config.hwid_hash)
+        updated = true
+    end
+
+    if not config.nickname or config.nickname == "" or config.nickname == "Stalker" then
+        printf("Zone: [WARNING] Callsign unconfigured or default ('%s'). Prompting player to configure callsign.", config.nickname or "nil")
+        if not config.nickname or config.nickname == "" then
+            config.nickname = "Stalker"
+            updated = true
+        end
+    end
+
+    if updated then
+        save_identity_config(config, path)
+    end
+
     return true
 end
 
 function on_game_start()
-    if type(ZoneNet) == "nil" then
-        printf("Zone: ZoneNet global not found! DLL hook failed or missing.")
+    if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) then
+        printf("Zone: ZoneClient.dll native library not loaded! DLL hook failed or missing.")
         return
     end
     
@@ -38,16 +104,17 @@ function on_game_start()
     
     local ip = config.server_ip or "127.0.0.1"
     local port = config.server_port or 27015
-    local uuid = config.client_uuid or "default_uuid"
-    local hwid = config.hwid_hash or 123456789
+    local uuid = config.client_uuid
+    local hwid = config.hwid_hash
     local nick = config.nickname or "Stalker"
     
     printf("Zone: Connecting to %s:%d as %s...", ip, port, nick)
     ZoneNet:Connect(ip, port, uuid, hwid, nick)
     
     -- Register callbacks
-    RegisterScriptCallback("actor_on_update", zone_net.on_tick)
-    RegisterScriptCallback("on_key_press", zone_safezone.on_key_press)
+    if RegisterScriptCallback then
+        RegisterScriptCallback("actor_on_update", zone_net.on_tick)
+    end
 end
 
 function get_config()

@@ -61,6 +61,43 @@ end
 -- HUD Static Widget Management
 -- ============================================================
 
+local function get_hud_rect()
+    local dev = device and device()
+    local dev_w = (dev and dev.width) or 1024
+    local dev_h = (dev and dev.height) or 768
+    local screen_ratio = dev_w / dev_h
+    -- In X-Ray, 1024x768 is the base UI virtual coordinate system.
+    -- On widescreen displays, X coordinates stretch with screen ratio.
+    -- Scale X dimension by (4:3 / current_aspect_ratio) to preserve aspect ratio.
+    local ratio = (1024 / 768) / screen_ratio
+
+    local base_w = 216
+    local base_h = 22
+    local margin_right = 8
+    local margin_top = 8
+
+    local w = base_w * ratio
+    local x2 = 1024 - (margin_right * ratio)
+    local x1 = x2 - w
+    local y1 = margin_top
+    local y2 = y1 + base_h
+
+    return Frect():set(x1, y1, x2, y2)
+end
+
+local function clear_hud_static()
+    if hud_static then
+        local hud_mgr = get_hud and get_hud()
+        if hud_mgr then
+            local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+            if ui and ui.DetachChild then
+                pcall(function() ui:DetachChild(hud_static) end)
+            end
+        end
+        hud_static = nil
+    end
+end
+
 local function get_or_create_static()
     local hud_mgr = get_hud and get_hud()
     if not hud_mgr then return nil end
@@ -75,7 +112,7 @@ local function get_or_create_static()
     local s = CUIStatic()
     -- DO NOT USE SetAutoDelete(true) because we are maintaining a Lua reference
     -- s:SetAutoDelete(true)
-    s:SetWndRect(Frect():set(800, 8, 1016, 30))
+    s:SetWndRect(get_hud_rect())
 
     if GetFontLetterica16Russian then
         s:SetFont(GetFontLetterica16Russian())
@@ -179,23 +216,25 @@ function notify_safezone(locked)
 end
 
 -- ============================================================
--- Cleanup on Level Transition / Actor Destroy
+-- Cleanup on Level Transition / Screen Ratio / Actor Destroy
 -- ============================================================
 
+local function on_level_changing()
+    clear_hud_static()
+    last_update_time = 0
+    last_connected   = nil
+    safe_zone_active = false
+end
+
+local function on_screen_ratio_changed()
+    clear_hud_static()
+end
+
 local function on_actor_destroy()
-    if hud_static then
-        local hud_mgr = get_hud and get_hud()
-        if hud_mgr then
-            local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
-            if ui and ui.DetachChild then
-                pcall(function() ui:DetachChild(hud_static) end)
-            end
-        end
-        hud_static       = nil
-        last_update_time = 0
-        last_connected   = nil
-        safe_zone_active = false
-    end
+    clear_hud_static()
+    last_update_time = 0
+    last_connected   = nil
+    safe_zone_active = false
 end
 
 -- ============================================================
@@ -204,7 +243,9 @@ end
 
 function on_game_start()
     if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_update",      on_actor_update)
-        RegisterScriptCallback("actor_on_net_destroy", on_actor_destroy)
+        RegisterScriptCallback("actor_on_update",         on_actor_update)
+        RegisterScriptCallback("actor_on_net_destroy",    on_actor_destroy)
+        RegisterScriptCallback("on_level_changing",       on_level_changing)
+        RegisterScriptCallback("on_screen_ratio_changed", on_screen_ratio_changed)
     end
 end

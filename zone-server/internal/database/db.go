@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"log"
 	"time"
 	_ "modernc.org/sqlite"
 )
@@ -22,6 +23,13 @@ func Open(dbPath string) (*DB, error) {
 	}
 
 	return &DB{db: db}, nil
+}
+
+func (d *DB) Close() error {
+	if d.db != nil {
+		return d.db.Close()
+	}
+	return nil
 }
 
 type Character struct {
@@ -111,6 +119,9 @@ func (d *DB) GetCharacterInventory(uuid string) ([]InventoryItem, error) {
 		}
 		items = append(items, i)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return items, nil
 }
 
@@ -185,9 +196,21 @@ func (d *DB) StartWriteQueue(ctx context.Context) chan *DBWriteJob {
 		for {
 			select {
 			case <-ctx.Done():
+				for len(q) > 0 {
+					job := <-q
+					if job != nil {
+						if _, err := d.db.Exec(job.Query, job.Args...); err != nil {
+							log.Printf("database write error during shutdown drain: %v (query: %s)", err, job.Query)
+						}
+					}
+				}
 				return
 			case job := <-q:
-				_, _ = d.db.Exec(job.Query, job.Args...)
+				if job != nil {
+					if _, err := d.db.Exec(job.Query, job.Args...); err != nil {
+						log.Printf("database write error: %v (query: %s)", err, job.Query)
+					}
+				}
 			}
 		}
 	}()

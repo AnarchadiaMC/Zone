@@ -1,9 +1,3 @@
 [submodule "zone-client/3rdparty/minhook"]
 	path = zone-client/3rdparty/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
-	branch = master
-
-[submodule "zone-client/3rdparty/imgui"]
-	path = zone-client/3rdparty/imgui
-	url = https://github.com/ocornut/imgui.git
-	branch = docking

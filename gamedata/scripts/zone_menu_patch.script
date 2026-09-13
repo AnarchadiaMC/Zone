@@ -14,9 +14,8 @@ local _hook_installed = false
 local function attach_zone_button(menu_wnd)
     if not menu_wnd then return end
 
-    -- Check if child already exists
-    local existing = menu_wnd[BUTTON_REG_NAME]
-    if existing then return end
+    -- Check if button already attached in current menu lifecycle
+    if menu_wnd._zone_button_attached then return end
 
     -- Build CUI3tButton from XML to match native Anomaly style
     local xml = CScriptXmlInit()
@@ -38,7 +37,8 @@ local function attach_zone_button(menu_wnd)
         menu_wnd
     )
 
-    menu_wnd[BUTTON_REG_NAME] = btn
+    -- Do not cache dead C++ button pointer userdata across menu destructions; use a boolean flag
+    menu_wnd._zone_button_attached = true
     printf("Zone MenuPatch: 'Zone' button attached to main menu.")
 end
 
@@ -58,8 +58,19 @@ local function hook_init_controls()
     end
 
     ui_main_menu.main_menu.InitControls = function(self_menu)
+        -- Clear attachment flag on reload so buttons are cleanly re-initialized
+        self_menu._zone_button_attached = nil
         orig_InitControls(self_menu)
         attach_zone_button(self_menu)
+    end
+
+    -- Hook __finalize on main_menu class to ensure no lingering references across menu destructions
+    local orig_finalize = ui_main_menu.main_menu.__finalize
+    ui_main_menu.main_menu.__finalize = function(self_menu)
+        self_menu._zone_button_attached = nil
+        if orig_finalize then
+            orig_finalize(self_menu)
+        end
     end
 
     _hook_installed = true
@@ -80,6 +91,12 @@ local function on_main_menu_on(menu_obj)
     end
 end
 
+local function on_main_menu_quit(menu_obj)
+    if menu_obj then
+        menu_obj._zone_button_attached = nil
+    end
+end
+
 -- ============================================================
 -- on_game_start — Anomaly script entrypoint
 -- ============================================================
@@ -90,5 +107,6 @@ function on_game_start()
     -- Always register callback as a guarantee across all game states
     if RegisterScriptCallback then
         RegisterScriptCallback("main_menu_on_init", on_main_menu_on)
+        RegisterScriptCallback("main_menu_on_quit", on_main_menu_quit)
     end
 end

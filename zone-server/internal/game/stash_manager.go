@@ -145,9 +145,6 @@ func (m *StashManager) ModifyStashItem(stashID uint32, itemSection string, count
 		return err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	rec, err := db.GetStash(stashID)
 	if err != nil {
 		return ErrStashNotFound
@@ -155,7 +152,9 @@ func (m *StashManager) ModifyStashItem(stashID uint32, itemSection string, count
 
 	var items []StashItem
 	if len(rec.ContentsJSON) > 0 {
-		_ = json.Unmarshal([]byte(rec.ContentsJSON), &items)
+		if err := json.Unmarshal([]byte(rec.ContentsJSON), &items); err != nil {
+			return err
+		}
 	}
 
 	foundIndex := -1

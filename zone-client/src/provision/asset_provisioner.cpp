@@ -16,30 +16,54 @@ namespace AssetProvisioner
     std::wstring GetGameRoot()
     {
         wchar_t buf[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        DWORD ret = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        if (ret == 0 || ret >= MAX_PATH)
+        {
+            return L"";
+        }
         std::wstring path(buf);
 
-        // Strip executable name
-        size_t last = path.find_last_of(L"\\/");
-        if (last != std::wstring::npos) path = path.substr(0, last);
+        // Normalize slashes to backslashes
+        for (auto& c : path)
+        {
+            if (c == L'/') c = L'\\';
+        }
 
-        // Loop until all binary subdirectories (x64, bin, Win64) are stripped
+        // Strip executable name
+        size_t last = path.find_last_of(L'\\');
+        if (last != std::wstring::npos)
+        {
+            path = path.substr(0, last);
+        }
+
+        // Strip trailing backslash if any
+        while (!path.empty() && path.back() == L'\\')
+        {
+            path.pop_back();
+        }
+
+        // Specifically look for trailing \bin or binary subfolders (\x64, \Win64, \bin, \bin_x64, \bin_dedicated)
+        // at the end of the parent directory, rather than searching arbitrary substrings.
         bool stripped = true;
-        while (stripped)
+        while (stripped && !path.empty())
         {
             stripped = false;
-            last = path.find_last_of(L"\\/");
-            if (last != std::wstring::npos)
+            size_t slash = path.find_last_of(L'\\');
+            if (slash != std::wstring::npos)
             {
-                std::wstring folder = path.substr(last + 1);
+                std::wstring folder = path.substr(slash + 1);
                 if (_wcsicmp(folder.c_str(), L"x64") == 0 ||
                     _wcsicmp(folder.c_str(), L"Win64") == 0 ||
                     _wcsicmp(folder.c_str(), L"bin") == 0 ||
                     _wcsicmp(folder.c_str(), L"bin_x64") == 0 ||
                     _wcsicmp(folder.c_str(), L"bin_dedicated") == 0)
                 {
-                    path = path.substr(0, last);
+                    path = path.substr(0, slash);
                     stripped = true;
+                    while (!path.empty() && path.back() == L'\\')
+                    {
+                        path.pop_back();
+                    }
                 }
             }
         }

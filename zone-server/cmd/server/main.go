@@ -48,6 +48,9 @@ func main() {
 	dbQueue := db.StartWriteQueue(ctx)
 
 	server := game.NewServer(cfg, db, logger, dbQueue)
+	if err := server.InitUDP(); err != nil {
+		log.Fatalf("Failed to initialize UDP listener: %v", err)
+	}
 
 	adminServer := game.NewAdminServer(server, cfg.AdminPipe)
 	if err := adminServer.Start(ctx); err != nil {

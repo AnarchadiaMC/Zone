@@ -68,8 +68,8 @@ func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *
 				PosX:      peer.Position[0],
 				PosY:      peer.Position[1],
 				PosZ:      peer.Position[2],
-				Yaw:       int16(peer.Rotation[0]),
-				Pitch:     int16(peer.Rotation[1]),
+				Yaw:       int16(peer.Rotation[0] * 100.0),
+				Pitch:     int16(peer.Rotation[1] * 100.0),
 				AnimFlags: peer.AnimFlags,
 				Health:    uint8(peer.Health),
 			}
@@ -162,3 +162,13 @@ func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID 
 		_ = udp.Send(udpAddr, buf.Bytes())
 	}
 }
+
+func (a *AoIManager) RemoveSession(sessID uint32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.entries, sessID)
+	for _, set := range a.entries {
+		delete(set, sessID)
+	}
+}
+
