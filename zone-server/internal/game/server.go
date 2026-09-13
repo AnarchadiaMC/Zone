@@ -115,5 +115,27 @@ func (s *Server) Tick(now time.Time) {
 }
 
 func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{}) {
-	// Send packet...
+	if sess == nil || sess.UDPAddr == nil || s.udp == nil {
+		return
+	}
+
+	seq := s.seq.Add(1)
+
+	var buf bytes.Buffer
+	if err := protocol.WritePacket(&buf, opcode, seq, flags, payload); err != nil {
+		s.logger.Error("Failed to write packet", zap.Error(err))
+		return
+	}
+
+	data := buf.Bytes()
+
+	if (flags & protocol.FlagReliable) != 0 {
+		if s.ackQueue != nil {
+			s.ackQueue.EnqueueReliable(seq, sess.UDPAddr, data)
+		}
+	}
+
+	if err := s.udp.Send(sess.UDPAddr, data); err != nil {
+		s.logger.Error("Failed to send packet", zap.Error(err))
+	}
 }
