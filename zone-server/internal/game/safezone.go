@@ -27,17 +27,30 @@ var defaultSafeZones = []SafeZone{
 }
 
 func SeedSafeZones(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO safe_zones (zone_id, level_name, shape, center_x, center_y, center_z, radius, height)
+		VALUES (?, ?, 'cylinder', ?, ?, ?, ?, ?)
+		ON CONFLICT(zone_id) DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
 	for _, sz := range defaultSafeZones {
-		_, err := db.Exec(`
-			INSERT INTO safe_zones (zone_id, level_name, shape, center_x, center_y, center_z, radius, height)
-			VALUES (?, ?, 'cylinder', ?, ?, ?, ?, ?)
-			ON CONFLICT(zone_id) DO NOTHING
-		`, sz.ZoneID, sz.LevelName, sz.CenterX, sz.CenterY, sz.CenterZ, sz.Radius, sz.Height)
+		_, err := stmt.Exec(sz.ZoneID, sz.LevelName, sz.CenterX, sz.CenterY, sz.CenterZ, sz.Radius, sz.Height)
 		if err != nil {
 			return err
 		}
 	}
-	return nil
+
+	return tx.Commit()
 }
 
 func CheckSafeZone(x, y, z float32, level string) *SafeZone {
