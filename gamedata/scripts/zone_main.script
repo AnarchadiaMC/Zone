@@ -1,5 +1,5 @@
 -- zone_main.script
--- Zone Online Bootstrap
+-- Zone Bootstrap
 
 local config = {}
 
@@ -10,7 +10,7 @@ local function load_config()
     local path = appdata .. "\\zone_identity.ltx"
     local file = io.open(path, "r")
     if not file then
-        printf("ZoneOnline: Missing zone_identity.ltx in %APPDATA%")
+        printf("Zone: Missing zone_identity.ltx in %APPDATA%")
         return false
     end
     
@@ -30,12 +30,12 @@ end
 
 function on_game_start()
     if type(ZoneNet) == "nil" then
-        printf("ZoneOnline: ZoneNet global not found! DLL hook failed or missing.")
+        printf("Zone: ZoneNet global not found! DLL hook failed or missing.")
         return
     end
     
     if not load_config() then
-        printf("ZoneOnline: Failed to load config.")
+        printf("Zone: Failed to load config.")
         return
     end
     
@@ -45,7 +45,7 @@ function on_game_start()
     local hwid = config.hwid_hash or 123456789
     local nick = config.nickname or "Stalker"
     
-    printf("ZoneOnline: Connecting to %s:%d as %s...", ip, port, nick)
+    printf("Zone: Connecting to %s:%d as %s...", ip, port, nick)
     ZoneNet:Connect(ip, port, uuid, hwid, nick)
     
     -- Register callbacks

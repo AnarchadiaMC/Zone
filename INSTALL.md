@@ -1,4 +1,4 @@
-﻿# Zone Online — Installation & User Guide
+﻿# Zone — Installation & User Guide
 
 > A dedicated multiplayer survival server and injectable client DLL for S.T.A.L.K.E.R. Anomaly 1.5.3.
 
@@ -6,10 +6,10 @@
 
 ## Architecture Overview
 
-Zone Online uses an **autonomous client injection architecture**:
+Zone uses an **autonomous client injection architecture**:
 - **No Proxy DLLs**: No `dxgi.dll` or proxy loading required. No conflicts with AnomalyFSR or ReShade.
 - **Zero-Touch Asset Provisioning**: When `ZoneClient.dll` is injected, it automatically provisions necessary configuration (`mod_system_zone_online.ltx` via DLTX) and UI layouts (`zone_ui_server_list.xml`) if they are missing.
-- **Native X-Ray UI**: A native "Zone Online" button appears directly on Anomaly's home screen. Clicking it opens a native S.T.A.L.K.E.R. Server Browser with direct IP connect and favorite servers list.
+- **Native X-Ray UI**: A native "Zone" button appears directly on Anomaly's home screen. Clicking it opens a native S.T.A.L.K.E.R. Server Browser with direct IP connect and favorite servers list.
 - **Automated Launcher/Injector**: `ZoneClient_Injector.exe` can launch the modified EXEs and inject simultaneously, or run as a standalone injector.
 
 ---
@@ -87,8 +87,8 @@ The injector detects `AnomalyDX11.exe`, `AnomalyDX11AVX.exe`, `VerifiedDX11.exe`
 
 ### Home Screen
 1. When Anomaly opens, look at the main menu.
-2. Below the standard menu options, a native **Zone Online** button appears.
-3. Click **Zone Online** to open the Server Browser.
+2. Below the standard menu options, a native **Zone** button appears.
+3. Click **Zone** to open the Server Browser.
 
 ### Server Browser Features
 - **Direct Connect**: Enter the server IP address (default `127.0.0.1`), Port (`27015`), and your Callsign/Nickname, then click **Connect**.

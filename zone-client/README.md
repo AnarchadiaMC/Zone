@@ -1,6 +1,6 @@
 ﻿# ZoneClient — S.T.A.L.K.E.R. Anomaly Multiplayer Client & Injector
 
-`ZoneClient` is the client-side runtime layer for **Zone Online**, an authoritative multiplayer survival architecture for *S.T.A.L.K.E.R. Anomaly 1.5.3*.
+`ZoneClient` is the client-side runtime layer for **Zone**, an authoritative multiplayer survival architecture for *S.T.A.L.K.E.R. Anomaly 1.5.3*.
 
 It consists of two native C++ components:
 1. **`ZoneClient.dll`**: A lightweight runtime DLL that hooks into Anomaly's engine via MinHook, initializes persistent HWID/UUID identity, provisions missing game assets, handles non-blocking binary UDP telemetry, and exposes the `ZoneNet` Lua API directly into Anomaly's LuaJIT environment.
@@ -21,7 +21,7 @@ Unlike traditional mods that require manual file extraction, directory creation,
 ### 2. Native X-Ray UI Integration (No ImGui / No DirectX Hooking)
 - Operates entirely without external overlay layers (like Dear ImGui) or DirectX Present hooks.
 - Interfaces directly with Anomaly's native UI system:
-  - Injects a native 3-state button (`CUI3tButton`) labeled **"Zone Online"** into Anomaly's home screen stack below vanilla buttons (`zone_menu_patch.script`).
+  - Injects a native 3-state button (`CUI3tButton`) labeled **"Zone"** into Anomaly's home screen stack below vanilla buttons (`zone_menu_patch.script`).
   - Opens a native `CUIScriptWnd` server browser dialog (`zone_ui_server_list.script` + XML) with Direct Connect (IP, Port, Callsign) and persistent Favorite Servers.
   - Renders HUD network status and safe zone alerts natively via X-Ray PDA news tips and HUD statics (`zone_hud.script`).
 

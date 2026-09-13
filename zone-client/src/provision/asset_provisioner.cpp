@@ -79,7 +79,7 @@ namespace
     }
 
     const char* g_DLTX_ModSystem = 
-        "; Zone Online DLTX Patch — auto-merged into system.ltx by Anomaly Modded EXEs\n"
+        "; Zone DLTX Patch — auto-merged into system.ltx by Anomaly Modded EXEs\n"
         "; Adds proxy stalker NPC section used for remote player avatars\n"
         "\n"
         "[zone_proxy_stalker]:sim_default_stalker\n"

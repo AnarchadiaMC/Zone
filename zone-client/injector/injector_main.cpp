@@ -417,7 +417,7 @@ static void ShowUsage(const wchar_t* exeName)
 int main(int argc, char** argv)
 {
     std::wcout << L"=======================================\n";
-    std::wcout << L"   Zone Online Injector v1.0           \n";
+    std::wcout << L"   Zone Injector v1.0           \n";
     std::wcout << L"=======================================\n\n";
 
     // Convert arguments to wide strings

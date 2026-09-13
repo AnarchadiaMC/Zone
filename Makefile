@@ -1,5 +1,5 @@
 ﻿# ============================================================
-#  Zone Online - Root Build Orchestrator
+#  Zone - Root Build Orchestrator
 #  Usage:
 #    make server        - build zone-server.exe (Windows)
 #    make server-linux  - cross-compile zone-server (Linux amd64)

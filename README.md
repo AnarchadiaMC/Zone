@@ -1,11 +1,11 @@
-﻿# Zone Online — S.T.A.L.K.E.R. Anomaly Multiplayer
+﻿# Zone — S.T.A.L.K.E.R. Anomaly Multiplayer
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat&logo=c%2B%2B)](https://isocpp.org)
 [![Target Engine](https://img.shields.io/badge/Engine-Anomaly%201.5.3%20Modded%20EXEs-orange.svg)](https://github.com/themrdemonized/STALKER-Anomaly-modded-exes)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Zone Online** is a dedicated survival multiplayer architecture for **S.T.A.L.K.E.R. Anomaly 1.5.3**. It pairs a high-performance, authoritative Golang server with an autonomous, injectable C++ client DLL and native X-Ray UI — no proxy DLLs, no DirectX hooks, no external overlays.
+**Zone** is a dedicated survival multiplayer architecture for **S.T.A.L.K.E.R. Anomaly 1.5.3**. It pairs a high-performance, authoritative Golang server with an autonomous, injectable C++ client DLL and native X-Ray UI — no proxy DLLs, no DirectX hooks, no external overlays.
 
 ---
 
@@ -115,7 +115,6 @@ zone-online/
 │
 ├── Makefile                     # Root build orchestrator
 ├── INSTALL.md                   # Detailed installation and setup guide
-├── WALKTHROUGH.md               # Comprehensive architectural walkthrough
 └── README.md                    # This file
 ```
 
@@ -155,7 +154,7 @@ graph TD
 | `zone_dummy` | 186 | Manages remote player proxy objects. Spawns alife stalkers, buffers 8 position samples, applies cubic Hermite (Catmull-Rom) interpolation with 100ms jitter buffer every frame. |
 | `zone_safezone` | 107 | Enforces safe zone rules. Nullifies incoming damage (`s_hit.power = 0`), blocks fire input, forces weapon holster via `db.actor:hide_weapon()`. |
 | `zone_hud` | 215 | Persistent HUD indicator at top-right showing `[ZO] Online` / `Safe Zone` / `Offline` with ping. Issues PDA news tips on state transitions. Runs at 1 Hz. |
-| `zone_menu_patch` | 113 | Monkey-patches `ui_main_menu.main_menu:InitControls` to append a native `CUI3tButton` at position (40, 548) labeled "Zone Online". |
+| `zone_menu_patch` | 113 | Monkey-patches `ui_main_menu.main_menu:InitControls` to append a native `CUI3tButton` at position (40, 548) labeled "Zone". |
 | `zone_ui_server_list` | 506 | Full `CUIScriptWnd` server browser. Favorites persisted in `%APPDATA%\zone_identity.ltx` (max 16). Supports direct IP connect, double-click-to-connect, add/remove favorites. |
 | `zone_ai_proxy` | 85 | Spawns server-authoritative AI puppets. Handles entity enter (NPC/mutant), AI action events (attack, death, flee), and entity leave. |
 | `zone_worldevent` | 40 | Handles emission warnings (`0x01`), active emissions (`0x02`), clear (`0x03`), raid start (`0x04`), and raid end (`0x05`). Triggers weather changes and siren sounds. |
@@ -255,7 +254,7 @@ Launch Anomaly using the automated injector:
 ZoneClient_Injector.exe --launch "C:\Anomaly\bin\AnomalyDX11.exe"
 ```
 Once in the main menu:
-1. Click the native **Zone Online** button below the menu options.
+1. Click the native **Zone** button below the menu options.
 2. Enter the server IP (default `127.0.0.1`), port (`27015`), and your callsign.
 3. Click **Connect**.
 

@@ -22,7 +22,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	logger.Info("Starting Zone Online Server", zap.Int("port", cfg.Port))
+	logger.Info("Starting Zone Server", zap.Int("port", cfg.Port))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
