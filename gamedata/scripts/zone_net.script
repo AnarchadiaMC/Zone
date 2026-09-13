@@ -61,7 +61,11 @@ function dispatch_packet(pkt)
     elseif opcode == 0x0030 then
         zone_worldevent.on_world_event(pkt, offset)
     elseif opcode == 0x0050 then
-        -- Handle damage notification (TODO)
+        local target_id, pos = read_uint32_le(pkt, offset)
+        local attacker_id, pos = read_uint32_le(pkt, pos)
+        local damage, pos = read_float_le(pkt, pos)
+        local bone_id, pos = read_uint8(pkt, pos)
+        zone_dummy.on_damage_notify(target_id, attacker_id, damage, bone_id)
     elseif opcode == 0x0060 then
         -- Chat text
         local txt, _ = read_string(pkt, offset, paylen)
