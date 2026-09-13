@@ -32,7 +32,6 @@ type Server struct {
 	sessions  *network.SessionManager
 	grid      *SpatialGrid
 	events    *EventManager
-	stash     *StashManager
 	economy   *EconomyManager
 	anticheat *AntiCheatManager
 	aoi       *AoIManager
@@ -49,7 +48,6 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger) *Server 
 		sessions:  network.NewSessionManager(),
 		grid:      NewSpatialGrid(64.0),
 		events:    NewEventManager(),
-		stash:     NewStashManager(),
 		economy:   NewEconomyManager(),
 		anticheat: NewAntiCheatManager(),
 		aoi:       NewAoIManager(),
