@@ -25,9 +25,10 @@ type PlayerSession struct {
 }
 
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[uint32]*PlayerSession
-	byAddr   map[string]*PlayerSession
+	mu        sync.RWMutex
+	sessions  map[uint32]*PlayerSession
+	byAddr    map[string]*PlayerSession
+	allCached []*PlayerSession
 }
 
 func NewSessionManager() *SessionManager {
@@ -37,11 +38,20 @@ func NewSessionManager() *SessionManager {
 	}
 }
 
+func (sm *SessionManager) updateCache() {
+	all := make([]*PlayerSession, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		all = append(all, s)
+	}
+	sm.allCached = all
+}
+
 func (sm *SessionManager) AddSession(s *PlayerSession) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessions[s.SessionID] = s
 	sm.byAddr[s.UDPAddr.String()] = s
+	sm.updateCache()
 }
 
 func (sm *SessionManager) RemoveSession(id uint32) {
@@ -50,6 +60,7 @@ func (sm *SessionManager) RemoveSession(id uint32) {
 	if s, ok := sm.sessions[id]; ok {
 		delete(sm.sessions, id)
 		delete(sm.byAddr, s.UDPAddr.String())
+		sm.updateCache()
 	}
 }
 
@@ -68,11 +79,7 @@ func (sm *SessionManager) GetByAddr(addr string) *PlayerSession {
 func (sm *SessionManager) GetAll() []*PlayerSession {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	var all []*PlayerSession
-	for _, s := range sm.sessions {
-		all = append(all, s)
-	}
-	return all
+	return sm.allCached
 }
 
 func (sm *SessionManager) Count() int {
