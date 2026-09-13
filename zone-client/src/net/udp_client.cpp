@@ -7,6 +7,7 @@
 #include <mutex>
 #include <chrono>
 #include <vector>
+#include <condition_variable>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -37,6 +38,7 @@ namespace
     std::atomic<uint32_t> g_RingTail = 0;
     
     std::mutex g_StateMutex;
+    std::condition_variable g_StateCV;
     
     std::string g_TargetIP;
     uint16_t g_TargetPort;
@@ -70,7 +72,8 @@ namespace
             
             if (g_State == DISCONNECTED)
             {
-                std::this_thread::sleep_for(milliseconds(100));
+                std::unique_lock<std::mutex> lock(g_StateMutex);
+                g_StateCV.wait(lock, [] { return !g_Running || g_State != DISCONNECTED; });
                 continue;
             }
             
@@ -204,7 +207,11 @@ namespace NetClient
 
     void Shutdown()
     {
-        g_Running = false;
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_Running = false;
+        }
+        g_StateCV.notify_all();
         if (g_NetThread.joinable())
             g_NetThread.join();
             
@@ -230,6 +237,7 @@ namespace NetClient
         inet_pton(AF_INET, ip.c_str(), &g_ServerAddr.sin_addr);
         
         g_State = CONNECTING;
+        g_StateCV.notify_all();
     }
 
     void Disconnect()
@@ -241,6 +249,7 @@ namespace NetClient
             sendto(g_Socket, (char*)&hdr, sizeof(hdr), 0, (sockaddr*)&g_ServerAddr, sizeof(g_ServerAddr));
         }
         g_State = DISCONNECTED;
+        g_StateCV.notify_all();
     }
 
     void SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint16_t animflags)
