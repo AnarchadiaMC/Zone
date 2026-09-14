@@ -7,12 +7,19 @@ import (
 	"io"
 )
 
-var ErrPayloadTooLarge = errors.New("payload exceeds uint16 maximum")
+const (
+	MaxSafeUDPPacketSize = 1200
+	OpAck         uint16 = 0x0005
+)
 
+var (
+	ErrPayloadTooLarge   = errors.New("payload exceeds uint16 maximum")
+	ErrPayloadExceedsMTU = errors.New("packet exceeds safe MTU threshold of 1200 bytes")
+)
 
 type HandshakeReq struct {
-	UUID        [36]byte
-	HWIDHash    [4]byte
+	UUID        [37]byte
+	HWIDHash    [32]byte // 32-byte SHA-256 binary hash
 	Nickname    [32]byte
 	ProtocolVer uint8
 }
@@ -53,7 +60,12 @@ type SnapshotEntry struct {
 
 type ServerSnapshot struct {
 	Count   uint8
-	Entries [64]SnapshotEntry
+	Entries [32]SnapshotEntry
+}
+
+type SafezoneStatePayload struct {
+	Locked uint8
+	ZoneID [32]byte
 }
 
 type EntityEnterAoI struct {
@@ -129,11 +141,9 @@ type StashResponsePayload struct {
 
 // AIActionPayload carries an AI squad state update broadcast to nearby clients.
 type AIActionPayload struct {
-	SquadID uint32
-	State   uint8
-	PosX    float32
-	PosY    float32
-	PosZ    float32
+	EntityID uint32
+	Action   uint8
+	TargetID uint32
 }
 
 // EntityAoIPayload notifies a client that an entity entered or left its
@@ -146,7 +156,7 @@ type EntityAoIPayload struct {
 	PosZ       float32
 }
 
-func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interface{}) error {
+func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload interface{}) error {
 	var buf bytes.Buffer
 	if payload != nil {
 		switch p := payload.(type) {
@@ -183,6 +193,10 @@ func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interf
 		}
 	}
 
+	if buf.Len() > MaxSafeUDPPacketSize {
+		return ErrPayloadExceedsMTU
+	}
+
 	if buf.Len() > 65535 {
 		return ErrPayloadTooLarge
 	}
@@ -192,7 +206,7 @@ func WritePacket(w io.Writer, op uint16, seq uint32, flags uint8, payload interf
 		Protocol:      ProtocolVer,
 		FlagsChannel:  flags,
 		SequenceNum:   seq,
-		Opcode:        op,
+		Opcode:        opcode,
 		PayloadLength: uint16(buf.Len()),
 	}
 

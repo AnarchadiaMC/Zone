@@ -360,6 +360,6 @@ end
 
 function on_game_start()
     if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_level_changing", on_level_changing)
+        RegisterScriptCallback("on_level_changing", on_level_changing)
     end
 end

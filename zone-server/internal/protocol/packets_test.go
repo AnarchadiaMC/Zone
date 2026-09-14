@@ -2,28 +2,49 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 )
 
-// SafezoneStatePayload represents the payload sent for OpSafezoneState (0x0020).
-type SafezoneStatePayload struct {
-	InSafeZone uint8
-}
-
-// LeaveAoIPayload represents a session-level leave notification payload.
+// LeaveAoIPayload represents a session-level leave notification payload for testing.
 type LeaveAoIPayload struct {
 	SessionID uint32
 }
 
-// EnterAoIPayload represents a session-level enter notification payload.
+// EnterAoIPayload represents a session-level enter notification payload for testing.
 type EnterAoIPayload struct {
 	SessionID uint32
 	PosX      float32
 	PosY      float32
 	PosZ      float32
+}
+
+func TestPacketByteLengths(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    interface{}
+		expected int
+	}{
+		{"HandshakeReq", HandshakeReq{}, 102},         // 37 + 32 + 32 + 1 = 102
+		{"HandshakeRes", HandshakeRes{}, 26},          // 4 + 1 + 12 + 8 + 1 = 26
+		{"ServerSnapshot", ServerSnapshot{}, 705},     // 1 + 32 * 22 = 705
+		{"SafezoneStatePayload", SafezoneStatePayload{}, 33}, // 1 + 32 = 33
+		{"WorldEventPayload", WorldEventPayload{}, 6}, // 1 + 1 + 4 = 6
+		{"AIActionPayload", AIActionPayload{}, 9},     // 4 + 1 + 4 = 9
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			size := binary.Size(tc.value)
+			if size != tc.expected {
+				t.Fatalf("%s byte length mismatch: got %d, want %d", tc.name, size, tc.expected)
+			}
+		})
+	}
 }
 
 func TestPackets(t *testing.T) {
@@ -86,11 +107,12 @@ func TestPackets(t *testing.T) {
 		req := HandshakeReq{
 			ProtocolVer: ProtocolVer,
 		}
-		copy(req.UUID[:], "550e8400-e29b-41d4-a716-446655440000")
-		copy(req.HWIDHash[:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
-		copy(req.Nickname[:], "StalkerMajor")
+		copy(req.UUID[:], "550e8400-e29b-41d4-a716-446655440000\x00")
+		hash := sha256.Sum256([]byte("hwid-test-string-12345"))
+		req.HWIDHash = hash
+		copy(req.Nickname[:], "StalkerMajor\x00")
 
-		const expectedLen = 36 + 4 + 32 + 1 // 73 bytes
+		const expectedLen = 37 + 32 + 32 + 1 // 102 bytes
 		if err := WritePacket(&buf, OpHandshakeReq, 10, FlagReliable, req); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
@@ -110,13 +132,13 @@ func TestPackets(t *testing.T) {
 		if err := binary.Read(&buf, binary.LittleEndian, &decoded); err != nil {
 			t.Fatalf("Payload read failed: %v", err)
 		}
-		if string(decoded.UUID[:]) != "550e8400-e29b-41d4-a716-446655440000" {
+		if string(bytes.TrimRight(decoded.UUID[:], "\x00")) != "550e8400-e29b-41d4-a716-446655440000" {
 			t.Errorf("UUID mismatch: %s", string(decoded.UUID[:]))
 		}
-		if decoded.HWIDHash != [4]byte{0xDE, 0xAD, 0xBE, 0xEF} {
-			t.Errorf("HWIDHash mismatch: %v", decoded.HWIDHash)
+		if decoded.HWIDHash != hash {
+			t.Errorf("HWIDHash mismatch: got %x, want %x", decoded.HWIDHash, hash)
 		}
-		if string(decoded.Nickname[:12]) != "StalkerMajor" {
+		if string(bytes.TrimRight(decoded.Nickname[:], "\x00")) != "StalkerMajor" {
 			t.Errorf("Nickname mismatch: %s", string(decoded.Nickname[:]))
 		}
 		if decoded.ProtocolVer != ProtocolVer {
@@ -257,7 +279,7 @@ func TestPackets(t *testing.T) {
 	t.Run("OpServerSnapshot Dynamic Entries and Layout", func(t *testing.T) {
 		snap := ServerSnapshot{
 			Count: 3,
-			Entries: [64]SnapshotEntry{
+			Entries: [32]SnapshotEntry{
 				{SessionID: 1, PosX: 10, PosY: 20, PosZ: 30, Yaw: 100, Pitch: 10, AnimFlags: 1, Health: 100},
 				{SessionID: 2, PosX: -10, PosY: -20, PosZ: -30, Yaw: -100, Pitch: -10, AnimFlags: 2, Health: 85},
 				{SessionID: 3, PosX: 0, PosY: 5, PosZ: 100, Yaw: 0, Pitch: 0, AnimFlags: 0, Health: 40},
@@ -299,7 +321,7 @@ func TestPackets(t *testing.T) {
 	t.Run("OpServerSnapshot Value Form Serialization", func(t *testing.T) {
 		snap := ServerSnapshot{
 			Count: 1,
-			Entries: [64]SnapshotEntry{
+			Entries: [32]SnapshotEntry{
 				{SessionID: 999, PosX: 1.0, PosY: 2.0, PosZ: 3.0, Yaw: 50, Pitch: -50, AnimFlags: 4, Health: 99},
 			},
 		}
@@ -327,6 +349,55 @@ func TestPackets(t *testing.T) {
 		}
 	})
 
+	t.Run("OpServerSnapshot Full 32 Entries Byte Length (705 bytes)", func(t *testing.T) {
+		var snap ServerSnapshot
+		snap.Count = 32
+		for i := 0; i < 32; i++ {
+			snap.Entries[i] = SnapshotEntry{
+				SessionID: uint32(i + 1),
+				PosX:      float32(i) * 1.5,
+				PosY:      float32(i) * 0.5,
+				PosZ:      float32(i) * -2.0,
+				Yaw:       int16(i * 10),
+				Pitch:     int16(i * -5),
+				AnimFlags: uint8(i % 8),
+				Health:    uint8(100 - i),
+			}
+		}
+
+		// Verify binary.Size matches exactly 1 + 32 * 22 = 705 bytes
+		if size := binary.Size(snap); size != 705 {
+			t.Fatalf("ServerSnapshot binary.Size mismatch: got %d, want 705", size)
+		}
+
+		var buf bytes.Buffer
+		if err := WriteServerSnapshot(&buf, 16, FlagUnreliable, &snap); err != nil {
+			t.Fatalf("WriteServerSnapshot full entries failed: %v", err)
+		}
+
+		hdr, err := ReadHeader(&buf)
+		if err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		const expectedLen = 1 + 32*22 // 705 bytes
+		if hdr.PayloadLength != expectedLen {
+			t.Fatalf("Payload length mismatch: got %d, want %d", hdr.PayloadLength, expectedLen)
+		}
+
+		decoded, err := ReadServerSnapshot(&buf)
+		if err != nil {
+			t.Fatalf("ReadServerSnapshot failed: %v", err)
+		}
+		if decoded.Count != 32 {
+			t.Fatalf("Count mismatch: got %d, want 32", decoded.Count)
+		}
+		for i := 0; i < 32; i++ {
+			if decoded.Entries[i] != snap.Entries[i] {
+				t.Fatalf("Entry %d mismatch: got %+v, want %+v", i, decoded.Entries[i], snap.Entries[i])
+			}
+		}
+	})
+
 	t.Run("OpEntityEnterAoI and OpEntityLeaveAoI", func(t *testing.T) {
 		enter := EntityEnterAoI{
 			EntityID:   505,
@@ -341,7 +412,7 @@ func TestPackets(t *testing.T) {
 
 		const expectedEnterLen = 4 + 1 + 32 + 4 + 4 + 4 + 16 + 1 // 62 bytes
 		var buf bytes.Buffer
-		if err := WritePacket(&buf, OpEntityEnterAoI, 16, FlagReliable, enter); err != nil {
+		if err := WritePacket(&buf, OpEntityEnterAoI, 17, FlagReliable, enter); err != nil {
 			t.Fatalf("WritePacket OpEntityEnterAoI failed: %v", err)
 		}
 
@@ -368,7 +439,7 @@ func TestPackets(t *testing.T) {
 		leave := EntityLeaveAoI{EntityID: 505}
 		const expectedLeaveLen = 4
 		buf.Reset()
-		if err := WritePacket(&buf, OpEntityLeaveAoI, 17, FlagReliable, leave); err != nil {
+		if err := WritePacket(&buf, OpEntityLeaveAoI, 18, FlagReliable, leave); err != nil {
 			t.Fatalf("WritePacket OpEntityLeaveAoI failed: %v", err)
 		}
 
@@ -401,7 +472,7 @@ func TestPackets(t *testing.T) {
 		}
 		const expectedEnterLen = 4 + 4 + 4 + 4 // 16 bytes
 		var buf bytes.Buffer
-		if err := WritePacket(&buf, OpEntityEnterAoI, 18, FlagReliable, enter); err != nil {
+		if err := WritePacket(&buf, OpEntityEnterAoI, 19, FlagReliable, enter); err != nil {
 			t.Fatalf("WritePacket OpEntityEnterAoI failed: %v", err)
 		}
 
@@ -424,7 +495,7 @@ func TestPackets(t *testing.T) {
 		leave := LeaveAoIPayload{SessionID: 101}
 		const expectedLeaveLen = 4
 		buf.Reset()
-		if err := WritePacket(&buf, OpEntityLeaveAoI, 19, FlagReliable, leave); err != nil {
+		if err := WritePacket(&buf, OpEntityLeaveAoI, 20, FlagReliable, leave); err != nil {
 			t.Fatalf("WritePacket OpEntityLeaveAoI failed: %v", err)
 		}
 
@@ -445,12 +516,19 @@ func TestPackets(t *testing.T) {
 		}
 	})
 
-	t.Run("OpSafezoneState Roundtrip and Layout", func(t *testing.T) {
+	t.Run("OpSafezoneState Roundtrip and Layout (33 bytes)", func(t *testing.T) {
 		var buf bytes.Buffer
-		sz := SafezoneStatePayload{InSafeZone: 1}
-		const expectedLen = 1
+		sz := SafezoneStatePayload{
+			Locked: 1,
+		}
+		copy(sz.ZoneID[:], "bar_rostok_peace_zone\x00")
 
-		if err := WritePacket(&buf, OpSafezoneState, 20, FlagReliable, sz); err != nil {
+		const expectedLen = 1 + 32 // 33 bytes
+		if size := binary.Size(sz); size != expectedLen {
+			t.Fatalf("SafezoneStatePayload binary.Size mismatch: got %d, want %d", size, expectedLen)
+		}
+
+		if err := WritePacket(&buf, OpSafezoneState, 21, FlagReliable, sz); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -469,8 +547,11 @@ func TestPackets(t *testing.T) {
 		if err := binary.Read(&buf, binary.LittleEndian, &decoded); err != nil {
 			t.Fatalf("Payload read failed: %v", err)
 		}
-		if decoded.InSafeZone != 1 {
-			t.Errorf("InSafeZone mismatch: got %d, want 1", decoded.InSafeZone)
+		if decoded.Locked != 1 {
+			t.Errorf("Locked mismatch: got %d, want 1", decoded.Locked)
+		}
+		if string(bytes.TrimRight(decoded.ZoneID[:], "\x00")) != "bar_rostok_peace_zone" {
+			t.Errorf("ZoneID mismatch: %s", string(decoded.ZoneID[:]))
 		}
 	})
 
@@ -484,7 +565,7 @@ func TestPackets(t *testing.T) {
 		}
 
 		const expectedLen = 4 + 4 + 4 + 1 // 13 bytes
-		if err := WritePacket(&buf, OpDamageNotify, 21, FlagReliable, dmg); err != nil {
+		if err := WritePacket(&buf, OpDamageNotify, 22, FlagReliable, dmg); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -508,7 +589,7 @@ func TestPackets(t *testing.T) {
 		}
 	})
 
-	t.Run("OpWorldEvent Roundtrip and Layout", func(t *testing.T) {
+	t.Run("OpWorldEvent Roundtrip and Layout (6 bytes)", func(t *testing.T) {
 		var buf bytes.Buffer
 		ev := WorldEventPayload{
 			EventType: 0, // Emission
@@ -517,7 +598,11 @@ func TestPackets(t *testing.T) {
 		}
 
 		const expectedLen = 1 + 1 + 4 // 6 bytes
-		if err := WritePacket(&buf, OpWorldEvent, 22, FlagReliable, ev); err != nil {
+		if size := binary.Size(ev); size != expectedLen {
+			t.Fatalf("WorldEventPayload binary.Size mismatch: got %d, want %d", size, expectedLen)
+		}
+
+		if err := WritePacket(&buf, OpWorldEvent, 23, FlagReliable, ev); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -547,7 +632,7 @@ func TestPackets(t *testing.T) {
 		const expectedLen = 4 + 1 + 255 // 260 bytes
 
 		var buf bytes.Buffer
-		if err := WritePacket(&buf, OpChatText, 23, FlagReliable, ct); err != nil {
+		if err := WritePacket(&buf, OpChatText, 24, FlagReliable, ct); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -584,18 +669,20 @@ func TestPackets(t *testing.T) {
 		}
 	})
 
-	t.Run("OpAiAction Roundtrip and Layout", func(t *testing.T) {
+	t.Run("OpAiAction Roundtrip and Layout (9 bytes)", func(t *testing.T) {
 		var buf bytes.Buffer
 		ai := AIActionPayload{
-			SquadID: 301,
-			State:   2, // In Combat
-			PosX:    12.34,
-			PosY:    -5.67,
-			PosZ:    89.01,
+			EntityID: 501,
+			Action:   2,
+			TargetID: 1002,
 		}
 
-		const expectedLen = 4 + 1 + 4 + 4 + 4 // 17 bytes
-		if err := WritePacket(&buf, OpAIActionEvent, 24, FlagUnreliable, ai); err != nil {
+		const expectedLen = 4 + 1 + 4 // 9 bytes
+		if size := binary.Size(ai); size != expectedLen {
+			t.Fatalf("AIActionPayload binary.Size mismatch: got %d, want %d", size, expectedLen)
+		}
+
+		if err := WritePacket(&buf, OpAIActionEvent, 25, FlagUnreliable, ai); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -629,7 +716,7 @@ func TestPackets(t *testing.T) {
 
 		const expectedInteractLen = 4 + 1 + 32 + 2 // 39 bytes
 		var buf bytes.Buffer
-		if err := WritePacket(&buf, OpStashInteract, 25, FlagReliable, interact); err != nil {
+		if err := WritePacket(&buf, OpStashInteract, 26, FlagReliable, interact); err != nil {
 			t.Fatalf("WritePacket OpStashInteract failed: %v", err)
 		}
 
@@ -662,7 +749,7 @@ func TestPackets(t *testing.T) {
 
 		const expectedResponseLen = 4 + 1 + 2 + 256 // 263 bytes
 		buf.Reset()
-		if err := WritePacket(&buf, OpStashResponse, 26, FlagReliable, response); err != nil {
+		if err := WritePacket(&buf, OpStashResponse, 27, FlagReliable, response); err != nil {
 			t.Fatalf("WritePacket OpStashResponse failed: %v", err)
 		}
 
@@ -697,7 +784,7 @@ func TestPackets(t *testing.T) {
 		}
 
 		const expectedLen = 4 + 1 + 4 + 4 + 4 // 17 bytes
-		if err := WritePacket(&buf, OpEntityEnterAoI, 27, FlagReliable, aoi); err != nil {
+		if err := WritePacket(&buf, OpEntityEnterAoI, 28, FlagReliable, aoi); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
 
@@ -715,6 +802,86 @@ func TestPackets(t *testing.T) {
 		}
 		if decoded != aoi {
 			t.Errorf("Decoded mismatch: got %+v, want %+v", decoded, aoi)
+		}
+	})
+
+	t.Run("OpAck Verification", func(t *testing.T) {
+		if OpAck != 0x0005 {
+			t.Fatalf("OpAck mismatch: got 0x%04x, want 0x0005", OpAck)
+		}
+
+		var buf bytes.Buffer
+		if err := WritePacket(&buf, OpAck, 42, FlagReliable, nil); err != nil {
+			t.Fatalf("WritePacket OpAck failed: %v", err)
+		}
+
+		hdr, err := ReadHeader(&buf)
+		if err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		if hdr.Opcode != OpAck {
+			t.Errorf("Opcode mismatch: got 0x%04x, want 0x%04x", hdr.Opcode, OpAck)
+		}
+		if hdr.SequenceNum != 42 {
+			t.Errorf("SequenceNum mismatch: got %d, want 42", hdr.SequenceNum)
+		}
+		if hdr.PayloadLength != 0 {
+			t.Errorf("PayloadLength mismatch: got %d, want 0", hdr.PayloadLength)
+		}
+	})
+
+	t.Run("MTU Enforcement Threshold", func(t *testing.T) {
+		var buf bytes.Buffer
+
+		// 1. Exactly 1200 bytes payload should succeed (at the threshold)
+		safePayload := make([]byte, MaxSafeUDPPacketSize)
+		buf.Reset()
+		err := WritePacket(&buf, OpChatText, 50, FlagReliable, safePayload)
+		if err != nil {
+			t.Fatalf("WritePacket with exactly 1200 bytes failed: %v", err)
+		}
+		hdr, err := ReadHeader(&buf)
+		if err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		if hdr.PayloadLength != MaxSafeUDPPacketSize {
+			t.Errorf("PayloadLength mismatch: got %d, want %d", hdr.PayloadLength, MaxSafeUDPPacketSize)
+		}
+
+		// 2. 1201 bytes payload exceeds MTU threshold of 1200 bytes
+		oversizedSlice := make([]byte, MaxSafeUDPPacketSize+1)
+		buf.Reset()
+		err = WritePacket(&buf, OpChatText, 51, FlagReliable, oversizedSlice)
+		if err == nil {
+			t.Fatal("expected ErrPayloadExceedsMTU for 1201 bytes, got nil")
+		}
+		if !errors.Is(err, ErrPayloadExceedsMTU) {
+			t.Fatalf("expected ErrPayloadExceedsMTU, got: %v", err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("expected no bytes written to writer on MTU failure, got %d", buf.Len())
+		}
+
+		// 3. Fixed-size array exceeding 1200 bytes
+		var oversizedArray [1201]byte
+		buf.Reset()
+		err = WritePacket(&buf, OpChatText, 52, FlagReliable, oversizedArray)
+		if err == nil {
+			t.Fatal("expected ErrPayloadExceedsMTU for [1201]byte, got nil")
+		}
+		if !errors.Is(err, ErrPayloadExceedsMTU) {
+			t.Fatalf("expected ErrPayloadExceedsMTU, got: %v", err)
+		}
+
+		// 4. Significantly oversized payload (2048 bytes)
+		largePayload := make([]byte, 2048)
+		buf.Reset()
+		err = WritePacket(&buf, OpChatText, 53, FlagReliable, largePayload)
+		if err == nil {
+			t.Fatal("expected ErrPayloadExceedsMTU for 2048 bytes, got nil")
+		}
+		if !errors.Is(err, ErrPayloadExceedsMTU) {
+			t.Fatalf("expected ErrPayloadExceedsMTU, got: %v", err)
 		}
 	})
 

@@ -9,7 +9,7 @@ local safe_zone_id = ""
 --- @param offset number  1-based byte offset following 12-byte header
 function on_safezone_state(pkt, offset)
     local locked, pos = zone_net.read_uint8(pkt, offset)
-    local zone_id_raw, _ = zone_net.read_string(pkt, pos, 16)
+    local zone_id_raw, _ = zone_net.read_string(pkt, pos, 32)
     local zid = zone_id_raw:gsub("%z+", "")
 
     local is_locked = (locked == 1)
@@ -62,7 +62,7 @@ function on_key_press(key)
 
     if dik_to_bind and key_bindings then
         local bind = dik_to_bind(key)
-        if bind == key_bindings.kFIRE or bind == key_bindings.kFIRE2 then
+        if bind == key_bindings.kWPN_FIRE or (key_bindings.kWPN_ZOOM and bind == key_bindings.kWPN_ZOOM) then
             if db.actor.hide_weapon then
                 pcall(function() db.actor:hide_weapon() end)
             end

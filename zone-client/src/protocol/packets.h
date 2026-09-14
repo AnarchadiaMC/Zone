@@ -17,6 +17,7 @@ enum class Opcode : uint16_t {
     HANDSHAKE_RES = 0x0002, 
     DISCONNECT = 0x0003, 
     HEARTBEAT = 0x0004,
+    ACK = 0x0005,
     CLIENT_TRANSFORM = 0x0010, 
     SERVER_SNAPSHOT = 0x0011,
     ENTITY_ENTER_AOI = 0x0012, 
@@ -34,9 +35,13 @@ struct HeartbeatPayload {
     uint64_t timestamp;
 };
 
+struct AckPayload {
+    uint32_t seq;
+};
+
 struct HandshakeReq {
     char uuid[37];
-    uint32_t hwid;
+    uint8_t hwid[32]; // SHA-256 binary hash
     char nick[32];
     uint8_t protoVer;
 };
@@ -87,6 +92,7 @@ struct SafeZoneState {
 
 struct WorldEvent {
     uint8_t eventType;
+    uint8_t state;
     uint32_t timer;
 };
 

@@ -8,6 +8,8 @@ local UPDATE_INTERVAL_MS = 1000 -- 1 Hz HUD status polling
 local last_connected   = nil    -- nil (uninitialized), true, false
 local last_ping        = -1
 local safe_zone_active = false
+local last_dev_w       = 0
+local last_dev_h       = 0
 
 -- Persistent HUD static widget
 local hud_static       = nil
@@ -145,6 +147,19 @@ end
 local function on_actor_update()
     if not db.actor then return end
 
+    local dev = device and device()
+    if dev then
+        local dev_w = dev.width
+        local dev_h = dev.height
+        if dev_w ~= last_dev_w or dev_h ~= last_dev_h then
+            last_dev_w = dev_w
+            last_dev_h = dev_h
+            if hud_static then
+                hud_static:SetWndRect(get_hud_rect())
+            end
+        end
+    end
+
     local tg = time_global()
     if tg - last_update_time < UPDATE_INTERVAL_MS then return end
     last_update_time = tg
@@ -216,7 +231,7 @@ function notify_safezone(locked)
 end
 
 -- ============================================================
--- Cleanup on Level Transition / Screen Ratio / Actor Destroy
+-- Cleanup on Level Transition / Actor Destroy
 -- ============================================================
 
 local function on_level_changing()
@@ -224,10 +239,8 @@ local function on_level_changing()
     last_update_time = 0
     last_connected   = nil
     safe_zone_active = false
-end
-
-local function on_screen_ratio_changed()
-    clear_hud_static()
+    last_dev_w       = 0
+    last_dev_h       = 0
 end
 
 local function on_actor_destroy()
@@ -235,6 +248,8 @@ local function on_actor_destroy()
     last_update_time = 0
     last_connected   = nil
     safe_zone_active = false
+    last_dev_w       = 0
+    last_dev_h       = 0
 end
 
 -- ============================================================
@@ -243,9 +258,8 @@ end
 
 function on_game_start()
     if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_update",         on_actor_update)
-        RegisterScriptCallback("actor_on_net_destroy",    on_actor_destroy)
-        RegisterScriptCallback("on_level_changing",       on_level_changing)
-        RegisterScriptCallback("on_screen_ratio_changed", on_screen_ratio_changed)
+        RegisterScriptCallback("actor_on_update",      on_actor_update)
+        RegisterScriptCallback("actor_on_net_destroy", on_actor_destroy)
+        RegisterScriptCallback("on_level_changing",    on_level_changing)
     end
 end

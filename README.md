@@ -221,19 +221,20 @@ sequenceDiagram
 
 | Opcode | Name | Dir | Payload |
 |:---:|:---|:---:|:---|
-| `0x0001` | `PKT_HANDSHAKE_REQ` | C→S | UUID (36B), HWID Hash (4B), Nickname (32B), ProtoVer (1B) |
+| `0x0001` | `PKT_HANDSHAKE_REQ` | C→S | UUID (37B), HWID (32B SHA-256), Nickname (32B), ProtoVer (1B) |
 | `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B) |
 | `0x0003` | `PKT_DISCONNECT` | Both | Reason (1B) |
 | `0x0004` | `PKT_HEARTBEAT` | Both | Timestamp (8B) |
-| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (2B) |
-| `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), Array of: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
+| `0x0005` | `PKT_ACK` | Both | Sequence (4B) |
+| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (1B) |
+| `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), Array of 32: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
 | `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | EntityID (4B), Type (1B), Section (32B), PosXYZ (12B), Faction (1B), Health (2B) |
 | `0x0013` | `PKT_ENTITY_LEAVE_AOI` | S→C | EntityID (4B) |
-| `0x0020` | `PKT_SAFEZONE_STATE` | S→C | Locked (1B: 0=free, 1=locked), ZoneID (16B) |
-| `0x0030` | `PKT_WORLD_EVENT` | S→C | EventType (1B), Timer (4B) |
+| `0x0020` | `PKT_SAFEZONE_STATE` | S→C | Locked (1B: 0=free, 1=locked), ZoneID (32B) |
+| `0x0030` | `PKT_WORLD_EVENT` | S→C | EventType (1B), State (1B), Timer (4B) |
 | `0x0040` | `PKT_STASH_INTERACT` | C→S | StashID (4B), Action (1B), ItemSection (32B), Count (2B) |
 | `0x0041` | `PKT_STASH_RESPONSE` | S→C | Stash contents response |
-| `0x0050` | `PKT_DAMAGE_NOTIFY` | S→C | TargetSessionID (4B), AttackerSessionID (4B), Damage (4B float), BoneID (1B) |
+| `0x0050` | `PKT_DAMAGE_NOTIFY` | Both | TargetSessionID (4B), AttackerSessionID (4B), Damage (4B float), BoneID (1B) |
 | `0x0060` | `PKT_CHAT_TEXT` | Both | SenderID (4B), Length (1B), Message Text (up to 255B) |
 | `0x0070` | `PKT_AI_ACTION_EVENT` | S→C | EntityID (4B), Action (1B: Idle/Patrol/Attack/Flee/Death), TargetID (4B) |
 
@@ -288,16 +289,22 @@ Once in the main menu:
 | Dynamic Lua Runtime Hooking | `lua_hook.cpp` compiled into DLL. Detours `luaL_openlibs` via MinHook, dynamically exports and populates LuaJIT function pointers, registers native `ZoneNet` table. |
 | Thread-Safe UDP Client | Background thread with `std::atomic<uint32_t>` sequence & session IDs, `std::mutex` socket send serialization, 10s server liveness watchdog, 5-retry handshake ceiling, graceful `PKT_DISCONNECT` on unload. |
 | DLL Injection & Protection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege. UAF-safe `VirtualFreeEx` timeout handling, PID preservation avoiding TOCTOU races. |
-| Identity Persistence | UUID via UuidCreate, HWID via FNV-1a(MachineGuid + ComputerName) with volume serial fallback, atomic UTF-8 `%APPDATA%` path conversion. |
+| Identity Persistence | UUID via UuidCreate, HWID via CryptoAPI SHA-256 binary hash over MachineGuid + ComputerName (32 bytes), atomic UTF-8 `%APPDATA%` path conversion. |
 | Asset provisioning | Auto-writes DLTX config + UI XML if missing. Robust `\bin` directory matching preventing over-stripping. |
 | Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering, dropped packet tracking, capacity-checked event polling. |
 | Player proxy interpolation | Cubic Hermite (Catmull-Rom), 100ms jitter buffer, O(1) ring buffer history, non-uniform time scaling, smooth edge interval handling. |
-| Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0`), fire input block, weapon re-holster every frame, state reset on level change & disconnect. |
+| Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0`), fire input block (`kWPN_FIRE`/`kWPN_ZOOM`), weapon re-holster every frame, state reset on level change & disconnect. |
 | Server browser UI | CUIScriptWnd with favorites (max 16), direct connect, double-click-to-connect, atomic temporary-file LTX persistence, nickname sanitization. |
-| HUD status overlay | CUIStatic at top-right, 1 Hz update, aspect-ratio and resolution scaled placement, PDA news on transitions, clean level transition recreation. |
-| World event sync | Emission warn/active/clear, raid start/end. Weather changes + siren sounds, nil-safe audio objects, state reset on disconnect. |
+| HUD status overlay | CUIStatic at top-right, 1 Hz update, dynamic screen resolution and aspect-ratio tracking via `device().width`/`device().height`, PDA news on transitions. |
+| World event sync | Emission warn/active/clear, raid start/end. 6-byte wire protocol (`eventType`, `state`, `timer`), weather changes + siren sounds, nil-safe audio objects, state reset on disconnect. |
 | Economy & Stash systems | Buy/sell transactions, ruble currency, atomic balance checks, tier progression, unmarshal-safe stash CRUD without lock starvation. |
 | Admin server (named pipe & Unix socket) | Windows named pipe + Unix socket fallback with 0600 permissions and configurable path. Commands: `status`, `kick`, `ban`, `broadcast`. Token-based authentication support, 50ms exponential accept backoff. |
+| Per-IP Rate Limiting | Token bucket per client IP (100 pkt/s, burst 150) in raw UDP ingestion loop with 60s idle cleanup, early-dropping flood traffic before worker queue. |
+| Client Reliable ACK Engine | Immediate `Opcode::ACK` (0x0005) dispatch on receiving reliable packets (`flags & 0x01`), halting server retransmission timeouts. |
+| Anti-Combat Logging Sleeper System | Spawns authoritative 30-second sleeper proxy entities on disconnect outside safe zones or during active combat; persists damage and death to database. |
+| Server-Authoritative Combat & Damage Rules | Validates attack distance (300m ceiling), enforces safe zone damage immunity for attacker and target, clamps damage, tracks 30-second combat engagement status. |
+| Session Authentication & Ban Enforcement | Validates session IDs and tokens on incoming client packets, enforcing immediate status 2 rejection for banned accounts during handshake. |
+| Periodic 60s DB Checkpointing | Replaced 30Hz per-transform DB writes with in-memory session tracking, flushing dirty sessions on 60-second intervals, safe zone transitions, and disconnects (>98% I/O reduction). |
 | CI/CD Pipeline | Automated GitHub Actions workflow (`ci.yml`) testing Go server with race detection (`go test -race ./...`) and building client Release DLL with MSVC on Windows. |
 
 ---
@@ -305,13 +312,6 @@ Once in the main menu:
 ## To-Do & Roadmap
 
 Subsystems and features scheduled for upcoming milestones:
-
-### Security & Protocol Hardening
-
-| Subsystem | Priority | Description |
-|:---|:---:|:---|
-| Per-IP rate limiting | Medium | Add per-IP token bucket or connection cap to prevent flood-based DoS |
-| Packet authentication | Low | Add challenge-response handshake or HMAC session tokens |
 
 ### Infrastructure & Deployment
 

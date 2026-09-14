@@ -70,11 +70,13 @@ type Server struct {
 	aoi         *AoIManager
 	squads      *ai.SquadManager
 	logger      *zap.Logger
-	seq         atomic.Uint32
-	ackQueue    *network.AckQueue
-	emissionMgr *EmissionOrchestrator
-	startTime   time.Time
-	tickCount   atomic.Uint64
+	seq           atomic.Uint32
+	ackQueue      *network.AckQueue
+	emissionMgr   *EmissionOrchestrator
+	damageHandler *DamageHandler
+	sleepers      *SleeperManager
+	startTime     time.Time
+	tickCount     atomic.Uint64
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {
@@ -83,21 +85,23 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		q = dbQueue[0]
 	}
 	s := &Server{
-		cfg:         cfg,
-		db:          db,
-		dbQueue:     q,
-		sessions:    network.NewSessionManager(),
-		grid:        NewSpatialGrid(64.0),
-		events:      NewEventManager(),
-		economy:     NewEconomyManager(db),
-		stashMgr:    NewStashManager(db),
-		anticheat:   NewAntiCheatManager(),
-		aoi:         NewAoIManager(),
-		squads:      ai.NewSquadManager(),
-		logger:      logger,
-		ackQueue:    network.NewAckQueue(),
-		emissionMgr: NewEmissionOrchestrator(),
-		startTime:   time.Now(),
+		cfg:           cfg,
+		db:            db,
+		dbQueue:       q,
+		sessions:      network.NewSessionManager(),
+		grid:          NewSpatialGrid(64.0),
+		events:        NewEventManager(),
+		economy:       NewEconomyManager(db),
+		stashMgr:      NewStashManager(db),
+		anticheat:     NewAntiCheatManager(),
+		aoi:           NewAoIManager(),
+		squads:        ai.NewSquadManager(),
+		logger:        logger,
+		ackQueue:      network.NewAckQueue(),
+		emissionMgr:   NewEmissionOrchestrator(),
+		damageHandler: NewDamageHandler(logger),
+		sleepers:      NewSleeperManager(logger),
+		startTime:     time.Now(),
 	}
 
 	s.ackQueue.SetSendFunc(func(addr *net.UDPAddr, data []byte) error {
@@ -120,6 +124,16 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		s.emissionMgr.SetDormantDuration(time.Duration(cfg.EmissionIntervalMin) * time.Minute)
 	}
 	return s
+}
+
+// DamageHandler returns the active DamageHandler instance.
+func (s *Server) DamageHandler() *DamageHandler {
+	return s.damageHandler
+}
+
+// Sleepers returns the active SleeperManager instance.
+func (s *Server) Sleepers() *SleeperManager {
+	return s.sleepers
 }
 
 // EmissionMgr returns the active EmissionOrchestrator instance.
@@ -239,6 +253,20 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				cleanUUID = string(bytes.Trim(req.UUID[:], "\x00"))
 			}
 
+			// Ban Check (Issue 11)
+			if s.db != nil {
+				if banned, reason, err := CheckPlayerBanned(s.db, cleanUUID); err == nil && banned {
+					s.logger.Warn("Banned player rejected", zap.String("uuid", cleanUUID), zap.String("reason", reason))
+					res := protocol.HandshakeRes{
+						Status:    2, // 2 = Banned
+						WorldTime: uint64(time.Now().Unix()),
+					}
+					tempSess := &network.PlayerSession{UDPAddr: addr}
+					s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+					return
+				}
+			}
+
 			if s.cfg != nil && s.cfg.MaxPlayers > 0 && len(s.sessions.GetAll()) >= s.cfg.MaxPlayers {
 				s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
 				res := protocol.HandshakeRes{
@@ -251,13 +279,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			}
 
 			sessID := s.seq.Add(1)
+			token, _ := GenerateSessionToken()
 			sess := &network.PlayerSession{
-				SessionID:    sessID,
-				AccountID:    cleanUUID,
-				UDPAddr:      addr,
-				LastSeen:     time.Now(),
-				Health:       100.0,
-				CurrentLevel: "l01_escape",
+				SessionID:      sessID,
+				SessionToken:   token,
+				AccountID:      cleanUUID,
+				UDPAddr:        addr,
+				LastSeen:       time.Now(),
+				LastCheckpoint: time.Now(),
+				Health:         100.0,
+				CurrentLevel:   "l01_escape",
 			}
 			if s.db != nil {
 				nick := nullTermString(req.Nickname[:])
@@ -274,6 +305,21 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					sess.Health = char.Health
 				}
 			}
+
+			// Reclaim active sleeper if reconnecting (Issue 16)
+			if s.sleepers != nil {
+				if sleeper := s.sleepers.GetSleeperByAccount(cleanUUID); sleeper != nil {
+					sleeper.RLock()
+					sess.Position = sleeper.Position
+					sess.Health = sleeper.Health
+					sess.CurrentLevel = sleeper.CurrentLevel
+					sleeperID := sleeper.EntityID
+					sleeper.RUnlock()
+					s.sleepers.RemoveSleeper(sleeperID)
+					s.grid.Remove(sleeperID)
+				}
+			}
+
 			s.sessions.AddSession(sess)
 
 			res := protocol.HandshakeRes{
@@ -301,6 +347,8 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			yaw := sess.Rotation[0]
 			health := sess.Health
 			level := sess.CurrentLevel
+			inSafe := sess.InSafeZone
+			inCombat := time.Now().Before(sess.InCombatUntil)
 			sess.Unlock()
 
 			if uuid != "" {
@@ -308,6 +356,19 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			}
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
+
+			// Sleeper System (Issue 16, §17.1):
+			// If outside safe zone or in combat, spawn a sleeper proxy
+			if (!inSafe || inCombat) && s.sleepers != nil && health > 0 {
+				sleeper := s.sleepers.CreateSleeper(sess, 30*time.Second)
+				if sleeper != nil {
+					s.grid.Insert(sleeper.EntityID, sleeper.Position[0], sleeper.Position[2])
+					s.logger.Info("Spawned sleeper proxy for disconnected player",
+						zap.String("uuid", uuid),
+						zap.Uint32("entity_id", sleeper.EntityID),
+					)
+				}
+			}
 
 			leavePkt := protocol.EntityLeaveAoI{EntityID: sessID}
 			for _, other := range s.sessions.GetAll() {
@@ -359,17 +420,54 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				return
 			}
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
+				// Authenticate session ID if present (Issue 14)
+				reqSessID := binary.LittleEndian.Uint32(ct.SessionID[:])
+				if reqSessID != 0 && !AuthenticateSessionPacket(sess, reqSessID, 0) {
+					s.logger.Warn("Session ID mismatch in ClientTransform",
+						zap.Uint32("expected", sess.SessionID),
+						zap.Uint32("got", reqSessID),
+					)
+					return
+				}
+
+				now := time.Now()
+				sess.Lock()
+				dt := float32(now.Sub(sess.LastTransformTime).Seconds())
+				sess.Unlock()
+
+				// Speedhack and movement sanity check (Issue 17)
+				if s.anticheat != nil {
+					newPos := [3]float32{ct.PosX, ct.PosY, ct.PosZ}
+					valid, reason := s.anticheat.ValidateMove(sess, newPos, dt)
+					if !valid {
+						violations := s.anticheat.RecordViolation(sess.SessionID, reason)
+						if s.anticheat.ShouldKick(violations) {
+							s.logger.Warn("Kicking player for repeated anticheat violations",
+								zap.Uint32("session", sess.SessionID),
+								zap.String("reason", reason),
+								zap.Int("violations", violations),
+							)
+							s.KickSession(sess.SessionID)
+							return
+						}
+						// Rubberband: drop packet and do not update position
+						return
+					}
+				}
+
 				sess.Lock()
 				sessID := sess.SessionID
 				sess.Position = [3]float32{ct.PosX, ct.PosY, ct.PosZ}
 				sess.Rotation = [2]float32{float32(ct.Yaw) / 100.0, float32(ct.Pitch) / 100.0}
 				sess.Velocity = [3]float32{float32(ct.VelX) / 100.0, float32(ct.VelY) / 100.0, float32(ct.VelZ) / 100.0}
 				sess.AnimFlags = ct.AnimFlags
-				sess.LastSeen = time.Now()
+				sess.LastSeen = now
+				sess.LastTransformTime = now
 				uuid := sess.AccountID
 				health := sess.Health
 				level := sess.CurrentLevel
 				prevSafe := sess.InSafeZone
+				sess.Dirty = true
 				sess.Unlock()
 
 				s.grid.Update(sessID, ct.PosX, ct.PosZ)
@@ -381,16 +479,25 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					sess.Unlock()
 
 					s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, SafezoneState{InSafeZone: boolToUint8(isSafe)})
-				}
 
-				if uuid != "" {
-					s.QueuePlayerTransform(uuid, ct.PosX, ct.PosY, ct.PosZ, float32(ct.Yaw)/100.0, health)
+					// Safe zone entry/exit flushes character transform immediately (Issue 19)
+					if uuid != "" {
+						s.QueuePlayerTransform(uuid, ct.PosX, ct.PosY, ct.PosZ, float32(ct.Yaw)/100.0, health)
+						sess.Lock()
+						sess.LastCheckpoint = now
+						sess.Dirty = false
+						sess.Unlock()
+					}
 				}
 			}
 		}
 	case protocol.OpChatText:
 		var pkt protocol.ChatText
 		if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
+			return
+		}
+		sess := s.sessions.GetByAddr(addr.String())
+		if sess == nil || (pkt.SenderID != 0 && !AuthenticateSessionPacket(sess, pkt.SenderID, 0)) {
 			return
 		}
 		// Extract text up to the declared length, capped at 255.
@@ -408,6 +515,57 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			zap.String("text", sanitized),
 		)
 		s.BroadcastChat(pkt.SenderID, sanitized)
+	case protocol.OpDamageNotify:
+		var dmg protocol.DamageNotify
+		if err := binary.Read(buf, binary.LittleEndian, &dmg); err != nil {
+			return
+		}
+		attackerSess := s.sessions.GetByAddr(addr.String())
+		if attackerSess == nil {
+			return
+		}
+
+		// Check if target is a sleeper proxy (Issue 16)
+		if s.sleepers != nil {
+			if sleeper := s.sleepers.GetSleeper(dmg.TargetID); sleeper != nil {
+				remHealth, isDead := s.sleepers.ApplyDamage(dmg.TargetID, dmg.Damage)
+				s.logger.Info("Damage applied to sleeper",
+					zap.Uint32("sleeper", dmg.TargetID),
+					zap.Float32("damage", dmg.Damage),
+					zap.Float32("rem_health", remHealth),
+					zap.Bool("dead", isDead),
+				)
+				if isDead {
+					sleeper.RLock()
+					uuid := sleeper.AccountID
+					pos := sleeper.Position
+					yaw := sleeper.Rotation[0]
+					sleeper.RUnlock()
+					if uuid != "" {
+						s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+					}
+					s.sleepers.RemoveSleeper(dmg.TargetID)
+					s.grid.Remove(dmg.TargetID)
+				}
+				return
+			}
+		}
+
+		targetSess := s.sessions.GetByID(dmg.TargetID)
+		if targetSess == nil {
+			return
+		}
+
+		if s.damageHandler != nil {
+			applied, valid, reason := s.damageHandler.ValidateAndApplyDamage(attackerSess, targetSess, &dmg)
+			if !valid {
+				s.logger.Debug("Damage rejected", zap.String("reason", reason))
+				return
+			}
+			dmgOut := dmg
+			dmgOut.Damage = applied
+			s.SendToSession(targetSess, protocol.OpDamageNotify, protocol.FlagReliable, dmgOut)
+		}
 	case protocol.OpStashInteract:
 		var pkt protocol.StashInteractPayload
 		if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
@@ -494,19 +652,62 @@ func (s *Server) Tick(now time.Time) {
 	tick := s.tickCount.Add(1)
 	isSecondTick := (tick%30 == 0)
 
-	// Timeout stale sessions & queue periodic stats
+	// Sleeper Tick (Issue 16)
+	if s.sleepers != nil {
+		s.sleepers.Tick(now, func(sl *Sleeper) {
+			sl.RLock()
+			uuid := sl.AccountID
+			pos := sl.Position
+			yaw := sl.Rotation[0]
+			health := sl.Health
+			sl.RUnlock()
+			if uuid != "" {
+				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+			}
+			s.grid.Remove(sl.EntityID)
+		}, func(sl *Sleeper) {
+			sl.RLock()
+			uuid := sl.AccountID
+			pos := sl.Position
+			yaw := sl.Rotation[0]
+			sl.RUnlock()
+			if uuid != "" {
+				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+			}
+			s.grid.Remove(sl.EntityID)
+		})
+	}
+
+	// Timeout stale sessions & periodic checkpointing (Issue 19)
 	for _, sess := range s.sessions.GetAll() {
 		sess.Lock()
 		sessID := sess.SessionID
 		uuid := sess.AccountID
 		stale := now.Sub(sess.LastSeen) > 30*time.Second
+		dirty := sess.Dirty
+		pos := sess.Position
+		yaw := sess.Rotation[0]
+		health := sess.Health
 		sess.Unlock()
 		if stale {
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
 			s.sessions.RemoveSession(sessID)
-		} else if isSecondTick && uuid != "" {
-			s.QueuePeriodicStats(uuid, 1)
+			if uuid != "" && dirty {
+				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+			}
+		} else {
+			if isSecondTick && uuid != "" {
+				s.QueuePeriodicStats(uuid, 1)
+			}
+			// 60s Checkpoint (Issue 19)
+			if ShouldCheckpointSession(sess, now, 60*time.Second) && uuid != "" {
+				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+				sess.Lock()
+				sess.LastCheckpoint = now
+				sess.Dirty = false
+				sess.Unlock()
+			}
 		}
 	}
 	if udp := s.GetUDP(); udp != nil {
@@ -532,11 +733,9 @@ func (s *Server) Tick(now time.Time) {
 
 func (s *Server) broadcastSquadAction(squadID uint32, state ai.AIState, pos [3]float32) {
 	payload := protocol.AIActionPayload{
-		SquadID: squadID,
-		State:   uint8(state),
-		PosX:    pos[0],
-		PosY:    pos[1],
-		PosZ:    pos[2],
+		EntityID: squadID,
+		Action:   uint8(state),
+		TargetID: 0,
 	}
 	for _, sess := range s.sessions.GetAll() {
 		s.SendToSession(sess, OpAiAction, protocol.FlagUnreliable, payload)

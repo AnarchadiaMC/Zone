@@ -26,64 +26,94 @@ function on_disconnect()
     reset_world_events()
 end
 
+local function handle_emission_warn(timer)
+    emission_timer = timer
+    if db.actor then
+        local msg = "ZONE EMISSION IN " .. tostring(timer) .. " SECONDS - FIND SHELTER"
+        db.actor:give_game_news("Anomaly Detected", msg, "ui_inGame2_Vibros", 0, 10000, 0)
+        -- Play sound if possible (L-20: verify snd is non-nil before playing)
+        if current_snd and current_snd:playing() then
+            pcall(function() current_snd:stop() end)
+        end
+        local ok, snd = pcall(sound_object, "characters_voice\\scenario\\video\\emission_siren")
+        if ok and snd then
+            current_snd = snd
+            snd:play(db.actor, 0, sound_object.s2d)
+        end
+    end
+end
+
+local function handle_emission_active()
+    active_emission = true
+    emission_timer = 0
+    if xr_effects and xr_effects.start_surge then
+        -- Trigger anomaly surge
+        xr_effects.start_surge(db.actor, nil, {})
+    else
+        -- Manual fallback
+        level.set_weather("emission", true)
+    end
+end
+
+local function handle_emission_clear()
+    active_emission = false
+    emission_timer = 0
+    -- L-27: Avoid double weather change on emission clear
+    local ended = false
+    if surge_manager and surge_manager.get_surge_manager then
+        local sm = surge_manager.get_surge_manager()
+        if sm and sm.end_surge then
+            sm:end_surge(true)
+            ended = true
+        end
+    end
+    if not ended then
+        level.set_weather("default", true)
+    end
+end
+
+local function handle_raid_start()
+    if db.actor then
+        db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+    end
+end
+
+local function handle_raid_end()
+    if db.actor then
+        db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+    end
+end
+
 function on_world_event(pkt, offset)
     local event_type, pos = zone_net.read_uint8(pkt, offset)
+    local state, pos = zone_net.read_uint8(pkt, pos)
     local timer, pos = zone_net.read_uint32_le(pkt, pos)
     
-    if event_type == 0x01 then -- EMISSION_WARN
-        emission_timer = timer
-        if db.actor then
-            local msg = "ZONE EMISSION IN " .. tostring(timer) .. " SECONDS - FIND SHELTER"
-            db.actor:give_game_news("Anomaly Detected", msg, "ui_inGame2_Vibros", 0, 10000, 0)
-            -- Play sound if possible (L-20: verify snd is non-nil before playing)
-            if current_snd and current_snd:playing() then
-                pcall(function() current_snd:stop() end)
-            end
-            local ok, snd = pcall(sound_object, "characters_voice\\scenario\\video\\emission_siren")
-            if ok and snd then
-                current_snd = snd
-                snd:play(db.actor, 0, sound_object.s2d)
-            end
+    if event_type == 0 then -- Emission
+        if state == 1 then -- Warning
+            handle_emission_warn(timer)
+        elseif state == 2 then -- Active
+            handle_emission_active()
+        elseif state == 3 then -- Clear
+            handle_emission_clear()
         end
-    elseif event_type == 0x02 then -- EMISSION_ACTIVE
-        active_emission = true
-        emission_timer = 0
-        if xr_effects and xr_effects.start_surge then
-            -- Trigger anomaly surge
-            xr_effects.start_surge(db.actor, nil, {})
-        else
-            -- Manual fallback
-            level.set_weather("emission", true)
-        end
-    elseif event_type == 0x03 then -- EMISSION_CLEAR
-        active_emission = false
-        emission_timer = 0
-        -- L-27: Avoid double weather change on emission clear
-        local ended = false
-        if surge_manager and surge_manager.get_surge_manager then
-            local sm = surge_manager.get_surge_manager()
-            if sm and sm.end_surge then
-                sm:end_surge(true)
-                ended = true
-            end
-        end
-        if not ended then
-            level.set_weather("default", true)
-        end
-    elseif event_type == 0x04 then -- RAID_START
-        if db.actor then
-            db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
-        end
-    elseif event_type == 0x05 then -- RAID_END
-        if db.actor then
-            db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
-        end
+    -- Backward compatibility for direct event_type values (1..5)
+    elseif event_type == 1 then -- EMISSION_WARN
+        handle_emission_warn(timer)
+    elseif event_type == 2 then -- EMISSION_ACTIVE
+        handle_emission_active()
+    elseif event_type == 3 then -- EMISSION_CLEAR
+        handle_emission_clear()
+    elseif event_type == 4 then -- RAID_START
+        handle_raid_start()
+    elseif event_type == 5 then -- RAID_END
+        handle_raid_end()
     end
 end
 
 function on_game_start()
     if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_level_changing", on_level_changing)
+        RegisterScriptCallback("on_level_changing", on_level_changing)
         RegisterScriptCallback("actor_on_net_destroy", on_disconnect)
     end
 end

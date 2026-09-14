@@ -162,16 +162,11 @@ func TestSim_AISquadTickedAndActionBroadcast(t *testing.T) {
 	if err := binary.Read(r, binary.LittleEndian, &action); err != nil {
 		t.Fatalf("failed to decode AIActionPayload: %v", err)
 	}
-	if action.SquadID != sq.ID {
-		t.Errorf("expected SquadID %d, got %d", sq.ID, action.SquadID)
+	if action.EntityID != sq.ID {
+		t.Errorf("expected EntityID %d, got %d", sq.ID, action.EntityID)
 	}
-	if action.State != uint8(ai.AIStatePatrol) {
-		t.Errorf("expected Action State %d (Patrol), got %d", ai.AIStatePatrol, action.State)
-	}
-
-	// Verify the squad position was updated and reflected in payload
-	if action.PosX == 0 && action.PosZ == 0 {
-		t.Errorf("expected non-zero target coordinates in broadcast payload, got [%f, %f, %f]", action.PosX, action.PosY, action.PosZ)
+	if action.Action != uint8(ai.AIStatePatrol) {
+		t.Errorf("expected Action %d (Patrol), got %d", ai.AIStatePatrol, action.Action)
 	}
 }
 

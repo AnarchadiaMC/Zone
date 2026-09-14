@@ -1,5 +1,6 @@
 #include "udp_client.h"
 #include "../protocol/packets.h"
+#include "../identity/identity.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <thread>
@@ -145,21 +146,32 @@ namespace
                 {
                     std::string uuidCopy;
                     std::string nickCopy;
-                    uint32_t hwidCopy = 0;
                     {
                         std::lock_guard<std::mutex> lock(g_StateMutex);
                         uuidCopy = g_UUID;
                         nickCopy = g_Nick;
-                        hwidCopy = g_HWID;
                         g_ConnectRetries++;
                         g_LastConnectTime = now;
                         g_ConnectBackoffMs = std::min(backoff * 2, 8000);
                     }
 
+                    if (uuidCopy.empty())
+                    {
+                        uuidCopy = Identity::GetClientUUID();
+                    }
+                    if (nickCopy.empty())
+                    {
+                        nickCopy = Identity::GetNickname();
+                    }
+
                     // Send Handshake
                     HandshakeReq req = {};
                     snprintf(req.uuid, sizeof(req.uuid), "%s", uuidCopy.c_str());
-                    req.hwid = hwidCopy;
+                    const uint8_t* hwidBuf = Identity::GetHWID();
+                    if (hwidBuf)
+                    {
+                        memcpy(req.hwid, hwidBuf, sizeof(req.hwid));
+                    }
                     snprintf(req.nick, sizeof(req.nick), "%s", nickCopy.c_str());
                     req.protoVer = 1;
                     
@@ -251,6 +263,16 @@ namespace
                             g_LastPacketReceivedTime = steady_clock::now();
                         }
 
+                        if (hdr->flags & 0x01)
+                        {
+                            ZO_Header ackHdr = { 0x5A4F, 1, 0x02, ++g_Sequence, (uint16_t)Opcode::ACK, sizeof(uint32_t) };
+                            uint32_t ackSeq = hdr->sequence;
+                            char ackBuf[sizeof(ZO_Header) + sizeof(uint32_t)];
+                            memcpy(ackBuf, &ackHdr, sizeof(ZO_Header));
+                            memcpy(ackBuf + sizeof(ZO_Header), &ackSeq, sizeof(uint32_t));
+                            SendPacket(ackBuf, sizeof(ackBuf));
+                        }
+
                         if (hdr->opcode == (uint16_t)Opcode::HANDSHAKE_RES)
                         {
                             if (res >= (int)(sizeof(ZO_Header) + sizeof(HandshakeRes)))
@@ -297,6 +319,10 @@ namespace
                                     g_Ping = (uint32_t)(nowMs - sentTs);
                                 }
                             }
+                        }
+                        else if (hdr->opcode == (uint16_t)Opcode::ACK)
+                        {
+                            // Server ACK received; do not enqueue to Lua
                         }
                         else
                         {

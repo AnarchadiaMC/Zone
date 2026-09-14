@@ -22,6 +22,28 @@ type PlayerSession struct {
 	LastSeen          time.Time
 	LastSequence      uint32
 	LastTransformTime time.Time
+	SessionToken      uint64
+	Dirty             bool
+	LastCheckpoint    time.Time
+	InCombatUntil     time.Time
+}
+
+func (s *PlayerSession) MarkDirty() {
+	s.Lock()
+	defer s.Unlock()
+	s.Dirty = true
+}
+
+func (s *PlayerSession) SetCombat(duration time.Duration) {
+	s.Lock()
+	defer s.Unlock()
+	s.InCombatUntil = time.Now().Add(duration)
+}
+
+func (s *PlayerSession) IsInCombat(now time.Time) bool {
+	s.Lock()
+	defer s.Unlock()
+	return now.Before(s.InCombatUntil)
 }
 
 type SessionManager struct {

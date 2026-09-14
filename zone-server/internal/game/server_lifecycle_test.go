@@ -291,6 +291,7 @@ func TestLifecycle_DisconnectPacket(t *testing.T) {
 		Position:     [3]float32{15.0, 1.0, 25.0},
 		Rotation:     [2]float32{1.5, 0.0},
 		Health:       85.0,
+		InSafeZone:   true,
 		LastSeen:     time.Now(),
 	}
 	s.sessions.AddSession(sess)
@@ -397,5 +398,240 @@ func TestLifecycle_StaleSessionTimeout(t *testing.T) {
 	// Verify removed from grid
 	if s.grid.Contains(sessID) {
 		t.Errorf("expected stale session to be removed from spatial grid on timeout")
+	}
+}
+
+func TestLifecycle_BannedPlayerRejected(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	sink.Reset()
+
+	bannedUUID := "uuid-banned-stalker-99"
+	_ = db.AutoProvision(bannedUUID, "hwid-banned", "BadActor")
+	if err := db.BanAccount(bannedUUID, "Aimbot detected"); err != nil {
+		t.Fatalf("Failed to ban account: %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30051}
+	var req protocol.HandshakeReq
+	copy(req.UUID[:], bannedUUID)
+	copy(req.Nickname[:], "BadActor")
+	req.ProtocolVer = 1
+
+	raw := buildTestPacket(t, protocol.OpHandshakeReq, 1, protocol.FlagReliable, req)
+	s.HandlePacket(raw, addr)
+
+	// Session should NOT be added
+	if s.sessions.GetByAddr(addr.String()) != nil {
+		t.Errorf("Expected banned player to not have active session")
+	}
+
+	// Verify response was Status 2 (Banned)
+	if sink.PacketCount() == 0 {
+		t.Fatalf("Expected handshake response packet")
+	}
+	r := bytes.NewReader(sink.LastPacket())
+	_, _ = protocol.ReadHeader(r)
+	var res protocol.HandshakeRes
+	_ = binary.Read(r, binary.LittleEndian, &res)
+	if res.Status != 2 {
+		t.Errorf("Expected HandshakeRes Status 2 (Banned), got %d", res.Status)
+	}
+}
+
+func TestLifecycle_CombatDisconnectSleeper(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	sink.Reset()
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30061}
+	sessID := uint32(801)
+	uuid := "uuid-sleeper-combat-dc"
+	sess := &network.PlayerSession{
+		SessionID:    sessID,
+		AccountID:    uuid,
+		UDPAddr:      addr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{100.0, 5.0, 100.0},
+		Rotation:     [2]float32{0.0, 0.0},
+		Health:       90.0,
+		InSafeZone:   false, // Disconnecting outside safe zone
+		LastSeen:     time.Now(),
+	}
+	s.sessions.AddSession(sess)
+	s.grid.Insert(sessID, 100.0, 100.0)
+
+	// Disconnect outside safe zone
+	rawDC := buildTestPacket(t, protocol.OpDisconnect, 1, protocol.FlagReliable, uint8(0))
+	s.HandlePacket(rawDC, addr)
+
+	// 1. Verify player session removed
+	if s.sessions.GetByID(sessID) != nil {
+		t.Errorf("Expected session %d removed from active sessions", sessID)
+	}
+
+	// 2. Verify sleeper proxy was spawned in SleeperManager
+	sleeper := s.Sleepers().GetSleeperByAccount(uuid)
+	if sleeper == nil {
+		t.Fatalf("Expected sleeper proxy to be created for account %s", uuid)
+	}
+	if sleeper.Position != [3]float32{100.0, 5.0, 100.0} {
+		t.Errorf("Expected sleeper position [100, 5, 100], got %v", sleeper.Position)
+	}
+	if sleeper.Health != 90.0 {
+		t.Errorf("Expected sleeper health 90, got %f", sleeper.Health)
+	}
+
+	// 3. Sleeper takes damage in world
+	s.Sleepers().ApplyDamage(sleeper.EntityID, 20.0)
+	if sleeper.Health != 70.0 {
+		t.Errorf("Expected sleeper health 70 after 20 damage, got %f", sleeper.Health)
+	}
+
+	// 4. Reconnect with same account: sleeper should be reclaimed
+	newAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30062}
+	var req protocol.HandshakeReq
+	copy(req.UUID[:], uuid)
+	copy(req.Nickname[:], "ReturningStalker")
+	req.ProtocolVer = 1
+
+	rawHS := buildTestPacket(t, protocol.OpHandshakeReq, 2, protocol.FlagReliable, req)
+	s.HandlePacket(rawHS, newAddr)
+
+	reconnectedSess := s.sessions.GetByAddr(newAddr.String())
+	if reconnectedSess == nil {
+		t.Fatalf("Expected reconnected session to exist")
+	}
+	if reconnectedSess.Health != 70.0 {
+		t.Errorf("Expected reconnected player to have sleeper health 70.0, got %f", reconnectedSess.Health)
+	}
+	// Sleeper must now be removed from SleeperManager
+	if s.Sleepers().GetSleeperByAccount(uuid) != nil {
+		t.Errorf("Expected sleeper to be removed upon player reconnection")
+	}
+}
+
+func TestLifecycle_SpeedhackRubberband(t *testing.T) {
+	s, _, _ := setupTestServerWithDB(t)
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30071}
+	sessID := uint32(901)
+	sess := &network.PlayerSession{
+		SessionID:         sessID,
+		AccountID:         "uuid-speedhack-test",
+		UDPAddr:           addr,
+		CurrentLevel:      "l01_escape",
+		Position:          [3]float32{0.0, 0.0, 0.0},
+		LastSeen:          time.Now().Add(-1 * time.Second),
+		LastTransformTime: time.Now().Add(-1 * time.Second),
+	}
+	s.sessions.AddSession(sess)
+	s.grid.Insert(sessID, 0.0, 0.0)
+
+	// Valid initial move
+	ct1 := protocol.ClientTransform{
+		PosX: 5.0,
+		PosY: 0.0,
+		PosZ: 5.0,
+	}
+	binary.LittleEndian.PutUint32(ct1.SessionID[:], sessID)
+	raw1 := buildTestPacket(t, protocol.OpClientTransform, 1, protocol.FlagUnreliable, ct1)
+	s.HandlePacket(raw1, addr)
+
+	sess.Lock()
+	p1 := sess.Position
+	sess.Unlock()
+	if p1[0] != 5.0 || p1[2] != 5.0 {
+		t.Fatalf("Expected valid transform position (5, 5), got (%f, %f)", p1[0], p1[2])
+	}
+
+	// Speedhack move: jump 500m in 0.01s (50,000 m/s > 25 m/s)
+	sess.Lock()
+	sess.LastTransformTime = time.Now().Add(-10 * time.Millisecond)
+	sess.Unlock()
+
+	ctHack := protocol.ClientTransform{
+		PosX: 500.0,
+		PosY: 0.0,
+		PosZ: 500.0,
+	}
+	binary.LittleEndian.PutUint32(ctHack.SessionID[:], sessID)
+	rawHack := buildTestPacket(t, protocol.OpClientTransform, 2, protocol.FlagUnreliable, ctHack)
+	s.HandlePacket(rawHack, addr)
+
+	// Position must be rubberbanded (kept at 5, 5, NOT 500, 500)
+	sess.Lock()
+	pHack := sess.Position
+	sess.Unlock()
+	if pHack[0] != 5.0 || pHack[2] != 5.0 {
+		t.Errorf("Speedhack packet was not rubberbanded! Position: (%f, %f)", pHack[0], pHack[2])
+	}
+
+	// Anticheat violation should be recorded
+	if s.anticheat.ViolationCount(sessID) == 0 {
+		t.Errorf("Expected violation recorded for speedhack")
+	}
+}
+
+func TestLifecycle_DamageSafeZoneImmunity(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	sink.Reset()
+
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30081}
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30082}
+
+	attackerSess := &network.PlayerSession{
+		SessionID:    1001,
+		AccountID:    "attacker-uuid",
+		UDPAddr:      attackerAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{10.0, 0.0, 10.0},
+		Health:       100.0,
+		InSafeZone:   false,
+	}
+	targetSess := &network.PlayerSession{
+		SessionID:    1002,
+		AccountID:    "victim-uuid",
+		UDPAddr:      targetAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{15.0, 0.0, 15.0},
+		Health:       100.0,
+		InSafeZone:   true, // Victim inside safe zone
+	}
+
+	s.sessions.AddSession(attackerSess)
+	s.sessions.AddSession(targetSess)
+
+	dmg := protocol.DamageNotify{
+		TargetID:   1002,
+		AttackerID: 1001,
+		Damage:     50.0,
+		BoneID:     1,
+	}
+	rawDmg := buildTestPacket(t, protocol.OpDamageNotify, 1, protocol.FlagReliable, dmg)
+	s.HandlePacket(rawDmg, attackerAddr)
+
+	targetSess.Lock()
+	h := targetSess.Health
+	targetSess.Unlock()
+
+	// Safe zone immunity: health must remain 100
+	if h != 100.0 {
+		t.Errorf("Expected safe zone victim health 100.0, got %f", h)
+	}
+
+	// Now move target outside safe zone
+	targetSess.Lock()
+	targetSess.InSafeZone = false
+	targetSess.Unlock()
+
+	sink.Reset()
+	rawDmg2 := buildTestPacket(t, protocol.OpDamageNotify, 2, protocol.FlagReliable, dmg)
+	s.HandlePacket(rawDmg2, attackerAddr)
+
+	targetSess.Lock()
+	h2 := targetSess.Health
+	targetSess.Unlock()
+
+	if h2 != 50.0 {
+		t.Errorf("Expected target health 50.0 after valid damage, got %f", h2)
 	}
 }

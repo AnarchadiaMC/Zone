@@ -1,7 +1,6 @@
 package game
 
 import (
-	"fmt"
 	"math"
 	"sync"
 
@@ -11,8 +10,9 @@ import (
 )
 
 const (
-	acMaxHorizontalSpeed = 25.0 // m/s — generous cap above X-Ray sprint (~8 m/s)
-	acMaxVerticalDelta   = 15.0 // metres — permits falls but blocks fly hacks
+	acMaxHorizontalSpeed      = 25.0 // m/s — generous cap above X-Ray sprint (~8 m/s)
+	acMaxVerticalDelta        = 15.0 // metres — permits falls but blocks fly hacks
+	MaxViolationsBeforeAction = 5
 )
 
 // AntiCheatManager tracks per-session violation counts and validates movement.
@@ -36,10 +36,14 @@ func NewAntiCheatManager(logger ...*zap.Logger) *AntiCheatManager {
 // ValidateMove checks whether a position delta is physically plausible.
 //
 // dt is the elapsed time since the session last packet, in seconds.
-// Returns (valid, reason). When dt <= 0 the check is skipped (first packet).
+// Returns (valid, reason). When dt <= 0 or dt > 2.0 the check is skipped (first packet or resume after pause).
 func (ac *AntiCheatManager) ValidateMove(sess *network.PlayerSession, newPos [3]float32, dt float32) (bool, string) {
-	if dt <= 0 {
+	if dt <= 0 || dt > 2.0 {
 		return true, ""
+	}
+
+	if sess == nil {
+		return false, "invalid session"
 	}
 
 	sess.Lock()
@@ -58,10 +62,20 @@ func (ac *AntiCheatManager) ValidateMove(sess *network.PlayerSession, newPos [3]
 	vz := float64(newPos[2]-oldPos[2]) / float64(dt)
 	totalSpeed := math.Sqrt(float64(vx*vx + vy*vy + vz*vz))
 	if totalSpeed > acMaxHorizontalSpeed {
-		return false, fmt.Sprintf("speed violation: %.2f m/s", totalSpeed)
+		return false, "speed violation"
 	}
 
 	return true, ""
+}
+
+// ShouldRubberband returns true if violations > 0.
+func (ac *AntiCheatManager) ShouldRubberband(violations int) bool {
+	return violations > 0
+}
+
+// ShouldKick returns true if violations >= MaxViolationsBeforeAction.
+func (ac *AntiCheatManager) ShouldKick(violations int) bool {
+	return violations >= MaxViolationsBeforeAction
 }
 
 // RecordViolation increments the violation count for sessionID and returns the new total.

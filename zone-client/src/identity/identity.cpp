@@ -1,15 +1,19 @@
 #include "identity.h"
 #include <windows.h>
+#include <wincrypt.h>
 #include <shlobj.h>
 #include <fstream>
 #include <sstream>
 #include <rpc.h>
 #pragma comment(lib, "Rpcrt4.lib")
+#pragma comment(lib, "Advapi32.lib")
 #include "../provision/asset_provisioner.h"
 
 namespace
 {
     std::string g_UUID;
+    uint8_t g_HWIDBinary[32] = {0};
+    char g_HWIDString[65] = {0};
     uint32_t g_HWID = 0;
     std::string g_Nickname = "Stalker";
     std::string g_ConfigPath;
@@ -36,7 +40,36 @@ namespace
         return hash;
     }
 
-    uint32_t GenerateHWID()
+    bool ComputeSHA256(const std::string& input, uint8_t outBinary[32])
+    {
+        HCRYPTPROV hProv = 0;
+        if (!CryptAcquireContextW(&hProv, nullptr, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        {
+            if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+            {
+                return false;
+            }
+        }
+
+        HCRYPTHASH hHash = 0;
+        bool success = false;
+        if (CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash))
+        {
+            if (CryptHashData(hHash, reinterpret_cast<const BYTE*>(input.data()), static_cast<DWORD>(input.size()), 0))
+            {
+                DWORD hashLen = 32;
+                if (CryptGetHashParam(hHash, HP_HASHVAL, outBinary, &hashLen, 0) && hashLen == 32)
+                {
+                    success = true;
+                }
+            }
+            CryptDestroyHash(hHash);
+        }
+        CryptReleaseContext(hProv, 0);
+        return success;
+    }
+
+    void GenerateHWID()
     {
         std::wstring machineGuid;
         HKEY hKey = nullptr;
@@ -61,6 +94,8 @@ namespace
         {
             compName = compBuf;
         }
+
+        std::string identStr;
 
         // If reading MachineGuid or computer name fails, generate a fallback HWID
         if (machineGuid.empty() || compName.empty())
@@ -89,24 +124,37 @@ namespace
                     fallback += "_";
                     fallback += guidA;
                 }
-                uint32_t hash = FNV1a(fallback);
-                return (hash != 0) ? hash : 1;
+                identStr = fallback;
             }
+            else
+            {
+                identStr = GenerateUUID();
+            }
+        }
+        else
+        {
+            char guidA[256] = {0};
+            char compA[MAX_COMPUTERNAME_LENGTH + 1] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, machineGuid.c_str(), -1, guidA, sizeof(guidA), nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, compName.c_str(), -1, compA, sizeof(compA), nullptr, nullptr);
 
-            // Pseudo-random UUID fallback
-            std::string fallbackUUID = GenerateUUID();
-            uint32_t hash = FNV1a(fallbackUUID);
-            return (hash != 0) ? hash : 1;
+            identStr = std::string(guidA) + compA;
         }
 
-        char guidA[256] = {0};
-        char compA[MAX_COMPUTERNAME_LENGTH + 1] = {0};
-        WideCharToMultiByte(CP_UTF8, 0, machineGuid.c_str(), -1, guidA, sizeof(guidA), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, compName.c_str(), -1, compA, sizeof(compA), nullptr, nullptr);
+        memset(g_HWIDBinary, 0, sizeof(g_HWIDBinary));
+        if (!ComputeSHA256(identStr, g_HWIDBinary))
+        {
+            uint32_t f = FNV1a(identStr);
+            memcpy(g_HWIDBinary, &f, sizeof(f));
+        }
 
-        std::string combined = std::string(guidA) + compA;
-        uint32_t hash = FNV1a(combined);
-        return (hash != 0) ? hash : 1;
+        for (size_t i = 0; i < 32; ++i)
+        {
+            snprintf(&g_HWIDString[i * 2], 3, "%02x", g_HWIDBinary[i]);
+        }
+        g_HWIDString[64] = '\0';
+
+        memcpy(&g_HWID, g_HWIDBinary, sizeof(uint32_t));
     }
 }
 
@@ -138,6 +186,7 @@ namespace Identity
             g_ConfigPath = "appdata/zone_identity.ltx";
         }
 
+        std::string savedHwid;
         std::ifstream in(g_ConfigPath);
         if (in.is_open())
         {
@@ -145,11 +194,7 @@ namespace Identity
             while (std::getline(in, line))
             {
                 if (line.find("uuid=") == 0) g_UUID = line.substr(5);
-                else if (line.find("hwid=") == 0)
-                {
-                    try { g_HWID = std::stoul(line.substr(5)); }
-                    catch (...) { g_HWID = 0; }
-                }
+                else if (line.find("hwid=") == 0) savedHwid = line.substr(5);
                 else if (line.find("nickname=") == 0) g_Nickname = line.substr(9);
             }
         }
@@ -160,9 +205,11 @@ namespace Identity
             g_UUID = GenerateUUID();
             needSave = true;
         }
-        if (g_HWID == 0)
+
+        GenerateHWID();
+
+        if (savedHwid.length() != 64 || savedHwid != g_HWIDString)
         {
-            g_HWID = GenerateHWID();
             needSave = true;
         }
 
@@ -171,7 +218,40 @@ namespace Identity
     }
 
     std::string GetClientUUID() { return g_UUID; }
-    uint32_t GetHWIDHash() { return g_HWID; }
+
+    const uint8_t* GetHWIDBinary()
+    {
+        bool allZero = true;
+        for (int i = 0; i < 32; ++i)
+        {
+            if (g_HWIDBinary[i] != 0) { allZero = false; break; }
+        }
+        if (allZero)
+        {
+            GenerateHWID();
+        }
+        return g_HWIDBinary;
+    }
+
+    const uint8_t* GetHWID()
+    {
+        return GetHWIDBinary();
+    }
+
+    const char* GetHWIDString()
+    {
+        if (g_HWIDString[0] == '\0')
+        {
+            GenerateHWID();
+        }
+        return g_HWIDString;
+    }
+
+    uint32_t GetHWIDHash()
+    {
+        return g_HWID;
+    }
+
     std::string GetNickname() { return g_Nickname; }
 
     void SetNickname(const std::string& nick)
@@ -188,7 +268,7 @@ namespace Identity
         {
             out << "[identity]\n";
             out << "uuid=" << g_UUID << "\n";
-            out << "hwid=" << g_HWID << "\n";
+            out << "hwid=" << g_HWIDString << "\n";
             out << "nickname=" << g_Nickname << "\n";
         }
     }
