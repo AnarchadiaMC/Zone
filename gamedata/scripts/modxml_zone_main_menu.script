@@ -1,5 +1,6 @@
 local FILES = {
     [ [[ui\ui_mm_main_16.xml]] ] = true,
+    [ [[ui\ui_mm_main.xml]]    ] = true,
 }
 
 local LISTS = { "menu_main", "menu_main_last_save" }
