@@ -56,8 +56,11 @@ end
 -- ============================================================
 class "UIZoneServerList" (CUIScriptWnd)
 
-function UIZoneServerList:__init()
-    CUIScriptWnd.__init(self)
+function UIZoneServerList:__init(owner)
+    super()
+    self.owner     = owner
+    self:SetWndRect(Frect():set(0, 0, 1024, 768))
+    self:Enable(true)
     self.favorites = {}   -- list of { label = string, ip = string, port = number, status = string }
     self.sel_idx   = nil  -- currently selected 0-based list index
     self.uuid      = "anonymous"
@@ -75,69 +78,44 @@ end
 function UIZoneServerList:InitControls()
     self:SetAutoDelete(true)
 
-    local xml = (CScriptXmlInit and CScriptXmlInit()) or (CUIXml and CUIXml())
-    if not xml then
-        printf("Zone UI Error: Neither CScriptXmlInit nor CUIXml is available!")
-        return
-    end
+    local xml = CScriptXmlInit()
+    xml:ParseFile("zone_ui_server_list.xml")
 
-    if xml.ParseFile then
-        xml:ParseFile(DIALOG_XML)
-    elseif xml.Load then
-        xml:Load("config\\ui\\", DIALOG_XML)
-    end
+    self.background = xml:InitStatic("background", self)
+    xml:InitStatic("header_label", self)
+    xml:InitStatic("col_name", self)
+    xml:InitStatic("col_host", self)
+    xml:InitStatic("col_port", self)
+    xml:InitStatic("col_status", self)
+    xml:InitStatic("direct_label", self)
+    xml:InitStatic("ip_label", self)
+    xml:InitStatic("port_label", self)
+    xml:InitStatic("nick_label", self)
 
-    -- Background frame
-    safe_init(xml, "InitWindow", "background", 0, self)
+    self.list_servers = xml:InitListBox("list", self)
+    if self.list_servers then self:Register(self.list_servers, "server_list") end
 
-    -- Column header statics (optional decorative labels from XML)
-    safe_init(xml, "InitStatic", "header_label", self)
-    safe_init(xml, "InitStatic", "server_list_frame:col_name", self)
-    safe_init(xml, "InitStatic", "server_list_frame:col_host", self)
-    safe_init(xml, "InitStatic", "server_list_frame:col_port", self)
-    safe_init(xml, "InitStatic", "server_list_frame:col_status", self)
-    safe_init(xml, "InitStatic", "direct_label", self)
-    safe_init(xml, "InitStatic", "ip_label", self)
-    safe_init(xml, "InitStatic", "port_label", self)
-    safe_init(xml, "InitStatic", "nick_label", self)
-
-    -- Server list box (try server_list, then nested variants)
-    self.list_servers = safe_init(xml, "InitListBox", "server_list", self)
-        or safe_init(xml, "InitListBox", "server_list_frame:server_list", self)
-        or safe_init(xml, "InitListBox", "server_list_frame:list", self)
-
-    if self.list_servers then
-        self:Register(self.list_servers, "server_list")
-    else
-        printf("Zone UI Warning: server_list listbox could not be initialized!")
-    end
-
-    -- Direct connect input boxes
-    self.edit_ip = safe_init(xml, "InitEditBox", "edit_ip", self)
-        or safe_init(xml, "InitEditBox", "ip_edit", self)
-
-    self.edit_port = safe_init(xml, "InitEditBox", "edit_port", self)
-        or safe_init(xml, "InitEditBox", "port_edit", self)
-
-    self.edit_nick = safe_init(xml, "InitEditBox", "edit_nick", self)
-        or safe_init(xml, "InitEditBox", "nick_edit", self)
-
+    self.edit_ip = xml:InitEditBox("edit_ip", self)
     if self.edit_ip then self:Register(self.edit_ip, "edit_ip") end
+
+    self.edit_port = xml:InitEditBox("edit_port", self)
     if self.edit_port then self:Register(self.edit_port, "edit_port") end
+
+    self.edit_nick = xml:InitEditBox("edit_nick", self)
     if self.edit_nick then self:Register(self.edit_nick, "edit_nick") end
 
-    -- Action buttons
-    self.btn_connect = safe_init(xml, "Init3tButton", "btn_connect", self)
-    self.btn_add_fav = safe_init(xml, "Init3tButton", "btn_add_fav", self)
-    self.btn_del_fav = safe_init(xml, "Init3tButton", "btn_del_fav", self)
-    self.btn_back    = safe_init(xml, "Init3tButton", "btn_back", self)
-
+    self.btn_connect = xml:Init3tButton("btn_connect", self)
     if self.btn_connect then self:Register(self.btn_connect, "btn_connect") end
-    if self.btn_add_fav then self:Register(self.btn_add_fav, "btn_add_fav") end
-    if self.btn_del_fav then self:Register(self.btn_del_fav, "btn_del_fav") end
-    if self.btn_back then    self:Register(self.btn_back,    "btn_back") end
 
-    -- Load saved servers and nickname
+    self.btn_add_fav = xml:Init3tButton("btn_add_fav", self)
+    if self.btn_add_fav then self:Register(self.btn_add_fav, "btn_add_fav") end
+
+    self.btn_del_fav = xml:Init3tButton("btn_del_fav", self)
+    if self.btn_del_fav then self:Register(self.btn_del_fav, "btn_del_fav") end
+
+    self.btn_back = xml:Init3tButton("btn_back", self)
+    if self.btn_back then self:Register(self.btn_back, "btn_back") end
+
     self:LoadFavorites()
 end
 
@@ -539,11 +517,16 @@ end
 
 function UIZoneServerList:OnBack()
     self:HideDialog()
+    self:Show(false)
+    if self.owner then
+        self.owner:ShowDialog(true)
+        self.owner:Show(true)
+    end
 end
 
 function UIZoneServerList:OnKeyboard(dik, keyboard_action)
     CUIScriptWnd.OnKeyboard(self, dik, keyboard_action)
-    if dik == DIK_keys.DIK_ESCAPE and keyboard_action == 0 then
+    if keyboard_action == ui_events.WINDOW_KEY_PRESSED and dik == DIK_keys.DIK_ESCAPE then
         self:OnBack()
         return true
     end
@@ -556,15 +539,18 @@ end
 
 --- Instantiates and shows the server browser dialog.
 --- Called from zone_menu_patch or console/hotkey.
-function open_server_browser()
+function open_server_browser(owner)
     if not _server_browser_dlg then
-        _server_browser_dlg = UIZoneServerList()
+        _server_browser_dlg = UIZoneServerList(owner)
         _server_browser_dlg:InitControls()
         _server_browser_dlg:InitCallBacks()
     else
+        if owner then _server_browser_dlg.owner = owner end
         _server_browser_dlg:LoadFavorites()
     end
     _server_browser_dlg:ShowDialog(true)
+    _server_browser_dlg:Show(true)
+    return _server_browser_dlg
 end
 
 function get_dialog()

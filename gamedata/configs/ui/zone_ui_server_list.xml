@@ -1,87 +1,75 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<w x="0" y="0" width="1024" height="768">
+<w>
     <background x="163" y="84" width="698" height="600" stretch="1">
-        <texture>ui\ui_actor_multiplayer_game_menu</texture>
+        <texture>ui_inGame2_multiplayer_game_menu</texture>
     </background>
 
-    <header_label x="200" y="100" width="624" height="30" font="letterica18" align="c" color="gold">
-        <text>ZONE — SERVER BROWSER</text>
+    <header_label x="200" y="100" width="624" height="30">
+        <text align="c" font="letterica18" r="255" g="215" b="0">ZONE — SERVER BROWSER</text>
     </header_label>
 
-    <server_list_frame x="175" y="140" width="674" height="250">
-        <col_name x="0" y="0" width="280" height="20" font="letterica16"><text>Server Name</text></col_name>
-        <col_host x="280" y="0" width="220" height="20" font="letterica16"><text>Host / IP</text></col_host>
-        <col_port x="500" y="0" width="80" height="20" font="letterica16"><text>Port</text></col_port>
-        <col_status x="580" y="0" width="80" height="20" font="letterica16"><text>Status</text></col_status>
-        <list id="server_list" x="0" y="22" width="674" height="228" item_height="22" show_by_need="1">
-            <font font="letterica16" r="200" g="200" b="200" />
-            <text_color>
-                <e r="100" g="220" b="255" />
-                <d r="140" g="140" b="140" />
-            </text_color>
-        </list>
-    </server_list_frame>
+    <col_name x="185" y="138" width="240" height="20">
+        <text font="letterica16" r="200" g="200" b="200">Server Name</text>
+    </col_name>
+    <col_host x="430" y="138" width="180" height="20">
+        <text font="letterica16" r="200" g="200" b="200">Host / IP</text>
+    </col_host>
+    <col_port x="620" y="138" width="75" height="20">
+        <text font="letterica16" r="200" g="200" b="200">Port</text>
+    </col_port>
+    <col_status x="705" y="138" width="100" height="20">
+        <text font="letterica16" r="200" g="200" b="200">Status</text>
+    </col_status>
 
-    <direct_label x="175" y="400" width="300" height="22" font="letterica16"><text>Direct Connect:</text></direct_label>
-    <ip_label x="175" y="428" width="80" height="22" font="letterica16"><text>IP Address:</text></ip_label>
-    <edit_ip id="edit_ip" x="260" y="428" width="240" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>64</max_symb_count>
+    <list x="175" y="162" width="674" height="228" item_height="22">
+        <font font="letterica16" r="200" g="200" b="200"/>
+        <list_font font="letterica16" r="200" g="200" b="200"/>
+    </list>
+
+    <direct_label x="175" y="400" width="300" height="22">
+        <text font="letterica16" r="240" g="240" b="240">Direct Connect:</text>
+    </direct_label>
+
+    <ip_label x="175" y="428" width="80" height="22">
+        <text font="letterica16" r="200" g="200" b="200">IP Address:</text>
+    </ip_label>
+    <edit_ip x="260" y="426" width="240" height="26" max_symb_count="64">
+        <texture>ui_inGame2_edit_box_1</texture>
+        <text font="letterica16" r="230" g="230" b="230"/>
     </edit_ip>
-    <ip_edit id="ip_edit" x="260" y="428" width="240" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>64</max_symb_count>
-    </ip_edit>
 
-    <port_label x="175" y="458" width="80" height="22" font="letterica16"><text>Port:</text></port_label>
-    <edit_port id="edit_port" x="260" y="458" width="100" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>5</max_symb_count>
+    <port_label x="175" y="458" width="80" height="22">
+        <text font="letterica16" r="200" g="200" b="200">Port:</text>
+    </port_label>
+    <edit_port x="260" y="456" width="100" height="26" max_symb_count="5">
+        <texture>ui_inGame2_edit_box_1</texture>
+        <text font="letterica16" r="230" g="230" b="230"/>
     </edit_port>
-    <port_edit id="port_edit" x="260" y="458" width="100" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>5</max_symb_count>
-    </port_edit>
 
-    <nick_label x="175" y="488" width="80" height="22" font="letterica16"><text>Callsign:</text></nick_label>
-    <edit_nick id="edit_nick" x="260" y="488" width="200" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>32</max_symb_count>
+    <nick_label x="175" y="488" width="80" height="22">
+        <text font="letterica16" r="200" g="200" b="200">Callsign:</text>
+    </nick_label>
+    <edit_nick x="260" y="486" width="200" height="26" max_symb_count="24">
+        <texture>ui_inGame2_edit_box_1</texture>
+        <text font="letterica16" r="230" g="230" b="230"/>
     </edit_nick>
-    <nick_edit id="nick_edit" x="260" y="488" width="200" height="24">
-        <texture>ui_inGame2_edit_box</texture>
-        <font font="letterica16" />
-        <text_color r="230" g="230" b="230" />
-        <max_symb_count>32</max_symb_count>
-    </nick_edit>
 
-    <btn_connect id="btn_connect" x="175" y="524" width="140" height="36" font="letterica18">
-        <text>Connect</text>
-        <texture>ui\ui_common:ui_inGame2_button_e</texture>
+    <btn_connect x="175" y="524" width="140" height="34">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica18" align="c" vert_align="c">Connect</text>
     </btn_connect>
 
-    <btn_add_fav id="btn_add_fav" x="325" y="524" width="140" height="36" font="letterica18">
-        <text>Add Favorite</text>
-        <texture>ui\ui_common:ui_inGame2_button_e</texture>
+    <btn_add_fav x="325" y="524" width="140" height="34">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica18" align="c" vert_align="c">Add Favorite</text>
     </btn_add_fav>
 
-    <btn_del_fav id="btn_del_fav" x="475" y="524" width="155" height="36" font="letterica18">
-        <text>Remove Fav</text>
-        <texture>ui\ui_common:ui_inGame2_button_e</texture>
+    <btn_del_fav x="475" y="524" width="155" height="34">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica18" align="c" vert_align="c">Remove Fav</text>
     </btn_del_fav>
 
-    <btn_back id="btn_back" x="175" y="572" width="140" height="36" font="letterica18">
-        <text>Back</text>
-        <texture>ui\ui_common:ui_inGame2_button_e</texture>
+    <btn_back x="175" y="572" width="140" height="34">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica18" align="c" vert_align="c">Back</text>
     </btn_back>
 </w>

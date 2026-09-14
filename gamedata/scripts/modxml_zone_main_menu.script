@@ -24,6 +24,7 @@ local function inject_list(xml_obj, list_name)
     end)
     if already_there then return false end
 
+    -- Insert btn_zone_online before btn_quit (never delete xrRazom's btn_multiplayer)
     xml_obj:insertElement(BTN, list, pos)
     return true
 end
@@ -38,9 +39,44 @@ function inject_button(xml_file_name, xml_obj)
     if injected > 0 then
         log("[Zone-Online] menu: injected btn_zone_online into " .. xml_file_name)
     end
+
+    -- Query shniaga_wnd: set y = 350 (shifted up from 419) and height = 360 (expanded from 280 for 9 buttons)
+    local shniaga_nodes = xml_obj:query("shniaga_wnd")
+    if shniaga_nodes then
+        for _, el in ipairs(shniaga_nodes) do
+            if xml_obj.setElementAttr then
+                xml_obj:setElementAttr(el, { y = "350", height = "360" })
+            end
+            if el.attr then
+                el.attr.y = "350"
+                el.attr.height = "360"
+            end
+        end
+    end
+
+    -- Query static_disclaimer: set y = 705 (shifted down so it never collides with buttons)
+    local disclaimer_nodes = xml_obj:query("static_disclaimer")
+    if disclaimer_nodes then
+        for _, el in ipairs(disclaimer_nodes) do
+            if xml_obj.setElementAttr then
+                xml_obj:setElementAttr(el, { y = "705" })
+            end
+            if el.attr then
+                el.attr.y = "705"
+            end
+        end
+    end
 end
 
 function on_xml_read()
     RegisterScriptCallback("on_xml_read", inject_button)
-    RegisterScriptCallback("main_menu_on_init", zone_menu_patch.on_main_menu_init)
+
+    -- Defer main_menu_on_init registration: zone_menu_patch loads after gathering.
+    -- Use a wrapper that resolves the function at call time, not registration time.
+    RegisterScriptCallback("main_menu_on_init", function(menu)
+        if zone_menu_patch and zone_menu_patch.on_main_menu_init then
+            zone_menu_patch.on_main_menu_init(menu)
+        end
+    end)
+    log("[Zone-Online] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
 end

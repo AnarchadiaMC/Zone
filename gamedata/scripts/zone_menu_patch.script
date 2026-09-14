@@ -1,42 +1,36 @@
-module("zone_menu_patch", package.seeall)
-
 -- zone_menu_patch.script
 -- Handles the behavior of the "Zone" button injected by modxml_zone_main_menu.script.
 
--- ============================================================
--- on_main_menu_init callback
--- ============================================================
--- Called by dxml via modxml_zone_main_menu's registration of main_menu_on_init
+local mm_class = nil
+local function install_methods()
+    if mm_class then return end
+    local cls = ui_main_menu.main_menu
+    mm_class = cls
+    cls.OnButton_zone_online_clicked = function(self)
+        if self.zone_server_browser_dlg == nil then
+            if zone_ui_server_list and zone_ui_server_list.UIZoneServerList then
+                self.zone_server_browser_dlg = zone_ui_server_list.UIZoneServerList(self)
+                self.zone_server_browser_dlg:InitControls()
+                self.zone_server_browser_dlg:InitCallBacks()
+            end
+        else
+            self.zone_server_browser_dlg:LoadFavorites()
+        end
+        if self.zone_server_browser_dlg then
+            self.zone_server_browser_dlg:ShowDialog(true)
+            self.zone_server_browser_dlg:Show(true)
+            self:HideDialog()
+            self:Show(false)
+        end
+    end
+end
+
 function on_main_menu_init(menu)
     if not menu then return end
-
-    menu:AddCallback(
-        "btn_zone_online",
-        ui_events.BUTTON_CLICKED,
-        function()
-            if zone_ui_server_list and zone_ui_server_list.open_server_browser then
-                zone_ui_server_list.open_server_browser()
-            else
-                printf("Zone: zone_ui_server_list module not loaded!")
-            end
-        end,
-        menu
-    )
+    install_methods()
+    menu:AddCallback("btn_zone_online", ui_events.BUTTON_CLICKED, mm_class.OnButton_zone_online_clicked, menu)
 end
 
--- ============================================================
--- on_main_menu_quit fallback callback
--- ============================================================
-local function on_main_menu_quit(menu_obj)
-    -- Just for cleanup if needed in the future
-end
-
--- ============================================================
--- on_game_start — Anomaly script entrypoint
--- ============================================================
 function on_game_start()
-    -- Register any global cleanup callbacks for the main menu
-    if RegisterScriptCallback then
-        RegisterScriptCallback("main_menu_on_quit", on_main_menu_quit)
-    end
+    -- Optional global callbacks
 end

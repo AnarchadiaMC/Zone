@@ -115,29 +115,29 @@ namespace AssetProvisioner
         std::wstring root = GetGameRoot();
         if (root.empty()) return;
 
-        // 1. Iterate through compile-time embedded assets and write if missing
+        // 1. Iterate through compile-time embedded assets.
+        //    Script files and UI XML files are always overwritten (mod code and UI layout must match DLL).
+        //    Config files are written only if missing (preserve user customizations).
         for (size_t i = 0; i < g_EmbeddedAssetsCount; ++i)
         {
             const auto& asset = g_EmbeddedAssets[i];
             std::wstring fullPath = root + L"\\" + asset.relativePath;
-            WriteFileIfMissing(fullPath, std::string(asset.data, asset.size));
+            std::string content(asset.data, asset.size);
+
+            // Detect script files and UI XML files — always overwrite
+            std::wstring rel(asset.relativePath);
+            bool isScript = (rel.size() >= 7 && rel.compare(rel.size() - 7, 7, L".script") == 0);
+            bool isUiXml  = (rel.find(L"zone_ui_server_list.xml") != std::wstring::npos) ||
+                            (rel.find(L"configs\\ui\\") != std::wstring::npos);
+
+            if (isScript || isUiXml)
+                OverwriteFile(fullPath, content);
+            else
+                WriteFileIfMissing(fullPath, content);
         }
 
-        // 2. Sanitization: check if gamedata\\configs\\ui\\zone_ui_server_list.xml exists on disk
-        // and contains legacy '<btn_zone_online'. If found, overwrite it with clean server list XML.
+        // 2. UI layout enforcement: ensure zone_ui_server_list.xml is overwritten with the latest layout
         std::wstring xmlPath = root + L"\\gamedata\\configs\\ui\\zone_ui_server_list.xml";
-        if (FileExists(xmlPath))
-        {
-            std::ifstream in(xmlPath.c_str(), std::ios::in | std::ios::binary);
-            if (in.is_open())
-            {
-                std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-                in.close();
-                if (content.find("<btn_zone_online") != std::string::npos)
-                {
-                    OverwriteFile(xmlPath, std::string(g_CleanServerListXml, g_CleanServerListXmlSize));
-                }
-            }
-        }
+        OverwriteFile(xmlPath, std::string(g_CleanServerListXml, g_CleanServerListXmlSize));
     }
 }
