@@ -1,0 +1,45 @@
+local FILES = {
+    [ [[ui\ui_mm_main_16.xml]] ] = true,
+}
+
+local LISTS = { "menu_main", "menu_main_last_save" }
+
+local BTN = { name = "btn",
+              attr = { name = "btn_zone_online", caption = "ui_mm_zone_online" } }
+
+local function inject_list(xml_obj, list_name)
+    local list = xml_obj:query(list_name)[1]
+    if not list then return false end
+
+    local pos, already_there
+    xml_obj:iterateChildren(list, function(v, i)
+        local el = xml_obj:getElement(v)
+        local name = el and el.attr and el.attr.name
+        if name == "btn_zone_online" then
+            already_there = true
+            return true
+        end
+        if name == "btn_quit" then pos = i end
+    end)
+    if already_there then return false end
+
+    xml_obj:insertElement(BTN, list, pos)
+    return true
+end
+
+function inject_button(xml_file_name, xml_obj)
+    if not FILES[xml_file_name] then return end
+
+    local injected = 0
+    for _, list_name in ipairs(LISTS) do
+        if inject_list(xml_obj, list_name) then injected = injected + 1 end
+    end
+    if injected > 0 then
+        log("[Zone-Online] menu: injected btn_zone_online into " .. xml_file_name)
+    end
+end
+
+function on_xml_read()
+    RegisterScriptCallback("on_xml_read", inject_button)
+    RegisterScriptCallback("main_menu_on_init", zone_menu_patch.on_main_menu_init)
+end

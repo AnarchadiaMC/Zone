@@ -84,9 +84,4 @@
         <text>Back</text>
         <texture>ui\ui_common:ui_inGame2_button_e</texture>
     </btn_back>
-
-    <btn_zone_online x="40" y="548" width="215" height="30">
-        <texture>ui\ui_common:ui_inGame2_button_e</texture>
-        <text font="letterica18" r="255" g="255" b="255">Zone</text>
-    </btn_zone_online>
 </w>
