@@ -199,6 +199,9 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	sink.Reset()
 
 	// 2. Transform into Cordon Rookie Village: (-211.3, -20.2, -145.8, "l01_escape")
+	sess.Lock()
+	sess.LastTransformTime = time.Time{}
+	sess.Unlock()
 	ctIn := protocol.ClientTransform{
 		PosX: -211.3,
 		PosY: -20.2,
@@ -245,6 +248,9 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	sink.Reset()
 
 	// 3. Move back outside Rookie Village
+	sess.Lock()
+	sess.LastTransformTime = time.Time{}
+	sess.Unlock()
 	ctOut2 := protocol.ClientTransform{
 		PosX: 50.0,
 		PosY: 0.0,
