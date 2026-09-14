@@ -288,10 +288,11 @@ namespace
                         }
                         else if (hdr->opcode == (uint16_t)Opcode::SAFEZONE_STATE)
                         {
+                            static_assert(sizeof(SafeZoneState) == 33, "SafeZoneState must be exactly 33 bytes");
                             if (res >= (int)(sizeof(ZO_Header) + sizeof(SafeZoneState)))
                             {
                                 SafeZoneState* sz = (SafeZoneState*)(recvBuf + sizeof(ZO_Header));
-                                g_InSafeZone = (sz->locked != 0);
+                                g_InSafeZone.store(sz->locked != 0, std::memory_order_release);
                             }
                             
                             // Enqueue for Lua so zone_safezone.script receives it
@@ -405,6 +406,7 @@ namespace NetClient
             g_State = DISCONNECTED;
             g_SessionID = 0;
         }
+        g_InSafeZone.store(false, std::memory_order_release);
         g_StateCV.notify_all();
 
         if (sendDisconnect)
@@ -454,6 +456,7 @@ namespace NetClient
         g_LastConnectTime = g_ConnectStartTime - std::chrono::milliseconds(g_ConnectBackoffMs + 1);
         g_LastPacketReceivedTime = g_ConnectStartTime;
         g_SessionID = 0;
+        g_InSafeZone.store(false, std::memory_order_release);
         g_LastError.clear();
 
         g_State = CONNECTING;
@@ -520,7 +523,7 @@ namespace NetClient
     }
     
     bool IsConnected() { return g_State == CONNECTED; }
-    bool IsInSafeZone() { return g_InSafeZone; }
+    bool IsInSafeZone() { return g_InSafeZone.load(std::memory_order_acquire); }
     
     void GetSessionInfo(uint32_t& outSessionID, uint32_t& outPing)
     {

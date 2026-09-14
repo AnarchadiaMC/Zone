@@ -231,12 +231,16 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 		t.Fatalf("expected Opcode OpSafezoneState (0x0020), got 0x%04X", hdr.Opcode)
 	}
 
-	var sz SafezoneState
+	var sz protocol.SafezoneStatePayload
 	if err := binary.Read(r, binary.LittleEndian, &sz); err != nil {
 		t.Fatalf("failed to read SafezoneState payload: %v", err)
 	}
-	if sz.InSafeZone != 1 {
-		t.Errorf("expected InSafeZone 1, got %d", sz.InSafeZone)
+	if sz.Locked != 1 {
+		t.Errorf("expected Locked 1, got %d", sz.Locked)
+	}
+	zid := string(bytes.Trim(sz.ZoneID[:], "\x00"))
+	if zid != "sz_cordon_rookie" {
+		t.Errorf("expected ZoneID 'sz_cordon_rookie', got '%s'", zid)
 	}
 
 	// Verify spatial grid was also updated to new coordinates
@@ -274,10 +278,10 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	if hdrOut.Opcode != protocol.OpSafezoneState {
 		t.Fatalf("expected Opcode OpSafezoneState, got 0x%04X", hdrOut.Opcode)
 	}
-	var szOut SafezoneState
+	var szOut protocol.SafezoneStatePayload
 	_ = binary.Read(rOut, binary.LittleEndian, &szOut)
-	if szOut.InSafeZone != 0 {
-		t.Errorf("expected InSafeZone 0, got %d", szOut.InSafeZone)
+	if szOut.Locked != 0 {
+		t.Errorf("expected Locked 0, got %d", szOut.Locked)
 	}
 }
 

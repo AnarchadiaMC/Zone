@@ -89,6 +89,7 @@ struct SafeZoneState {
     uint8_t locked;
     char zoneID[32];
 };
+static_assert(sizeof(SafeZoneState) == 33, "SafeZoneState size must be exactly 33 bytes");
 
 struct WorldEvent {
     uint8_t eventType;

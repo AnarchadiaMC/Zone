@@ -28,11 +28,6 @@ type PacketRecorder interface {
 
 var activeSink PacketRecorder
 
-// SafezoneState carries safe zone transition state.
-type SafezoneState struct {
-	InSafeZone uint8
-}
-
 // LeaveAoI carries entity leave notification payload.
 type LeaveAoI struct {
 	SessionID uint32
@@ -333,8 +328,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
 
 			s.grid.Insert(sessID, sess.Position[0], sess.Position[2])
-			inSZ := (CheckSafeZone(sess.Position[0], sess.Position[1], sess.Position[2], sess.CurrentLevel) != nil)
+			szObj := CheckSafeZone(sess.Position[0], sess.Position[1], sess.Position[2], sess.CurrentLevel)
+			inSZ := (szObj != nil)
 			sess.InSafeZone = inSZ
+			if inSZ {
+				sess.SafeZoneID = szObj.ZoneID
+			}
 
 			s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
 		}
@@ -472,13 +471,23 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 
 				s.grid.Update(sessID, ct.PosX, ct.PosZ)
 
-				isSafe := (CheckSafeZone(ct.PosX, ct.PosY, ct.PosZ, level) != nil)
+				szObj := CheckSafeZone(ct.PosX, ct.PosY, ct.PosZ, level)
+				isSafe := (szObj != nil)
 				if isSafe != prevSafe {
 					sess.Lock()
 					sess.InSafeZone = isSafe
+					var zoneIDStr string
+					if isSafe {
+						zoneIDStr = szObj.ZoneID
+					}
+					sess.SafeZoneID = zoneIDStr
 					sess.Unlock()
 
-					s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, SafezoneState{InSafeZone: boolToUint8(isSafe)})
+					payload := protocol.SafezoneStatePayload{
+						Locked: boolToUint8(isSafe),
+					}
+					copy(payload.ZoneID[:], zoneIDStr)
+					s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, payload)
 
 					// Safe zone entry/exit flushes character transform immediately (Issue 19)
 					if uuid != "" {
