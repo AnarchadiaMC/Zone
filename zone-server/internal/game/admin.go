@@ -71,6 +71,13 @@ func (a *AdminServer) Authenticate(token string) bool {
 	return false
 }
 
+// checkToken validates a token without touching per-connection or global
+// auth state. The pipe/socket conn handler uses this so one client's `auth`
+// never unlocks other connections.
+func (a *AdminServer) checkToken(token string) bool {
+	return a.authToken == "" || a.authToken == token
+}
+
 func (a *AdminServer) IsAuthenticated() bool {
 	return a.authToken == "" || a.authenticated.Load()
 }
@@ -110,11 +117,14 @@ func (a *AdminServer) executeCommand(cmdLine string, isAuthed bool) string {
 		return "ERR invalid token\n"
 
 	case "status":
+		if a.authToken != "" && !isAuthed {
+			return "ERR unauthorized: authentication required\n"
+		}
 		active, tickRate, uptime := a.server.GetStats()
 		return fmt.Sprintf("OK active_sessions=%d tick_rate=%d uptime=%s\n", active, tickRate, uptime.Round(time.Second))
 
 	case "kick":
-		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+		if a.authToken != "" && !isAuthed {
 			return "ERR unauthorized: authentication required\n"
 		}
 		if args == "" {
@@ -130,7 +140,7 @@ func (a *AdminServer) executeCommand(cmdLine string, isAuthed bool) string {
 		return fmt.Sprintf("ERR session %d not found\n", sessID)
 
 	case "ban":
-		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+		if a.authToken != "" && !isAuthed {
 			return "ERR unauthorized: authentication required\n"
 		}
 		if args == "" {
@@ -148,7 +158,7 @@ func (a *AdminServer) executeCommand(cmdLine string, isAuthed bool) string {
 		return fmt.Sprintf("OK account %s banned: %s\n", uuid, reason)
 
 	case "broadcast":
-		if a.authToken != "" && !isAuthed && !a.authenticated.Load() {
+		if a.authToken != "" && !isAuthed {
 			return "ERR unauthorized: authentication required\n"
 		}
 		if args == "" {
@@ -231,12 +241,18 @@ func (a *AdminServer) handleConnection(conn io.ReadWriteCloser) {
 			if len(parts) > 1 {
 				token = strings.TrimSpace(parts[1])
 			}
-			if a.authToken == "" {
-				connAuthed = true
-				_, _ = conn.Write([]byte("OK no authentication required\n"))
-			} else if a.Authenticate(token) {
-				connAuthed = true
-				_, _ = conn.Write([]byte("OK authenticated\n"))
+			// Per-connection auth only: validate without touching the global
+			// flag so this client never unlocks other connections.
+			if a.checkToken(token) {
+				if a.authToken == "" {
+					connAuthed = true
+					_, _ = conn.Write([]byte("OK no authentication required\n"))
+				} else if token != "" {
+					connAuthed = true
+					_, _ = conn.Write([]byte("OK authenticated\n"))
+				} else {
+					_, _ = conn.Write([]byte("ERR usage: auth <token>\n"))
+				}
 			} else {
 				_, _ = conn.Write([]byte("ERR invalid token\n"))
 			}

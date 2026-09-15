@@ -5,16 +5,35 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	"zone-online/zone-server/internal/database"
+	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
 
 	"go.uber.org/zap"
 )
 
-// buildStashInteractPacket creates a fully-framed OpStashInteract UDP payload.
+// stashTestSeq provides unique increasing sequence numbers for stash test
+// packets. Required since the server now enforces per-session replay
+// protection (hdr.SequenceNum <= LastSequence is dropped): reusing a fixed
+// seq (e.g. two Takes with seq 1) would be treated as a replay, not a new
+// request.
+var stashTestSeq atomic.Uint32
+
+// buildStashInteractPacket creates a fully-framed OpStashInteract UDP payload
+// with a unique wire sequence number (see stashTestSeq).
 func buildStashInteractPacket(t *testing.T, stashID uint32, action uint8, section string, count uint16) []byte {
+	t.Helper()
+	return buildStashInteractPacketSeq(t, stashID, action, section, count, stashTestSeq.Add(1))
+}
+
+// buildStashInteractPacketSeq creates a fully-framed OpStashInteract UDP
+// payload with an explicit sequence number. Replay protection drops reliable
+// packets with seq <= the session's last seen seq, so consecutive sends in
+// one test must use increasing seq numbers.
+func buildStashInteractPacketSeq(t *testing.T, stashID uint32, action uint8, section string, count uint16, seq uint32) []byte {
 	t.Helper()
 
 	pkt := protocol.StashInteractPayload{
@@ -25,8 +44,8 @@ func buildStashInteractPacket(t *testing.T, stashID uint32, action uint8, sectio
 	copy(pkt.ItemSection[:], section)
 
 	var buf bytes.Buffer
-	if err := protocol.WritePacket(&buf, protocol.OpStashInteract, 1, protocol.FlagReliable, pkt); err != nil {
-		t.Fatalf("buildStashInteractPacket: WritePacket failed: %v", err)
+	if err := protocol.WritePacket(&buf, protocol.OpStashInteract, seq, protocol.FlagReliable, pkt); err != nil {
+		t.Fatalf("buildStashInteractPacketSeq: WritePacket failed: %v", err)
 	}
 	return buf.Bytes()
 }
@@ -90,6 +109,7 @@ func newTestServer(t *testing.T) (*Server, *fakeSink, *database.DB) {
 
 	logger := zap.NewNop()
 	s := &Server{
+		db:       db,
 		sessions: newFakeSessionManager(),
 		stashMgr: NewStashManager(db),
 		logger:   logger,
@@ -99,6 +119,20 @@ func newTestServer(t *testing.T) (*Server, *fakeSink, *database.DB) {
 	s.udp = sink.UDPListener()
 
 	return s, sink, db
+}
+
+// registerStashTestSession registers a player session for addr so stash
+// access checks (unknown-session / level / distance) can succeed.
+func registerStashTestSession(t *testing.T, s *Server, addr *net.UDPAddr, level string, pos [3]float32) {
+	t.Helper()
+	s.sessions.AddSession(&network.PlayerSession{
+		SessionID:    uint32(addr.Port),
+		AccountID:    "test-uuid-" + addr.String(),
+		UDPAddr:      addr,
+		CurrentLevel: level,
+		Position:     pos,
+		Health:       100,
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +220,7 @@ func TestHandleOpStashInteract_Open(t *testing.T) {
 	}
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9001}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{1.0, 2.0, 3.0})
 	raw := buildStashInteractPacket(t, stashID, 1 /*Open*/, "", 0)
 	s.HandlePacket(raw, addr)
 
@@ -210,6 +245,7 @@ func TestHandleOpStashInteract_Open_NotFound(t *testing.T) {
 	s, sink, _ := newTestServer(t)
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9002}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{0, 0, 0})
 	raw := buildStashInteractPacket(t, 9999 /*missing*/, 1, "", 0)
 	s.HandlePacket(raw, addr)
 
@@ -237,6 +273,7 @@ func TestHandleOpStashInteract_Take(t *testing.T) {
 	}
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9003}
+	registerStashTestSession(t, s, addr, "l02_garbage", [3]float32{0, 0, 0})
 	raw := buildStashInteractPacket(t, stashID, 2 /*Take*/, "ammo_9x18_fmj", 5)
 	s.HandlePacket(raw, addr)
 
@@ -272,6 +309,7 @@ func TestHandleOpStashInteract_Take_InsufficientCount(t *testing.T) {
 	}
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9004}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{0, 0, 0})
 	// Try to take 99 while only 1 exists.
 	raw := buildStashInteractPacket(t, stashID, 2, "bandage", 99)
 	s.HandlePacket(raw, addr)
@@ -298,6 +336,7 @@ func TestHandleOpStashInteract_Store(t *testing.T) {
 	}
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9005}
+	registerStashTestSession(t, s, addr, "l03_agroprom", [3]float32{0, 0, 0})
 	raw := buildStashInteractPacket(t, stashID, 3 /*Store*/, "medkit", 2)
 	s.HandlePacket(raw, addr)
 
@@ -329,6 +368,7 @@ func TestHandleOpStashInteract_UnknownAction(t *testing.T) {
 	s, sink, _ := newTestServer(t)
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9006}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{0, 0, 0})
 	raw := buildStashInteractPacket(t, 1, 99 /*unknown*/, "", 0)
 	s.HandlePacket(raw, addr)
 
@@ -338,5 +378,168 @@ func TestHandleOpStashInteract_UnknownAction(t *testing.T) {
 	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 2 {
 		t.Errorf("expected Status=2 (Error) for unknown action, got %d", resp.Status)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security: distance / passcode / unknown-session / no-duplication
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestHandleOpStashInteract_UnknownSessionRejected(t *testing.T) {
+	s, sink, db := newTestServer(t)
+
+	stashID := uint32(44)
+	itemsJSON, _ := json.Marshal([]StashItem{{Section: "medkit", Count: 1}})
+	if err := db.SaveStash(stashID, "l01_escape", 0, 0, 0, string(itemsJSON)); err != nil {
+		t.Fatalf("SaveStash failed: %v", err)
+	}
+
+	// No session registered for this addr — must get Status=2, not a silent drop.
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9010}
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 1, "", 0), addr)
+
+	if len(sink.sent) == 0 {
+		t.Fatal("expected a response packet for unknown session, got none")
+	}
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 2 {
+		t.Errorf("expected Status=2 (Error) for unknown session, got %d", resp.Status)
+	}
+}
+
+func TestHandleOpStashInteract_Take_TooFarRejected(t *testing.T) {
+	s, sink, db := newTestServer(t)
+
+	stashID := uint32(45)
+	itemsJSON, _ := json.Marshal([]StashItem{{Section: "ammo_9x18_fmj", Count: 10}})
+	if err := db.SaveStash(stashID, "l01_escape", 0, 0, 0, string(itemsJSON)); err != nil {
+		t.Fatalf("SaveStash failed: %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9011}
+	// 200m away on the same level — beyond the 5m interact radius.
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{200, 0, 0})
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 2, "ammo_9x18_fmj", 1), addr)
+
+	if len(sink.sent) == 0 {
+		t.Fatal("expected a response packet, got none")
+	}
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 2 {
+		t.Errorf("expected Status=2 (Error) for 200m Take, got %d", resp.Status)
+	}
+
+	// Contents must be untouched.
+	stash, err := s.stashMgr.GetStash(stashID)
+	if err != nil {
+		t.Fatalf("GetStash: %v", err)
+	}
+	var gotItems []StashItem
+	_ = json.Unmarshal(stash.Contents, &gotItems)
+	if len(gotItems) != 1 || gotItems[0].Count != 10 {
+		t.Errorf("expected untouched 10 ammo after rejected Take, got %+v", gotItems)
+	}
+}
+
+func TestHandleOpStashInteract_Take_WrongLevelRejected(t *testing.T) {
+	s, sink, db := newTestServer(t)
+
+	stashID := uint32(46)
+	itemsJSON, _ := json.Marshal([]StashItem{{Section: "bandage", Count: 2}})
+	if err := db.SaveStash(stashID, "l01_escape", 0, 0, 0, string(itemsJSON)); err != nil {
+		t.Fatalf("SaveStash failed: %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9012}
+	// Same position but different level.
+	registerStashTestSession(t, s, addr, "l02_garbage", [3]float32{0, 0, 0})
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 2, "bandage", 1), addr)
+
+	if len(sink.sent) == 0 {
+		t.Fatal("expected a response packet, got none")
+	}
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 2 {
+		t.Errorf("expected Status=2 (Error) for wrong-level Take, got %d", resp.Status)
+	}
+}
+
+func TestHandleOpStashInteract_WrongPasscodeRejected(t *testing.T) {
+	s, sink, db := newTestServer(t)
+
+	stashID := uint32(47)
+	itemsJSON, _ := json.Marshal([]StashItem{{Section: "medkit", Count: 2}})
+	if err := db.SaveStash(stashID, "l01_escape", 5, 0, 5, string(itemsJSON)); err != nil {
+		t.Fatalf("SaveStash failed: %v", err)
+	}
+	// SaveStash has no passcode param — set it directly.
+	if _, err := db.RawDB().Exec(`UPDATE world_stashes SET passcode = ? WHERE stash_id = ?`, "s3cret", stashID); err != nil {
+		t.Fatalf("failed to set passcode: %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9013}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{5, 0, 5})
+	// Wire protocol carries no passcode field, so the request authenticates
+	// with "" and must be rejected for a passcode-protected stash.
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 2, "medkit", 1), addr)
+
+	if len(sink.sent) == 0 {
+		t.Fatal("expected a response packet, got none")
+	}
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 2 {
+		t.Errorf("expected Status=2 (Error) for wrong passcode, got %d", resp.Status)
+	}
+
+	// Direct ValidateAccess sanity: correct passcode passes, wrong fails.
+	rec, err := db.GetStash(stashID)
+	if err != nil {
+		t.Fatalf("GetStash: %v", err)
+	}
+	if err := s.stashMgr.ValidateAccess(rec, [3]float32{5, 0, 5}, "l01_escape", "s3cret"); err != nil {
+		t.Errorf("ValidateAccess with correct passcode should pass, got %v", err)
+	}
+	if err := s.stashMgr.ValidateAccess(rec, [3]float32{5, 0, 5}, "l01_escape", "wrong"); err == nil {
+		t.Errorf("ValidateAccess with wrong passcode should fail")
+	}
+}
+
+func TestHandleOpStashInteract_Take_NoDuplication(t *testing.T) {
+	s, sink, db := newTestServer(t)
+
+	stashID := uint32(48)
+	itemsJSON, _ := json.Marshal([]StashItem{{Section: "bandage", Count: 1}})
+	if err := db.SaveStash(stashID, "l01_escape", 0, 0, 0, string(itemsJSON)); err != nil {
+		t.Fatalf("SaveStash failed: %v", err)
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9014}
+	registerStashTestSession(t, s, addr, "l01_escape", [3]float32{0, 0, 0})
+
+	// First Take of 1 succeeds.
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 2, "bandage", 1), addr)
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 0 {
+		t.Fatalf("first Take: expected Status=0, got %d", resp.Status)
+	}
+
+	// Second Take of 1 must fail — no duplication, no negative counts.
+	sink.Reset()
+	// Re-arm ACK accounting: HandlePacket sends an OpAck before the response,
+	// lastStashResponse skips it, so no extra setup needed.
+	// NOTE: seq 2 — replay protection drops reliable re-sends of seq 1.
+	s.HandlePacket(buildStashInteractPacket(t, stashID, 2, "bandage", 1), addr)
+	if resp := lastStashResponse(t, sink.sent); resp.Status != 2 {
+		t.Errorf("second Take: expected Status=2 (Error), got %d", resp.Status)
+	}
+
+	stash, err := s.stashMgr.GetStash(stashID)
+	if err != nil {
+		t.Fatalf("GetStash: %v", err)
+	}
+	var gotItems []StashItem
+	_ = json.Unmarshal(stash.Contents, &gotItems)
+	for _, it := range gotItems {
+		if it.Count < 0 {
+			t.Errorf("negative count detected: %+v", gotItems)
+		}
+		if it.Section == "bandage" {
+			t.Errorf("expected bandage fully removed, got %+v", gotItems)
+		}
 	}
 }

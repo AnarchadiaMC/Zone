@@ -217,18 +217,19 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10020}
 	sess := &network.PlayerSession{
-		SessionID: 100,
-		AccountID: "uuid-transform",
-		UDPAddr:   addr,
-		Position:  [3]float32{0, 0, 0},
+		SessionID:         100,
+		AccountID:         "uuid-transform",
+		UDPAddr:           addr,
+		Position:          [3]float32{0, 0, 0},
+		LastTransformTime: time.Now().Add(-1 * time.Second),
 	}
 	s.sessions.AddSession(sess)
 
-	// 1. Valid transform
+	// 1. Valid transform (physically plausible: ~14.3m in ~1s ≈ 14 m/s).
 	ctValid := protocol.ClientTransform{
-		PosX:      50.0,
+		PosX:      10.0,
 		PosY:      2.0,
-		PosZ:      120.0,
+		PosZ:      10.0,
 		Yaw:       4500,
 		Pitch:     0,
 		VelX:      300,
@@ -242,15 +243,15 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	pos := sess.Position
 	sess.Unlock()
-	if pos[0] != 50.0 || pos[1] != 2.0 || pos[2] != 120.0 {
-		t.Errorf("expected position [50, 2, 120], got %v", pos)
+	if pos[0] != 10.0 || pos[1] != 2.0 || pos[2] != 10.0 {
+		t.Errorf("expected position [10, 2, 10], got %v", pos)
 	}
 
 	// 2. S-09: Invalid transform with NaN
 	ctNaN := protocol.ClientTransform{
 		PosX: float32(math.NaN()),
 		PosY: 2.0,
-		PosZ: 120.0,
+		PosZ: 10.0,
 	}
 	rawNaN := buildTestPacket(t, protocol.OpClientTransform, 2, protocol.FlagUnreliable, ctNaN)
 	s.HandlePacket(rawNaN, addr)
@@ -258,7 +259,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterNaN := sess.Position
 	sess.Unlock()
-	if posAfterNaN[0] != 50.0 {
+	if posAfterNaN[0] != 10.0 {
 		t.Errorf("S-09 violation: position updated with NaN! Got %v", posAfterNaN)
 	}
 
@@ -266,7 +267,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	ctInf := protocol.ClientTransform{
 		PosX: float32(math.Inf(1)),
 		PosY: 2.0,
-		PosZ: 120.0,
+		PosZ: 10.0,
 	}
 	rawInf := buildTestPacket(t, protocol.OpClientTransform, 3, protocol.FlagUnreliable, ctInf)
 	s.HandlePacket(rawInf, addr)
@@ -274,7 +275,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterInf := sess.Position
 	sess.Unlock()
-	if posAfterInf[0] != 50.0 {
+	if posAfterInf[0] != 10.0 {
 		t.Errorf("S-09 violation: position updated with Inf! Got %v", posAfterInf)
 	}
 
@@ -290,7 +291,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterOOB := sess.Position
 	sess.Unlock()
-	if posAfterOOB[0] != 50.0 {
+	if posAfterOOB[0] != 10.0 {
 		t.Errorf("S-09 violation: position updated with out of bounds coord! Got %v", posAfterOOB)
 	}
 }

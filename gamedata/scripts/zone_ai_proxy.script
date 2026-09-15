@@ -3,7 +3,20 @@
 
 local ai_entities = {}
 
+-- Mutual exclusion with xrRazom co-op (mirrors zone_dummy.spawn_proxy):
+-- never spawn Zone puppets while co-op owns the world.
+local function xrr_active()
+    local active = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then active = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then active = true end
+    end)
+    return active
+end
+
 function on_entity_enter(pkt, offset)
+    if xrr_active() then return end
+    if not pkt or not offset then return end
     local eid, pos = zone_net.read_uint32_le(pkt, offset)
     local typ, pos = zone_net.read_uint8(pkt, pos)
     local section, pos = zone_net.read_string(pkt, pos, 32)
@@ -17,9 +30,32 @@ function on_entity_enter(pkt, offset)
     faction = faction:gsub("%z+", "")
     local health, pos = zone_net.read_uint8(pkt, pos)
     
-    if typ == 2 or typ == 3 then -- NPC or Mutant
-        local lvid = db.actor and db.actor:level_vertex_id() or 0
-        local gvid = db.actor and db.actor:game_vertex_id() or 0
+    -- typ 0 = AI squad (wire EntityType), 2/3 = legacy NPC/Mutant values.
+    if typ == 0 or typ == 2 or typ == 3 then
+        -- Resolve vertices at the ENTITY position (mirror zone_dummy.spawn_proxy).
+        -- Never use actor lvid/gvid (spawns cross-map puppets at wrong graph point).
+        -- No movement code here (server batch stream 0x0014 doesn't exist yet).
+        local ent_pos = nil
+        pcall(function() ent_pos = vector():set(x, y, z) end)
+        if not ent_pos then return end
+        local lvid = 0
+        local gvid = 0
+        pcall(function()
+            if ent_pos and level and level.vertex_id then
+                lvid = level.vertex_id(ent_pos) or 0
+            elseif db.actor then
+                lvid = db.actor:level_vertex_id()
+            end
+            -- level.vertex_id returns u32(-1) off-graph; never feed that to create.
+            if lvid == nil or lvid >= 0xFFFFFFFE then
+                lvid = (db.actor and db.actor:level_vertex_id()) or 0
+            end
+        end)
+        pcall(function()
+            if db.actor then
+                gvid = db.actor:game_vertex_id() or 0
+            end
+        end)
         
         -- L-17: Validate section name in system_ini before alife():create
         local sec = section
@@ -32,16 +68,18 @@ function on_entity_enter(pkt, offset)
             end
         end
         
-        local sim = alife()
+        local sim = nil
+        pcall(function() sim = alife() end)
         if not sim then return end
         
-        local se_obj = sim:create(sec, vector():set(x,y,z), lvid, gvid)
+        local se_obj = nil
+        pcall(function() se_obj = sim:create(sec, ent_pos, lvid, gvid) end)
         if se_obj then
             se_obj.is_zone_ai_proxy = true
             ai_entities[eid] = {
                 se_id = se_obj.id,
                 section = sec,
-                pos = vector():set(x,y,z),
+                pos = ent_pos,
                 faction = faction,
                 action = 0,
                 target_id = 0
@@ -90,33 +128,69 @@ function on_ai_action(pkt, offset)
 end
 
 function on_entity_leave(pkt, offset)
-    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    if not pkt or not offset then return end
+    local eid = nil
+    pcall(function() eid = zone_net.read_uint32_le(pkt, offset) end)
+    if not eid then return end
     local entity = ai_entities[eid]
     if entity then
-        local se = alife():object(entity.se_id)
-        if se then
-            alife():release(se, true)
-        end
+        -- Guarded: alife() is nil during level change (CTD today without this).
+        pcall(function()
+            local sim = nil
+            if alife then
+                local ok, res = pcall(alife)
+                if ok then sim = res end
+            end
+            if sim and entity.se_id then
+                local se = nil
+                pcall(function() se = sim:object(entity.se_id) end)
+                if se then
+                    pcall(function() sim:release(se, true) end)
+                end
+            end
+        end)
         ai_entities[eid] = nil
     end
 end
 
--- L-14: Release all spawned AI entities on level change and clear table
-function on_level_changing()
-    local sim = alife()
-    for eid, entity in pairs(ai_entities) do
-        if sim and entity.se_id then
-            local se = sim:object(entity.se_id)
-            if se then
-                sim:release(se, true)
+-- Release all puppets (shared by level-change and disconnect cleanup).
+local function release_all_puppets()
+    pcall(function()
+        local sim = nil
+        if alife then
+            local ok, res = pcall(alife)
+            if ok then sim = res end
+        end
+        for eid, entity in pairs(ai_entities) do
+            if sim and entity and entity.se_id then
+                local se = nil
+                pcall(function() se = sim:object(entity.se_id) end)
+                if se then
+                    pcall(function() sim:release(se, true) end)
+                end
             end
         end
-    end
+    end)
     ai_entities = {}
+end
+
+-- Public release entry so zone_net can reap puppets on co-op takeover.
+function release_puppets()
+    release_all_puppets()
+end
+
+-- L-14: Release all spawned AI entities on level change and clear table
+function on_level_changing()
+    release_all_puppets()
+end
+
+function on_disconnect()
+    release_all_puppets()
 end
 
 function on_game_start()
     if RegisterScriptCallback then
         RegisterScriptCallback("on_level_changing", on_level_changing)
+        RegisterScriptCallback("actor_on_net_destroy", on_disconnect)
     end
 end

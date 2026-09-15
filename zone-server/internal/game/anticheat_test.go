@@ -100,10 +100,16 @@ func TestAntiCheat_ValidateMove_DtBounds(t *testing.T) {
 		t.Fatalf("expected dt<0 to skip check, got valid=%v, reason=%q", valid, reason)
 	}
 
-	// dt > 2.0 should be skipped (e.g. client resume after freeze / map load pause)
+	// dt > 2.0 is clamped to dt = 2.0 for the speed computation (no bypass):
+	// a huge jump after a pause must still fail.
 	valid, reason = ac.ValidateMove(sess, [3]float32{500, 50, 500}, 2.5)
-	if !valid || reason != "" {
-		t.Fatalf("expected dt>2.0 to skip check, got valid=%v, reason=%q", valid, reason)
+	if valid {
+		t.Fatalf("expected dt>2.0 huge jump to be rejected via clamp, got valid")
+	}
+	// Small drift after a pause stays valid: 10m clamped to 2.0s = 5 m/s.
+	valid, reason = ac.ValidateMove(sess, [3]float32{10, 0, 0}, 2.5)
+	if !valid {
+		t.Fatalf("expected dt>2.0 small move to stay valid, got invalid: %q", reason)
 	}
 }
 

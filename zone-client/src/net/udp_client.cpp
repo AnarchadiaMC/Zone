@@ -307,6 +307,21 @@ namespace
                                 }
                             }
                         }
+                        else if (hdr->opcode == (uint16_t)Opcode::DISCONNECT)
+                        {
+                            // Server kick (KickSession): drop to DISCONNECTED so
+                            // Lua IsConnected() goes false, tick stops sending,
+                            // and the HUD hides. Previously a kicked client sat
+                            // CONNECTED until the 10s liveness timeout.
+                            {
+                                std::lock_guard<std::mutex> lock(g_StateMutex);
+                                g_LastError = "Disconnected by server (kick)";
+                                g_SessionID = 0;
+                                g_State = DISCONNECTED;
+                            }
+                            g_InSafeZone.store(false, std::memory_order_release);
+                            g_StateCV.notify_all();
+                        }
                         else if (hdr->opcode == (uint16_t)Opcode::SAFEZONE_STATE)
                         {
                             static_assert(sizeof(SafeZoneState) == 33, "SafeZoneState must be exactly 33 bytes");

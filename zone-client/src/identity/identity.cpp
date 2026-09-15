@@ -4,6 +4,7 @@
 #include <shlobj.h>
 #include <fstream>
 #include <sstream>
+#include <mutex>
 #include <rpc.h>
 #pragma comment(lib, "Rpcrt4.lib")
 #pragma comment(lib, "Advapi32.lib")
@@ -156,6 +157,13 @@ namespace
 
         memcpy(&g_HWID, g_HWIDBinary, sizeof(uint32_t));
     }
+
+    std::once_flag g_HwidOnce;
+
+    void EnsureHWID()
+    {
+        std::call_once(g_HwidOnce, GenerateHWID);
+    }
 }
 
 namespace Identity
@@ -206,7 +214,7 @@ namespace Identity
             needSave = true;
         }
 
-        GenerateHWID();
+        EnsureHWID();
 
         if (savedHwid.length() != 64 || savedHwid != g_HWIDString)
         {
@@ -221,15 +229,10 @@ namespace Identity
 
     const uint8_t* GetHWIDBinary()
     {
-        bool allZero = true;
-        for (int i = 0; i < 32; ++i)
-        {
-            if (g_HWIDBinary[i] != 0) { allZero = false; break; }
-        }
-        if (allZero)
-        {
-            GenerateHWID();
-        }
+        // Pure reader: one-time HWID computation is guarded by call_once.
+        // The lazy fallback is routed through the same once-flag so concurrent
+        // callers never race on g_HWIDBinary/g_HWIDString/g_HWID.
+        EnsureHWID();
         return g_HWIDBinary;
     }
 
@@ -240,15 +243,14 @@ namespace Identity
 
     const char* GetHWIDString()
     {
-        if (g_HWIDString[0] == '\0')
-        {
-            GenerateHWID();
-        }
+        // Pure reader: see GetHWIDBinary note; fallback via call_once only.
+        EnsureHWID();
         return g_HWIDString;
     }
 
     uint32_t GetHWIDHash()
     {
+        EnsureHWID();
         return g_HWID;
     }
 

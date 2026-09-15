@@ -33,6 +33,11 @@ end
 -- Resolve entity by ID (attacker lookup: db.actor, remote proxy, or level entity) (L-18)
 local function resolve_entity(id)
     if not id then return nil end
+    -- Never touch xrRazom co-op dummies (guarded; absent when co-op not installed).
+    local ok_dummy, is_dummy = pcall(function()
+        return XrrPlayers and XrrPlayers():IsPlayerDummy(id)
+    end)
+    if ok_dummy and is_dummy then return nil end
     if db.actor and (id == db.actor:id()) then
         return db.actor
     end
@@ -96,6 +101,10 @@ function spawn_proxy(session_id, pos, faction)
         elseif db.actor then
             lvid = db.actor:level_vertex_id()
         end
+        -- level.vertex_id returns u32(-1) off-graph; never feed that to create.
+        if lvid == nil or lvid >= 0xFFFFFFFE then
+            lvid = (db.actor and db.actor:level_vertex_id()) or 0
+        end
     end)
     pcall(function()
         if level and level.vertex_position then
@@ -132,13 +141,21 @@ end
 function despawn_proxy(session_id)
     local proxy = spawned_proxies[session_id]
     if proxy then
-        local sim = alife()
-        if sim and proxy.se_id then
-            local se_obj = sim:object(proxy.se_id)
-            if se_obj then
-                sim:release(se_obj, true)
+        -- Guarded: alife() is nil in menu / during level change.
+        pcall(function()
+            local sim = nil
+            if alife then
+                local ok, res = pcall(alife)
+                if ok then sim = res end
             end
-        end
+            if sim and proxy.se_id then
+                local se_obj = nil
+                pcall(function() se_obj = sim:object(proxy.se_id) end)
+                if se_obj then
+                    pcall(function() sim:release(se_obj, true) end)
+                end
+            end
+        end)
         spawned_proxies[session_id] = nil
     end
 end
@@ -294,11 +311,11 @@ end
 
 function on_snapshot(pkt, offset)
     local pkt_len = string.len(pkt)
-    -- count(1) + 20 bytes per entry; validate before walking (forged count safe)
+    -- count(1) + 22 bytes per SnapshotEntry; validate before walking (forged count safe)
     local count, pos = zone_net.read_uint8(pkt, offset)
     if not count then return end
     if count > 32 then count = 32 end
-    if pkt_len < (pos - 1) + count * 20 then return end
+    if pkt_len < (pos - 1) + count * 22 then return end
     for i = 1, count do
         local sid, pos2 = zone_net.read_uint32_le(pkt, pos)
         local x, pos3 = zone_net.read_float_le(pkt, pos2)
@@ -395,15 +412,22 @@ function on_entity_leave(pkt, offset)
 end
 
 function on_level_changing()
-    local sim = alife()
-    for sid, proxy in pairs(spawned_proxies) do
-        if sim and proxy.se_id then
-            local se_obj = sim:object(proxy.se_id)
-            if se_obj then
-                sim:release(se_obj, true)
+    pcall(function()
+        local sim = nil
+        if alife then
+            local ok, res = pcall(alife)
+            if ok then sim = res end
+        end
+        for sid, proxy in pairs(spawned_proxies) do
+            if sim and proxy.se_id then
+                local se_obj = nil
+                pcall(function() se_obj = sim:object(proxy.se_id) end)
+                if se_obj then
+                    pcall(function() sim:release(se_obj, true) end)
+                end
             end
         end
-    end
+    end)
     spawned_proxies = {}
     peer_factions = {}
 end

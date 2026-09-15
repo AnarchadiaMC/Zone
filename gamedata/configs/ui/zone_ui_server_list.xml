@@ -72,4 +72,8 @@
         <texture>ui_button_ordinary</texture>
         <text font="letterica18" align="c" vert_align="c">Back</text>
     </btn_back>
+
+    <status_label x="175" y="612" width="674" height="22">
+        <text font="letterica16" r="255" g="215" b="0">Status: Ready</text>
+    </status_label>
 </w>

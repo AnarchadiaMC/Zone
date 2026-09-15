@@ -29,7 +29,13 @@ local function inject_list(xml_obj, list_name)
     return true
 end
 
-function inject_button(xml_file_name, xml_obj)
+-- Coexistence fix: uniquely-named functions + chaining (see on_xml_read below).
+-- Captures any previously-defined SHARED globals before shadowing (shared-_G
+-- loader model; normally nil under X-Ray per-file setfenv isolation).
+local _prev_global_inject_button = rawget(_G, "inject_button")
+local _prev_global_on_xml_read = rawget(_G, "on_xml_read")
+
+function zone_inject_button(xml_file_name, xml_obj)
     if not FILES[xml_file_name] then return end
 
     local injected = 0
@@ -77,10 +83,23 @@ function inject_button(xml_file_name, xml_obj)
             end
         end
     end
+
+    -- Shared-_G fallback: if another mod's global inject_button was shadowed,
+    -- still run it so its button appears even if only our callback got registered.
+    if type(_prev_global_inject_button) == "function" and _prev_global_inject_button ~= zone_inject_button then
+        pcall(_prev_global_inject_button, xml_file_name, xml_obj)
+    end
 end
 
-function on_xml_read()
-    RegisterScriptCallback("on_xml_read", inject_button)
+-- NOTE: no `inject_button` alias is exported. Under X-Ray per-file isolation
+-- zone_inject_button is registered explicitly (line ~101); under a shared-_G
+-- loader an alias would clobber xrRazom's global with no back-chain on their
+-- side (they load first), silently losing btn_multiplayer. Nothing references
+-- modxml_zone_main_menu.inject_button externally (dxml dispatches on_xml_read).
+local _zone_modxml_chaining = false
+
+function zone_modxml_on_xml_read()
+    RegisterScriptCallback("on_xml_read", zone_inject_button)
 
     -- Defer main_menu_on_init registration: zone_menu_patch loads after gathering.
     -- Use a wrapper that resolves the function at call time, not registration time.
@@ -90,4 +109,31 @@ function on_xml_read()
         end
     end)
     log("[Zone-Online] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
+
+    -- Re-entrancy guard (protects against mutual A-calls-B-calls-A chains).
+    if _zone_modxml_chaining then return end
+    _zone_modxml_chaining = true
+
+    -- Chain to previously-defined shared global (shared-_G loader model).
+    if type(_prev_global_on_xml_read) == "function" and _prev_global_on_xml_read ~= zone_modxml_on_xml_read then
+        pcall(_prev_global_on_xml_read)
+    end
+
+    -- Explicit xrRazom coexistence (per-file namespace model): modxml_xrr_main_menu
+    -- sorts before modxml_zone_main_menu, so its on_xml_read has already run;
+    -- re-invoking is deduped by dxml_core's function-object check, but gives a
+    -- second chance if load order ever reverses. Never bypasses its
+    -- xrr_player_name guard (no DLL -> correctly no button).
+    local xrr = rawget(_G, "modxml_xrr_main_menu")
+    if xrr and type(xrr.on_xml_read) == "function" and xrr.on_xml_read ~= zone_modxml_on_xml_read then
+        if xrr.on_xml_read ~= _prev_global_on_xml_read then
+            pcall(xrr.on_xml_read)
+        end
+    end
+
+    _zone_modxml_chaining = false
+end
+
+function on_xml_read()
+    zone_modxml_on_xml_read()
 end

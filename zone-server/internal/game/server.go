@@ -248,6 +248,45 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 	}
 
+	// Replay protection: per-session LastSequence tracking.
+	// Reliable packets with seq <= LastSequence are duplicates/replays and
+	// are dropped after the ACK above (ACK still sent, processing skipped).
+	// Unreliable heartbeat/transform packets only update LastSequence when
+	// newer; stale ones are dropped.
+	if sess := s.sessions.GetByAddr(addr.String()); sess != nil && hdr.Opcode != protocol.OpAck {
+		if hdr.FlagsChannel&protocol.FlagReliable != 0 {
+			sess.Lock()
+			last := sess.LastSequence
+			if hdr.SequenceNum <= last {
+				sess.Unlock()
+				s.logger.Debug("Dropped replayed reliable packet",
+					zap.String("addr", addr.String()),
+					zap.Uint16("opcode", hdr.Opcode),
+					zap.Uint32("seq", hdr.SequenceNum),
+					zap.Uint32("last", last),
+				)
+				return
+			}
+			sess.LastSequence = hdr.SequenceNum
+			sess.Unlock()
+		} else if hdr.Opcode == protocol.OpHeartbeat || hdr.Opcode == protocol.OpClientTransform {
+			sess.Lock()
+			last := sess.LastSequence
+			if hdr.SequenceNum <= last {
+				sess.Unlock()
+				s.logger.Debug("Dropped stale unreliable packet",
+					zap.String("addr", addr.String()),
+					zap.Uint16("opcode", hdr.Opcode),
+					zap.Uint32("seq", hdr.SequenceNum),
+					zap.Uint32("last", last),
+				)
+				return
+			}
+			sess.LastSequence = hdr.SequenceNum
+			sess.Unlock()
+		}
+	}
+
 	switch hdr.Opcode {
 	case protocol.OpHandshakeReq:
 		var req protocol.HandshakeReq
@@ -287,29 +326,19 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
-			if s.cfg != nil && s.cfg.MaxPlayers > 0 && len(s.sessions.GetAll()) >= s.cfg.MaxPlayers {
-				s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
-				res := protocol.HandshakeRes{
-					Status:    1,
-					WorldTime: uint64(time.Now().Unix()),
-				}
-				tempSess := &network.PlayerSession{UDPAddr: addr}
-				s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
-				return
-			}
-
-			sessID := s.seq.Add(1)
-			token, _ := GenerateSessionToken()
-			sess := &network.PlayerSession{
-				SessionID:      sessID,
-				SessionToken:   token,
-				AccountID:      cleanUUID,
-				UDPAddr:        addr,
-				LastSeen:       time.Now(),
-				LastCheckpoint: time.Now(),
-				Health:         100.0,
-				CurrentLevel:   "l01_escape",
-			}
+		sessID := s.seq.Add(1)
+		token, _ := GenerateSessionToken()
+		sess := &network.PlayerSession{
+			SessionID:      sessID,
+			SessionToken:   token,
+			AccountID:      cleanUUID,
+			UDPAddr:        addr,
+			LastSeen:       time.Now(),
+			LastCheckpoint: time.Now(),
+			Health:         100.0,
+			CurrentLevel:   "l01_escape",
+			LastSequence:   hdr.SequenceNum,
+		}
 			if s.db != nil {
 				nick := nullTermString(req.Nickname[:])
 				if nick == "" {
@@ -340,7 +369,27 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
-			s.sessions.AddSession(sess)
+			// Atomic cap enforcement: check-and-insert under ONE mutex hold
+			// (closes TOCTOU across UDP workers). Same-addr reconnects replace
+			// the old entry instead of counting twice.
+			maxPlayers := 0
+			if s.cfg != nil {
+				maxPlayers = s.cfg.MaxPlayers
+			}
+			if maxPlayers > 0 {
+				if !s.sessions.TryAddCapped(sess, maxPlayers) {
+					s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
+					res := protocol.HandshakeRes{
+						Status:    1,
+						WorldTime: uint64(time.Now().Unix()),
+					}
+					tempSess := &network.PlayerSession{UDPAddr: addr}
+					s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+					return
+				}
+			} else {
+				s.sessions.AddSession(sess)
+			}
 
 			res := protocol.HandshakeRes{
 				Status:    0,
@@ -531,7 +580,19 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			return
 		}
 		sess := s.sessions.GetByAddr(addr.String())
-		if sess == nil || (pkt.SenderID != 0 && !AuthenticateSessionPacket(sess, pkt.SenderID, 0)) {
+		if sess == nil {
+			return
+		}
+		sess.Lock()
+		senderID := sess.SessionID
+		sess.Unlock()
+		// Reject forged sender IDs: SenderID must equal the sender's own
+		// session ID; SenderID == 0 is never valid from a client.
+		if pkt.SenderID == 0 || pkt.SenderID != senderID {
+			return
+		}
+		// Per-session chat rate limit: max 5 msgs / 5s, drop excess silently.
+		if !sess.AllowChat(time.Now()) {
 			return
 		}
 		// Extract text up to the declared length, capped at 255.
@@ -608,16 +669,108 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 
 		sess := s.sessions.GetByAddr(addr.String())
-		var sessionID uint32
-		if sess != nil {
-			sess.Lock()
-			sessionID = sess.SessionID
-			sess.Unlock()
+		if sess == nil {
+			s.logger.Warn("OpStashInteract: unknown session", zap.String("addr", addr.String()))
+			s.sendStashResponse(addr, protocol.StashResponsePayload{
+				StashID: pkt.StashID,
+				Status:  2,
+				Count:   pkt.Count,
+			})
+			return
 		}
+		sess.Lock()
+		sessionID := sess.SessionID
+		playerPos := sess.Position
+		playerLevel := sess.CurrentLevel
+		sess.Unlock()
 
 		stashID := pkt.StashID
 		section := nullTermString(pkt.ItemSection[:])
 		count := int(pkt.Count)
+
+		// Unknown action short-circuits before DB load (Status 2 semantics).
+		if pkt.Action != 1 && pkt.Action != 2 && pkt.Action != 3 {
+			s.logger.Warn("OpStashInteract: unknown action", zap.Uint8("action", pkt.Action))
+			s.sendStashResponse(addr, protocol.StashResponsePayload{
+				StashID: stashID,
+				Status:  2,
+				Count:   pkt.Count,
+			})
+			return
+		}
+
+		// Load stash record for access validation.
+		var rec *database.StashRecord
+		if s.db != nil {
+			r, err := s.db.GetStash(stashID)
+			if err != nil {
+				s.sendStashResponse(addr, protocol.StashResponsePayload{
+					StashID: stashID,
+					Status:  1,
+					Count:   pkt.Count,
+				})
+				return
+			}
+			rec = r
+		} else if s.stashMgr != nil {
+			data, err := s.stashMgr.GetStash(stashID)
+			if err != nil {
+				status := uint8(2)
+				if err == ErrStashNotFound {
+					status = 1
+				}
+				s.sendStashResponse(addr, protocol.StashResponsePayload{
+					StashID: stashID,
+					Status:  status,
+					Count:   pkt.Count,
+				})
+				return
+			}
+			rec = &database.StashRecord{
+				StashID:   data.StashID,
+				LevelName: data.LevelName,
+				PosX:      data.PosX,
+				PosY:      data.PosY,
+				PosZ:      data.PosZ,
+				OwnerUUID: data.OwnerUUID,
+				Passcode:  data.Passcode,
+			}
+		} else {
+			s.sendStashResponse(addr, protocol.StashResponsePayload{
+				StashID: stashID,
+				Status:  2,
+				Count:   pkt.Count,
+			})
+			return
+		}
+
+		// Enforce proximity / level / passcode. NOTE: the wire protocol
+		// currently carries no passcode field, so fail closed with "" —
+		// passcode-protected stashes reject until the protocol is extended.
+		if s.stashMgr == nil {
+			s.sendStashResponse(addr, protocol.StashResponsePayload{
+				StashID: stashID,
+				Status:  2,
+				Count:   pkt.Count,
+			})
+			return
+		}
+		if verr := s.stashMgr.ValidateAccess(rec, playerPos, playerLevel, ""); verr != nil {
+			status := uint8(2)
+			if verr == ErrStashNotFound {
+				status = 1
+			}
+			s.logger.Warn("OpStashInteract: access denied",
+				zap.Uint32("stash_id", stashID),
+				zap.Uint32("session_id", sessionID),
+				zap.Error(verr))
+			s.sendStashResponse(addr, protocol.StashResponsePayload{
+				StashID: stashID,
+				Status:  status,
+				Count:   pkt.Count,
+			})
+			return
+		}
 
 		var status uint8
 		var contents []byte
@@ -762,6 +915,9 @@ func (s *Server) Tick(now time.Time) {
 				s.ackQueue.RemoveByAddr(addrStr)
 			}
 			s.sessions.RemoveSession(sessID)
+			if s.anticheat != nil {
+				s.anticheat.ViolationReset(sessID)
+			}
 			if uuid != "" && dirty {
 				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
 			}
@@ -883,7 +1039,27 @@ func (s *Server) QueuePeriodicStats(uuid string, playTimeDeltaSec int) {
 
 func (s *Server) BroadcastChat(senderID uint32, msg string) {
 	pkt := protocol.NewChatText(senderID, msg)
+	// Restrict player chat to the sender's CurrentLevel only.
+	// Server-originated broadcasts (senderID 0, e.g. admin) still go to all.
+	var senderLevel string
+	hasSender := false
+	if senderID != 0 {
+		if sender := s.sessions.GetByID(senderID); sender != nil {
+			sender.Lock()
+			senderLevel = sender.CurrentLevel
+			sender.Unlock()
+			hasSender = true
+		}
+	}
 	for _, sess := range s.sessions.GetAll() {
+		if hasSender {
+			sess.Lock()
+			same := sess.CurrentLevel == senderLevel
+			sess.Unlock()
+			if !same {
+				continue
+			}
+		}
 		s.SendToSession(sess, protocol.OpChatText, protocol.FlagReliable, pkt)
 	}
 }
@@ -926,6 +1102,11 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	s.grid.Remove(sessionID)
 	s.aoi.RemoveSession(sessionID)
 	s.sessions.RemoveSession(sessionID)
+	// Violation state is keyed by session ID: clear it so a later session
+	// reusing this ID starts clean (see AntiCheatManager.ViolationReset).
+	if s.anticheat != nil {
+		s.anticheat.ViolationReset(sessionID)
+	}
 	return true
 }
 

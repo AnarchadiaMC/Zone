@@ -3,16 +3,25 @@ package game
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"sync"
 
 	"zone-online/zone-server/internal/database"
 )
 
 var (
-	ErrStashNotFound     = errors.New("stash not found")
-	ErrItemNotFoundStash = errors.New("item not found in stash")
-	ErrInsufficientCount = errors.New("insufficient item count in stash")
+	ErrStashNotFound      = errors.New("stash not found")
+	ErrItemNotFoundStash  = errors.New("item not found in stash")
+	ErrInsufficientCount  = errors.New("insufficient item count in stash")
+	ErrStashAccessDenied  = errors.New("stash access denied")
+	ErrStashWrongLevel    = errors.New("player on wrong level for stash")
+	ErrStashTooFar        = errors.New("player too far from stash")
+	ErrStashWrongPasscode = errors.New("invalid stash passcode")
 )
+
+// MaxStashInteractDistance is the maximum 3D distance (meters) allowed
+// between a player and a stash for any interaction.
+const MaxStashInteractDistance = 5.0
 
 type StashData struct {
 	StashID   uint32  `json:"stash_id"`
@@ -35,6 +44,7 @@ type StashItem struct {
 type StashManager struct {
 	db           *database.DB
 	mu           sync.RWMutex
+	rmwMu        sync.Mutex
 	openSessions map[uint32]uint32 // sessionID -> stashID
 }
 
@@ -105,8 +115,37 @@ func (m *StashManager) SaveStash(stashID uint32, level string, x, y, z float32, 
 }
 
 
+// ValidateAccess enforces proximity, level, and passcode checks for a stash.
+// It returns nil when playerPos/playerLevel/passcode are authorized to
+// interact with stash, or a sentinel error otherwise:
+//   - ErrStashNotFound when stash is nil
+//   - ErrStashWrongLevel when levels differ
+//   - ErrStashTooFar when 3D distance exceeds MaxStashInteractDistance (5m)
+//   - ErrStashWrongPasscode when stash.Passcode != "" and does not match
+func (m *StashManager) ValidateAccess(stash *database.StashRecord, playerPos [3]float32, playerLevel string, passcode string) error {
+	if stash == nil {
+		return ErrStashNotFound
+	}
+	if stash.LevelName != playerLevel {
+		return ErrStashWrongLevel
+	}
+	dx := float64(playerPos[0] - stash.PosX)
+	dy := float64(playerPos[1] - stash.PosY)
+	dz := float64(playerPos[2] - stash.PosZ)
+	if math.Sqrt(dx*dx+dy*dy+dz*dz) > MaxStashInteractDistance {
+		return ErrStashTooFar
+	}
+	if stash.Passcode != "" && passcode != stash.Passcode {
+		return ErrStashWrongPasscode
+	}
+	return nil
+}
+
 // OpenStash marks the stash as opened by sessionID and returns its contents.
 func (m *StashManager) OpenStash(stashID uint32, sessionID uint32) ([]byte, error) {
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
+
 	stash, err := m.GetStash(stashID)
 	if err != nil {
 		return nil, err
@@ -142,6 +181,10 @@ func (m *StashManager) ModifyStashItem(stashID uint32, itemSection string, count
 	if err != nil {
 		return err
 	}
+
+	// Serialize read-modify-write to close TOCTOU races (concurrent Take/Store).
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
 
 	rec, err := db.GetStash(stashID)
 	if err != nil {

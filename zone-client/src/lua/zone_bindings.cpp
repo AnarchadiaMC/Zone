@@ -1,6 +1,7 @@
 #include "../net/udp_client.h"
 #include <windows.h>
 #include <cstdint>
+#include <string>
 
 extern "C" {
 
@@ -85,6 +86,16 @@ extern "C" {
     __declspec(dllexport) void ZN_SendChatText(const char* text)
     {
         NetClient::SendChatText(text ? text : "");
+    }
+
+    __declspec(dllexport) const char* ZN_GetLastError()
+    {
+        // thread_local cache: GetLastError() returns std::string by value, so
+        // returning .c_str() of a temporary would dangle. The cache lives as
+        // long as the calling (Lua main) thread; each call refreshes it.
+        thread_local std::string cache;
+        cache = NetClient::GetLastError();
+        return cache.c_str();
     }
 
 }

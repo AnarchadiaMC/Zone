@@ -28,17 +28,26 @@ end
 
 local function handle_emission_warn(timer)
     emission_timer = timer
-    if db.actor then
+    if not db.actor then return end
+    pcall(function()
         local msg = "ZONE EMISSION IN " .. tostring(timer) .. " SECONDS - FIND SHELTER"
         db.actor:give_game_news("Anomaly Detected", msg, "ui_inGame2_Vibros", 0, 10000, 0)
-        -- Play sound if possible (L-20: verify snd is non-nil before playing)
-        if current_snd and current_snd:playing() then
-            pcall(function() current_snd:stop() end)
+    end)
+    -- Stop previous siren (guarded; object may be invalid after level change).
+    pcall(function()
+        if current_snd and current_snd.playing and current_snd:playing() then
+            current_snd:stop()
         end
+    end)
+    -- sound_object is an unverified Anomaly-script global; nil-guard + pcall.
+    if sound_object then
         local ok, snd = pcall(sound_object, "characters_voice\\scenario\\video\\emission_siren")
         if ok and snd then
             current_snd = snd
-            snd:play(db.actor, 0, sound_object.s2d)
+            pcall(function()
+                local s2d = (sound_object and sound_object.s2d) or 0
+                snd:play(db.actor, 0, s2d)
+            end)
         end
     end
 end
@@ -46,12 +55,17 @@ end
 local function handle_emission_active()
     active_emission = true
     emission_timer = 0
-    if xr_effects and xr_effects.start_surge then
-        -- Trigger anomaly surge
-        xr_effects.start_surge(db.actor, nil, {})
-    else
+    -- xr_effects is an unverified Anomaly-script global; nil-guard + pcall (CTD risk).
+    local started = false
+    if xr_effects and xr_effects.start_surge and db.actor then
+        local ok, _ = pcall(function() xr_effects.start_surge(db.actor, nil, {}) end)
+        if ok then started = true end
+    end
+    if not started then
         -- Manual fallback
-        level.set_weather("emission", true)
+        pcall(function()
+            if level and level.set_weather then level.set_weather("emission", true) end
+        end)
     end
 end
 
@@ -60,36 +74,50 @@ local function handle_emission_clear()
     emission_timer = 0
     -- L-27: Avoid double weather change on emission clear
     local ended = false
-    if surge_manager and surge_manager.get_surge_manager then
-        local sm = surge_manager.get_surge_manager()
-        if sm and sm.end_surge then
-            sm:end_surge(true)
-            ended = true
+    pcall(function()
+        if surge_manager and surge_manager.get_surge_manager then
+            local sm = surge_manager.get_surge_manager()
+            if sm and sm.end_surge then
+                sm:end_surge(true)
+                ended = true
+            end
         end
-    end
+    end)
     if not ended then
-        level.set_weather("default", true)
+        pcall(function()
+            if level and level.set_weather then level.set_weather("default", true) end
+        end)
     end
 end
 
 local function handle_raid_start()
     if db.actor then
-        db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        pcall(function()
+            db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        end)
     end
 end
 
 local function handle_raid_end()
     if db.actor then
-        db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        pcall(function()
+            db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+        end)
     end
 end
 
 function on_world_event(pkt, offset)
-    local event_type, pos = zone_net.read_uint8(pkt, offset)
-    local state, pos = zone_net.read_uint8(pkt, pos)
-    local timer, pos = zone_net.read_uint32_le(pkt, pos)
+    if not pkt or not offset then return end
+    local event_type, pos = nil, nil
+    local state, timer = nil, nil
+    local ok_parse = pcall(function()
+        event_type, pos = zone_net.read_uint8(pkt, offset)
+        state, pos = zone_net.read_uint8(pkt, pos)
+        timer, pos = zone_net.read_uint32_le(pkt, pos)
+    end)
+    if not ok_parse or not event_type then return end
     
-    if event_type == 0 then -- Emission
+    if event_type == 0 then -- Emission (state 1-3)
         if state == 1 then -- Warning
             handle_emission_warn(timer)
         elseif state == 2 then -- Active
@@ -97,13 +125,8 @@ function on_world_event(pkt, offset)
         elseif state == 3 then -- Clear
             handle_emission_clear()
         end
-    -- Backward compatibility for direct event_type values (1..5)
-    elseif event_type == 1 then -- EMISSION_WARN
-        handle_emission_warn(timer)
-    elseif event_type == 2 then -- EMISSION_ACTIVE
-        handle_emission_active()
-    elseif event_type == 3 then -- EMISSION_CLEAR
-        handle_emission_clear()
+    -- NOTE: legacy event_type 1..3 compat removed: collides with future Psi-Storm typing.
+    -- Use type 0/state 1-3 for emission; type 4/5 for raids only.
     elseif event_type == 4 then -- RAID_START
         handle_raid_start()
     elseif event_type == 5 then -- RAID_END

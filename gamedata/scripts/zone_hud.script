@@ -140,6 +140,12 @@ local function update_hud_display(text, color)
     s:Show(true)
 end
 
+local function hide_hud_display()
+    if hud_static and hud_static.Show then
+        pcall(function() hud_static:Show(false) end)
+    end
+end
+
 -- ============================================================
 -- actor_on_update Handler
 -- ============================================================
@@ -166,8 +172,13 @@ local function on_actor_update()
 
     local connected, sid, ping, status_text, status_color = get_status_data()
 
-    -- Update corner HUD text overlay
-    update_hud_display(status_text, status_color)
+    -- Hide overlay when NOT connected (offline/singleplayer); 1 Hz check.
+    if not connected then
+        hide_hud_display()
+    else
+        -- Update corner HUD text overlay
+        update_hud_display(status_text, status_color)
+    end
 
     -- Connection transition notifications
     if is_dll_loaded() then
@@ -199,15 +210,19 @@ end
 
 --- Called when safe zone state changes (e.g. from zone_safezone.script).
 --- @param locked boolean  true = entered safe zone, false = left safe zone
-function notify_safezone(locked)
+--- @param zone_id string|nil  safe zone id (optional; backward compat with 1-arg calls)
+function notify_safezone(locked, zone_id)
     local is_locked = (locked == true or locked == 1)
+    local zid = (type(zone_id) == "string" and zone_id ~= "") and zone_id or ""
 
     if is_locked and not safe_zone_active then
         safe_zone_active = true
         if db.actor then
+            local enter_text = "[Safe Zone] Weapons locked — peaceful territory"
+            if zid ~= "" then enter_text = enter_text .. " (" .. zid .. ")" end
             db.actor:give_game_news(
                 "Zone",
-                "[Safe Zone] Weapons locked — peaceful territory",
+                enter_text,
                 "ui_inGame2_PDA_icon",
                 0, 5000, 1
             )

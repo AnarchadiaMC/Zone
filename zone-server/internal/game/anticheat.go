@@ -36,14 +36,20 @@ func NewAntiCheatManager(logger ...*zap.Logger) *AntiCheatManager {
 // ValidateMove checks whether a position delta is physically plausible.
 //
 // dt is the elapsed time since the session last packet, in seconds.
-// Returns (valid, reason). When dt <= 0 or dt > 2.0 the check is skipped (first packet or resume after pause).
+// Returns (valid, reason). When dt <= 0 the check is skipped (first packet).
+// When dt > 2.0 the delta is clamped to dt = 2.0 for the speed computation
+// so huge jumps after a pause still fail instead of bypassing validation.
 func (ac *AntiCheatManager) ValidateMove(sess *network.PlayerSession, newPos [3]float32, dt float32) (bool, string) {
-	if dt <= 0 || dt > 2.0 {
+	if dt <= 0 {
 		return true, ""
 	}
 
 	if sess == nil {
 		return false, "invalid session"
+	}
+
+	if dt > 2.0 {
+		dt = 2.0
 	}
 
 	sess.Lock()
@@ -107,4 +113,14 @@ func (ac *AntiCheatManager) Reset(sessionID uint32) {
 	ac.mu.Lock()
 	delete(ac.violations, sessionID)
 	ac.mu.Unlock()
+}
+
+// ViolationReset clears the violation record for a session.
+//
+// Intended call sites (not wired here to keep this change scoped):
+// Server.KickSession and the stale-session timeout cleanup path in
+// Server.Tick (server.go) should call ViolationReset when a session is
+// removed so a reconnecting client starts with a clean slate.
+func (ac *AntiCheatManager) ViolationReset(sessionID uint32) {
+	ac.Reset(sessionID)
 }

@@ -4,6 +4,8 @@
 local in_safe_zone = false
 local safe_zone_active = false
 local safe_zone_id = ""
+local last_reholster_time = 0
+local REHOLSTER_INTERVAL_MS = 1000 -- 1 Hz max re-holster (never every frame)
 
 --- Handles server packet PKT_SAFEZONE_STATE (opcode 0x0020).
 --- @param pkt string  raw network packet buffer
@@ -38,6 +40,8 @@ function on_safezone_state(pkt, offset)
 end
 
 --- Prevents all damage to the actor while inside a safe zone.
+--- NOTE: draftsman/safe-position consideration deliberately omitted here
+--- (would need unverified position APIs; do NOT call them from this callback).
 function on_before_hit(npc, s_hit, bone_id)
     if not db.actor then return end
     if not safe_zone_active and not in_safe_zone then return end
@@ -48,8 +52,9 @@ function on_before_hit(npc, s_hit, bone_id)
             if s_hit then
                 s_hit.power = 0
             end
-        elseif npc and npc.power then
-            npc.power = 0
+        elseif npc and s_hit then
+            -- FIX: zero the hit power (s_hit), not npc.power (wrong object).
+            s_hit.power = 0
         end
     end)
 end
@@ -71,14 +76,21 @@ function on_key_press(key)
 end
 
 --- Periodically ensures weapons stay holstered while in safe zone.
+--- NOTE: weapon_safemode API from the old spec does not exist in this engine
+--- build, so hide_weapon/restore_weapon (guarded by pcall + nil check) is the
+--- correct fallback. Throttled to at most 1 Hz (not every frame).
 local function on_actor_update()
     if not (safe_zone_active or in_safe_zone) or not db.actor then return end
 
     pcall(function()
+        local tg = 0
+        if time_global then tg = time_global() end
+        if tg - last_reholster_time < REHOLSTER_INTERVAL_MS then return end
         local wpn = db.actor:active_item()
         if (IsWeapon and wpn and IsWeapon(wpn)) or (wpn and wpn.is_weapon and wpn:is_weapon()) then
             if db.actor and db.actor.hide_weapon then
                 db.actor:hide_weapon()
+                last_reholster_time = tg
             end
         end
     end)
@@ -89,6 +101,7 @@ function reset()
     safe_zone_active = false
     in_safe_zone = false
     safe_zone_id = ""
+    last_reholster_time = 0
     if zone_hud and zone_hud.notify_safezone then
         pcall(function() zone_hud.notify_safezone(false, "") end)
     end

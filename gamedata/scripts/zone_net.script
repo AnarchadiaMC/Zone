@@ -31,6 +31,7 @@ ffi.cdef[[
     bool ZN_IsConnected();
     void ZN_GetSessionInfo(uint32_t* sessionID, uint32_t* ping);
     void ZN_SendChatText(const char* text);
+    const char* ZN_GetLastError();
 ]]
 
 -- L-31: Pre-allocated FFI buffers at file/module scope
@@ -48,10 +49,14 @@ function is_client_loaded()
     return zone_client ~= nil
 end
 
+-- Tracks co-op-takeover cleanup so dormant-branch release runs once.
+local xrr_was_active = false
+
 -- L-06: Exported reset_state for reconnecting
 function reset_state()
     last_tick = 0
     last_pos = nil
+    xrr_was_active = false
 end
 
 -- Polyfill ZoneNet global object for compatibility
@@ -89,6 +94,15 @@ function ZoneNet:GetSessionInfo()
 end
 function ZoneNet:SendChatText(text)
     if zone_client then zone_client.ZN_SendChatText(text) end
+end
+function ZoneNet:GetLastError()
+    if not zone_client then return "" end
+    local ok, err = pcall(function() return zone_client.ZN_GetLastError() end)
+    if ok and err then
+        local ok2, s = pcall(function() return ffi.string(err) end)
+        if ok2 and s then return s end
+    end
+    return ""
 end
 function ZoneNet:IsClientLoaded()
     return is_client_loaded()
@@ -134,9 +148,30 @@ function dispatch_packet(pkt)
     if opcode == 0x0011 then
         zone_dummy.on_snapshot(pkt, offset)
     elseif opcode == 0x0012 then
+        -- Fan out to BOTH player proxies (typ 1) and AI puppets (typ 0/2/3);
+        -- each handler filters by type. No live server sender yet (dormant).
         zone_dummy.on_entity_enter(pkt, offset)
+        if zone_ai_proxy and zone_ai_proxy.on_entity_enter then
+            pcall(zone_ai_proxy.on_entity_enter, pkt, offset)
+        end
     elseif opcode == 0x0013 then
         zone_dummy.on_entity_leave(pkt, offset)
+        if zone_ai_proxy and zone_ai_proxy.on_entity_leave then
+            pcall(zone_ai_proxy.on_entity_leave, pkt, offset)
+        end
+    elseif opcode == 0x0041 then
+        -- Stash responses have no consumer UI yet (no committed stash sender).
+        -- Parse minimally and surface errors; never fatal. Future stash UI
+        -- should hook here for full contents display.
+        if string.len(pkt) >= offset + 5 - 1 then
+            local stash_id, ppos = read_uint32_le(pkt, offset)
+            local status, _ = read_uint8(pkt, ppos)
+            if status ~= 0 and db.actor then
+                pcall(function()
+                    db.actor:give_game_news("Zone", "Stash unavailable.", "ui_inGame2_PDA_icon", 0, 3000, 0)
+                end)
+            end
+        end
     elseif opcode == 0x0020 then
         zone_safezone.on_safezone_state(pkt, offset)
     elseif opcode == 0x0030 then
@@ -215,11 +250,26 @@ function on_tick()
     end
 
     -- Mutual exclusion with xrRazom: do not send Zone telemetry or consume
-    -- Zone snapshots while co-op owns the world.
+    -- Zone snapshots while co-op owns the world. On the transition tick,
+    -- release Zone-side enforcement/proxies once so no sticky safezone
+    -- holstering or ghost puppets leak into the co-op session.
     if xrr_session_active() then
         last_pos = nil
+        if not xrr_was_active then
+            xrr_was_active = true
+            pcall(function()
+                if zone_safezone and zone_safezone.reset then zone_safezone.reset() end
+            end)
+            pcall(function()
+                if zone_dummy and zone_dummy.on_level_changing then zone_dummy.on_level_changing() end
+            end)
+            pcall(function()
+                if zone_ai_proxy and zone_ai_proxy.release_puppets then zone_ai_proxy.release_puppets() end
+            end)
+        end
         return
     end
+    xrr_was_active = false
 
     if db.actor then
         local ok_tick = pcall(function()

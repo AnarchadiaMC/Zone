@@ -143,10 +143,10 @@ func TestAdminServer_ExecuteCommand(t *testing.T) {
 		authedAdmin := NewAdminServer(server)
 		authedAdmin.SetAuthToken("secret-admin-pass")
 
-		// Status does not require auth
+		// Status requires auth too (no unauthenticated info leak)
 		statusResp := authedAdmin.ExecuteCommand("status")
-		if !strings.HasPrefix(statusResp, "OK active_sessions=") {
-			t.Errorf("Expected status to succeed without auth: %q", statusResp)
+		if !strings.HasPrefix(statusResp, "ERR unauthorized") {
+			t.Errorf("Expected status to fail without auth: %q", statusResp)
 		}
 
 		// Kick fails without auth
@@ -183,6 +183,38 @@ func TestAdminServer_ExecuteCommand(t *testing.T) {
 		kickResp = authedAdmin.ExecuteCommand("kick 99999")
 		if strings.HasPrefix(kickResp, "ERR unauthorized") {
 			t.Errorf("Expected kick to be authorized after auth: %q", kickResp)
+		}
+
+		// Status succeeds after auth as well
+		statusResp = authedAdmin.ExecuteCommand("status")
+		if !strings.HasPrefix(statusResp, "OK active_sessions=") {
+			t.Errorf("Expected status to succeed after auth: %q", statusResp)
+		}
+	})
+
+	t.Run("PerConnectionAuthIsolation", func(t *testing.T) {
+		isoAdmin := NewAdminServer(server)
+		isoAdmin.SetAuthToken("iso-secret")
+
+		// Arm the legacy GLOBAL flag the way the old handleConnection path
+		// did (Authenticate side-effect). Per-conn gating must IGNORE it:
+		// under the old `!isAuthed && !global` check this would unlock every
+		// connection; under the new per-conn-only check conn B stays blocked.
+		if !isoAdmin.Authenticate("iso-secret") {
+			t.Fatalf("setup: global Authenticate(true) expected")
+		}
+		respB := isoAdmin.executeCommand("status", false)
+		if !strings.HasPrefix(respB, "ERR unauthorized") {
+			t.Errorf("Expected unauthed conn B to stay blocked despite global auth: %q", respB)
+		}
+		respB = isoAdmin.executeCommand("kick 99999", false)
+		if !strings.HasPrefix(respB, "ERR unauthorized") {
+			t.Errorf("Expected unauthed conn B kick to stay blocked despite global auth: %q", respB)
+		}
+		// The explicitly-authed connection still passes the gate.
+		respA := isoAdmin.executeCommand("kick 99999", true)
+		if strings.HasPrefix(respA, "ERR unauthorized") {
+			t.Errorf("Expected authed conn A to pass auth gate: %q", respA)
 		}
 	})
 }

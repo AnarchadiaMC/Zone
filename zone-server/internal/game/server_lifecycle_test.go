@@ -201,8 +201,11 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	sink.Reset()
 
 	// 2. Transform into Cordon Rookie Village: (-211.3, -20.2, -145.8, "l01_escape")
+	// Stage just inside the zone edge so the move is physically plausible
+	// (anticheat clamps dt > 2s to 2.0s: ~10m in ~1s ≈ 10 m/s).
 	sess.Lock()
-	sess.LastTransformTime = time.Time{}
+	sess.Position = [3]float32{-201.3, -20.2, -145.8}
+	sess.LastTransformTime = time.Now().Add(-1 * time.Second)
 	sess.Unlock()
 	ctIn := protocol.ClientTransform{
 		PosX: -211.3,
@@ -253,14 +256,16 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 
 	sink.Reset()
 
-	// 3. Move back outside Rookie Village
+	// 3. Move back outside Rookie Village (rise above the cylinder: the zone
+	// is 20m tall around y=-20.2, so y=-6 is outside; dy=14.2m passes the
+	// 15m vertical ceiling and ~14 m/s passes the speed check).
 	sess.Lock()
-	sess.LastTransformTime = time.Time{}
+	sess.LastTransformTime = time.Now().Add(-1 * time.Second)
 	sess.Unlock()
 	ctOut2 := protocol.ClientTransform{
-		PosX: 50.0,
-		PosY: 0.0,
-		PosZ: 50.0,
+		PosX: -211.3,
+		PosY: -6.0,
+		PosZ: -145.8,
 	}
 	rawOut2 := buildTestPacket(t, protocol.OpClientTransform, 3, protocol.FlagUnreliable, ctOut2)
 	s.HandlePacket(rawOut2, addr)
@@ -449,6 +454,46 @@ func TestLifecycle_BannedPlayerRejected(t *testing.T) {
 	_ = binary.Read(r, binary.LittleEndian, &res)
 	if res.Status != 2 {
 		t.Errorf("Expected HandshakeRes Status 2 (Banned), got %d", res.Status)
+	}
+}
+
+func TestLifecycle_HandshakeVersionMismatchRejected(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	sink.Reset()
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30052}
+	var req protocol.HandshakeReq
+	copy(req.UUID[:], "uuid-version-mismatch-1")
+	copy(req.Nickname[:], "OldClient")
+	// xrRazom co-op uses protocol 89 — different protocol, must be rejected.
+	// Zone wire version is protocol.ProtocolVer (0x01).
+	req.ProtocolVer = 89
+
+	raw := buildTestPacket(t, protocol.OpHandshakeReq, 1, protocol.FlagReliable, req)
+	s.HandlePacket(raw, addr)
+
+	// Session should NOT be added
+	if s.sessions.GetByAddr(addr.String()) != nil {
+		t.Errorf("Expected version-mismatched client to not have active session")
+	}
+
+	// Verify response was Status 3 (version mismatch), not Status 0.
+	// NOTE: sink.LastPacket is the HandshakeRes; an unreliable OpAck precedes it.
+	if sink.PacketCount() == 0 {
+		t.Fatalf("Expected handshake response packet")
+	}
+	r := bytes.NewReader(sink.LastPacket())
+	hdr, err := protocol.ReadHeader(r)
+	if err != nil {
+		t.Fatalf("failed to read header: %v", err)
+	}
+	if hdr.Opcode != protocol.OpHandshakeRes {
+		t.Fatalf("expected OpHandshakeRes, got 0x%04X", hdr.Opcode)
+	}
+	var res protocol.HandshakeRes
+	_ = binary.Read(r, binary.LittleEndian, &res)
+	if res.Status != 3 {
+		t.Errorf("Expected HandshakeRes Status 3 (version mismatch), got %d", res.Status)
 	}
 }
 

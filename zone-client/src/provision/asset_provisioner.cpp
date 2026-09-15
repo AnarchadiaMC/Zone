@@ -6,7 +6,6 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <string>
-#include <fstream>
 #include <vector>
 
 #pragma comment(lib, "shlwapi.lib")
@@ -88,11 +87,50 @@ namespace AssetProvisioner
         if (slash != std::wstring::npos)
             EnsureDirectoryTree(path.substr(0, slash));
 
-        std::ofstream file(path.c_str(), std::ios::out | std::ios::binary);
-        if (!file.is_open())
+        // Wide/Win32 write so non-ASCII game paths work (no narrow ofstream).
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            DWORD err = GetLastError();
+            if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS)
+                return true; // Raced with another writer; user file wins.
+            std::wstring msg = L"[AssetProvisioner] WriteFileIfMissing: CreateFileW failed for \"" +
+                path + L"\" (error " + std::to_wstring(err) + L")\n";
+            OutputDebugStringW(msg.c_str());
             return false;
+        }
 
-        file.write(content.data(), content.size());
+        bool ok = true;
+        DWORD werr = ERROR_SUCCESS;
+        size_t offset = 0;
+        while (offset < content.size())
+        {
+            size_t remaining = content.size() - offset;
+            DWORD chunk = (remaining > (1 << 20)) ? (1 << 20) : static_cast<DWORD>(remaining);
+            DWORD written = 0;
+            if (!WriteFile(h, content.data() + offset, chunk, &written, nullptr) || written != chunk)
+            {
+                ok = false;
+                werr = GetLastError();
+                break;
+            }
+            offset += written;
+        }
+        // Capture flush result BEFORE CloseHandle (which may reset LastError).
+        BOOL flushed = FlushFileBuffers(h);
+        DWORD ferr = flushed ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(h);
+
+        if (!ok || !flushed)
+        {
+            DWORD err = !ok ? werr : ferr;
+            DeleteFileW(path.c_str());
+            std::wstring msg = L"[AssetProvisioner] WriteFileIfMissing: WriteFile failed for \"" +
+                path + L"\" (error " + std::to_wstring(err) + L")\n";
+            OutputDebugStringW(msg.c_str());
+            return false;
+        }
         return true;
     }
 
@@ -102,18 +140,75 @@ namespace AssetProvisioner
         if (slash != std::wstring::npos)
             EnsureDirectoryTree(path.substr(0, slash));
 
-        std::ofstream file(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!file.is_open())
-            return false;
+        // Atomic write: temp file + MoveFileExW(REPLACE_EXISTING) so a crash
+        // mid-write never leaves a truncated/zero-byte target. Old file is
+        // kept on any failure. PID-suffixed temp name so two processes sharing
+        // one game root never interleave chunks into the same .tmp.
+        std::wstring tmpPath = path + L".tmp." + std::to_wstring(GetCurrentProcessId());
 
-        file.write(content.data(), content.size());
+        HANDLE h = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            DWORD err = GetLastError();
+            std::wstring msg = L"[AssetProvisioner] OverwriteFile: CreateFileW(temp) failed for \"" +
+                path + L"\" (error " + std::to_wstring(err) + L"); keeping old file.\n";
+            OutputDebugStringW(msg.c_str());
+            return false;
+        }
+
+        bool ok = true;
+        DWORD werr = ERROR_SUCCESS;
+        size_t offset = 0;
+        while (offset < content.size())
+        {
+            size_t remaining = content.size() - offset;
+            DWORD chunk = (remaining > (1 << 20)) ? (1 << 20) : static_cast<DWORD>(remaining);
+            DWORD written = 0;
+            if (!WriteFile(h, content.data() + offset, chunk, &written, nullptr) || written != chunk)
+            {
+                ok = false;
+                werr = GetLastError();
+                break;
+            }
+            offset += written;
+        }
+        // Capture flush result BEFORE CloseHandle (which may reset LastError).
+        BOOL flushed = FlushFileBuffers(h);
+        DWORD ferr = flushed ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(h);
+
+        if (!ok || !flushed)
+        {
+            DWORD err = !ok ? werr : ferr;
+            DeleteFileW(tmpPath.c_str());
+            std::wstring msg = L"[AssetProvisioner] OverwriteFile: WriteFile failed for \"" +
+                path + L"\" (error " + std::to_wstring(err) + L"); keeping old file.\n";
+            OutputDebugStringW(msg.c_str());
+            return false;
+        }
+
+        if (!MoveFileExW(tmpPath.c_str(), path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            DWORD err = GetLastError();
+            DeleteFileW(tmpPath.c_str());
+            std::wstring msg = L"[AssetProvisioner] OverwriteFile: MoveFileExW failed for \"" +
+                path + L"\" (error " + std::to_wstring(err) + L"); keeping old file.\n";
+            OutputDebugStringW(msg.c_str());
+            return false;
+        }
         return true;
     }
 
     void EnsureAssets()
     {
         std::wstring root = GetGameRoot();
-        if (root.empty()) return;
+        if (root.empty())
+        {
+            OutputDebugStringW(L"[AssetProvisioner] GetGameRoot returned empty - cannot provision assets (game root unknown). Check process image path.\n");
+            return;
+        }
 
         // 1. Iterate through compile-time embedded assets.
         //    Script files and UI XML files are always overwritten (mod code and UI layout must match DLL).

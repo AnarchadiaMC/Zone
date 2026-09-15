@@ -66,6 +66,15 @@ function UIZoneServerList:__init(owner)
     self.uuid      = "anonymous"
     self.hwid      = 0
     self.nick      = "Stalker"
+    -- Menu-visible connection state (db.actor is nil in the main menu, so
+    -- give_game_news cannot be used here; the dialog's own status label is
+    -- the only user-visible feedback channel).
+    self.status_text     = "Ready"
+    self.connect_pending = false
+    self.connect_ip      = nil
+    self.connect_port    = nil
+    self.connect_start   = 0
+    self.last_status_poll = 0
 end
 
 function UIZoneServerList:__finalize()
@@ -116,7 +125,15 @@ function UIZoneServerList:InitControls()
     self.btn_back = xml:Init3tButton("btn_back", self)
     if self.btn_back then self:Register(self.btn_back, "btn_back") end
 
+    -- Connection-status footer. Missing in older layouts: nil-safe, Update()
+    -- and SetStatus() both tolerate a nil label (log-only fallback).
+    self.status_label = nil
+    pcall(function()
+        self.status_label = xml:InitStatic("status_label", self)
+    end)
+
     self:LoadFavorites()
+    pcall(function() self:SetStatus("Ready") end)
 end
 
 -- ------------------------------------------------------------
@@ -250,6 +267,108 @@ function UIZoneServerList:RefreshList()
     self.sel_idx = nil
 end
 
+-- ------------------------------------------------------------
+-- SetStatus — menu-visible connection feedback.
+-- db.actor (and give_game_news) does not exist in the main menu, so the
+-- dialog's own status footer is the only user-visible channel. printf alone
+-- only reaches xray_*.log. Never fatal: all engine calls are pcall-wrapped.
+-- ------------------------------------------------------------
+function UIZoneServerList:SetStatus(text)
+    self.status_text = text or "Ready"
+    pcall(function()
+        -- NOTE: engine printf supports %s only.
+        printf(string.format("Zone UI: %s", tostring(self.status_text)))
+    end)
+    pcall(function()
+        if not self.status_label then return end
+        local full = "Status: " .. tostring(self.status_text)
+        if self.status_label.TextControl then
+            self.status_label:TextControl():SetText(full)
+        elseif self.status_label.SetText then
+            self.status_label:SetText(full)
+        end
+    end)
+end
+
+-- ------------------------------------------------------------
+-- Update — per-frame poll (engine calls CUIScriptWnd:Update while shown).
+-- Polls ZoneNet:IsConnected() for a pending menu-initiated Connect and
+-- flips the status footer to Connected/Failed. Throttled to ~2 Hz and fully
+-- pcall-wrapped: a Lua error here is a fatal CTD.
+-- ------------------------------------------------------------
+function UIZoneServerList:Update()
+    pcall(function() CUIScriptWnd.Update(self) end)
+    pcall(function()
+        if not self.connect_pending then return end
+
+        local now_ms = nil
+        pcall(function()
+            if time_global then now_ms = time_global() end
+        end)
+        if not now_ms and time_continual then
+            pcall(function() now_ms = time_continual() * 1000 end)
+        end
+        if not now_ms then return end
+
+        -- Throttle to ~2 Hz so label/list updates don't flicker.
+        if self.last_status_poll and (now_ms - self.last_status_poll) < 500 then
+            return
+        end
+        self.last_status_poll = now_ms
+
+        local connected = false
+        pcall(function()
+            if ZoneNet and ZoneNet.IsConnected then
+                connected = ZoneNet:IsConnected() and true or false
+            end
+        end)
+        if connected then
+            self.connect_pending = false
+            local ip_s = tostring(self.connect_ip or "")
+            local port_s = tostring(self.connect_port or "")
+            pcall(function()
+                for _, e in ipairs(self.favorites) do
+                    if e.ip == self.connect_ip and e.port == self.connect_port then
+                        e.status = "Connected"
+                    end
+                end
+            end)
+            pcall(function() self:RefreshList() end)
+            self:SetStatus(string.format("Connected to %s:%s - start or load a game",
+                ip_s, port_s))
+            return
+        end
+
+        -- Match ZoneClient CONNECTING retry budget (15 s / 5 tries in
+        -- zone-client/src/net/udp_client.cpp) with a small margin.
+        local elapsed = now_ms - (self.connect_start or now_ms)
+        if elapsed > 16000 then
+            self.connect_pending = false
+            pcall(function()
+                for _, e in ipairs(self.favorites) do
+                    if e.ip == self.connect_ip and e.port == self.connect_port then
+                        e.status = "Failed"
+                    end
+                end
+            end)
+            pcall(function() self:RefreshList() end)
+            -- Surface the native reason (banned / full / version mismatch)
+            -- instead of a generic unreachable message when available.
+            local reason = ""
+            pcall(function()
+                if ZoneNet and ZoneNet.GetLastError then
+                    reason = ZoneNet:GetLastError() or ""
+                end
+            end)
+            if reason ~= nil and reason ~= "" then
+                self:SetStatus(string.format("Failed - %s", tostring(reason)))
+            else
+                self:SetStatus("Failed - server unreachable, see xray log")
+            end
+        end
+    end)
+end
+
 -- PRODUCTION FIX (crash on Connect):
 -- The engine nils os.remove/os.rename/os.execute/os.exit (see
 -- xray-monolith/src/xrServerEntities/script_storage.cpp disable_os_funcs).
@@ -358,12 +477,14 @@ function UIZoneServerList:OnConnect()
 
         if ip == "" then
             printf("Zone: Cannot connect - empty server IP")
+            pcall(function() self:SetStatus("Enter a server IP first") end)
             return
         end
 
         local port_n = tonumber(port)
         if not port_n or port_n < 1 or port_n > 65535 then
             printf("Zone: Cannot connect - invalid port")
+            pcall(function() self:SetStatus("Invalid port (1-65535)") end)
             return
         end
 
@@ -386,6 +507,7 @@ function UIZoneServerList:OnConnect()
         end)
         if xrr_busy then
             printf("Zone: Cannot connect - xrRazom co-op session is active. Disconnect from co-op first.")
+            pcall(function() self:SetStatus("Busy - xrRazom co-op is active") end)
             return
         end
 
@@ -399,6 +521,7 @@ function UIZoneServerList:OnConnect()
         end)
         if not dll_ok then
             printf("Zone: ZoneNet DLL missing, cannot connect.")
+            pcall(function() self:SetStatus("DLL missing - inject ZoneClient first") end)
             return
         end
 
@@ -413,6 +536,7 @@ function UIZoneServerList:OnConnect()
         for _, e in ipairs(self.favorites) do
             if e.ip == ip and e.port == port_n then
                 found = true
+                e.status = "Connecting"
                 break
             end
         end
@@ -421,16 +545,37 @@ function UIZoneServerList:OnConnect()
                 label  = string.format("%s:%s", tostring(ip), tostring(port_n)),
                 ip     = ip,
                 port   = port_n,
-                status = "Recent"
+                status = "Connecting"
             }
         end
         pcall(function() self:SaveFavorites() end)
+        pcall(function() self:RefreshList() end)
 
-        -- Close dialog
-        pcall(function() self:OnBack() end)
+        -- Menu-visible feedback: keep the browser OPEN so the user sees the
+        -- handshake outcome. db.actor/give_game_news do not exist in the main
+        -- menu, so Update() polling + the status footer are the only channel.
+        -- Do NOT auto-close here: closing is what produced "browser closes,
+        -- nothing happens". The user closes via Back once Connected.
+        pcall(function()
+            self.connect_pending = true
+            self.connect_ip = ip
+            self.connect_port = port_n
+            self.connect_start = 0
+            if time_global then
+                self.connect_start = time_global()
+            elseif time_continual then
+                self.connect_start = time_continual() * 1000
+            end
+            self.last_status_poll = 0
+        end)
+        pcall(function()
+            self:SetStatus(string.format("Connecting to %s:%s...",
+                tostring(ip), tostring(port_n)))
+        end)
     end)
     if not ok then
         printf("Zone UI Error: Connect failed safely (no crash)")
+        pcall(function() self:SetStatus("Error - see xray log") end)
     end
 end
 

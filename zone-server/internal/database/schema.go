@@ -80,4 +80,11 @@ CREATE TABLE IF NOT EXISTS ai_squads (
     patrol_path TEXT,
     is_online INTEGER NOT NULL DEFAULT 0
 );
+-- Performance indexes (idempotent; safe for existing DBs on Open).
+-- NOTE: this schema uses client_uuid as the account/character key, so
+-- idx_char_account / idx_inv_char target client_uuid (spec names kept).
+CREATE INDEX IF NOT EXISTS idx_char_account ON characters(client_uuid);
+CREATE INDEX IF NOT EXISTS idx_inv_char ON character_inventory(client_uuid);
+CREATE INDEX IF NOT EXISTS idx_stashes_level ON world_stashes(level_name);
+CREATE INDEX IF NOT EXISTS idx_zones_level ON safe_zones(level_name);
 `

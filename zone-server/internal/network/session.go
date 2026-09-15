@@ -26,6 +26,29 @@ type PlayerSession struct {
 	Dirty             bool
 	LastCheckpoint    time.Time
 	InCombatUntil     time.Time
+	ChatTimestamps    []time.Time
+}
+
+// AllowChat enforces per-session chat rate limiting (max 5 msgs / 5s).
+// Prunes timestamps older than 5s; returns false (drop silently) if the
+// session already sent 5 messages in the window, otherwise records now
+// and returns true.
+func (s *PlayerSession) AllowChat(now time.Time) bool {
+	s.Lock()
+	defer s.Unlock()
+	cutoff := now.Add(-5 * time.Second)
+	kept := s.ChatTimestamps[:0]
+	for _, t := range s.ChatTimestamps {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	s.ChatTimestamps = kept
+	if len(s.ChatTimestamps) >= 5 {
+		return false
+	}
+	s.ChatTimestamps = append(s.ChatTimestamps, now)
+	return true
 }
 
 func (s *PlayerSession) MarkDirty() {
@@ -81,6 +104,51 @@ func (sm *SessionManager) AddSession(s *PlayerSession) {
 		sm.byAddr[s.UDPAddr.String()] = s
 	}
 	sm.updateCache()
+}
+
+// TryAddCapped performs check-and-insert under ONE mutex hold, closing the
+// TOCTOU window between GetAll()+AddSession across UDP workers.
+// Returns false (caller sends Status 1) when len(sessions) >= max.
+// Duplicate connections from the same addr replace the old entry instead of
+// counting twice: old sessions with the same addr (different SessionID) are
+// removed first. Same-SessionID re-adds are treated as updates and allowed
+// even at cap. max <= 0 means uncapped (always insert).
+func (sm *SessionManager) TryAddCapped(s *PlayerSession, max int) bool {
+	if s == nil {
+		return false
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s.UDPAddr != nil {
+		addrStr := s.UDPAddr.String()
+		if _, ok := sm.byAddr[addrStr]; ok {
+			for id, sess := range sm.sessions {
+				if id == s.SessionID {
+					continue
+				}
+				if sess != nil && sess.UDPAddr != nil && sess.UDPAddr.String() == addrStr {
+					delete(sm.sessions, id)
+				}
+			}
+		}
+	}
+	if max > 0 && len(sm.sessions) >= max {
+		if _, exists := sm.sessions[s.SessionID]; !exists {
+			return false
+		}
+	}
+	// Reuse AddSession dedup semantics: clean stale byAddr for same SessionID.
+	if old, exists := sm.sessions[s.SessionID]; exists && old != nil && old != s {
+		if old.UDPAddr != nil {
+			delete(sm.byAddr, old.UDPAddr.String())
+		}
+	}
+	sm.sessions[s.SessionID] = s
+	if s.UDPAddr != nil {
+		sm.byAddr[s.UDPAddr.String()] = s
+	}
+	sm.updateCache()
+	return true
 }
 
 func (sm *SessionManager) RemoveSession(id uint32) {

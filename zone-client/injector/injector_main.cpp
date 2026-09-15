@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "psapi.lib")
 
 // ---------------------------------------------------------------------------
 // Privilege Elevation: Enable SeDebugPrivilege if available
@@ -108,6 +109,153 @@ static DWORD FindProcessId(const std::wstring& processName)
 }
 
 // ---------------------------------------------------------------------------
+// Bitness check + engine-readiness gate (minimal scoped helpers)
+// ---------------------------------------------------------------------------
+static bool IsOS64Bit()
+{
+    SYSTEM_INFO si = {};
+    GetNativeSystemInfo(&si);
+    return (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
+            si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64);
+}
+
+static const wchar_t* InjectorArchName()
+{
+    return (sizeof(void*) == 8) ? L"x64" : L"x86";
+}
+
+// Fail fast on injector-vs-target architecture mismatch.
+// DLL is built alongside the injector, so injector bitness == DLL bitness.
+static bool CheckBitnessCompatibility(HANDLE hProcess, DWORD pid)
+{
+    BOOL targetWow64 = FALSE;
+    if (!IsWow64Process(hProcess, &targetWow64))
+    {
+        // Fail open: could not query target; let injection attempt proceed
+        // and surface any real error from CreateRemoteThread/LoadLibraryW.
+        return true;
+    }
+
+    if (!IsOS64Bit())
+    {
+        return true; // 32-bit OS: everything is 32-bit, always compatible.
+    }
+
+    const bool selfIs64 = (sizeof(void*) == 8);
+    const bool targetIs64 = (targetWow64 == FALSE);
+
+    if (selfIs64 == targetIs64)
+    {
+        return true;
+    }
+
+    std::wcerr << L"[!] Bitness mismatch: injector/DLL is " << InjectorArchName()
+               << L" but target PID " << pid
+               << (targetIs64 ? L" is x64." : L" is x86 (Wow64).")
+               << L"\n    Cannot inject "
+               << (selfIs64 ? L"x64 DLL into x86 process." : L"x86 DLL into x64 process.")
+               << L"\n    Note: AnomalyDX11/DX10 exes are x64; DX8/DX9-era exes in --wait list may be 32-bit - use a matching injector/DLL build.\n";
+    return false;
+}
+
+struct MainWindowSearch
+{
+    DWORD pid = 0;
+    bool found = false;
+};
+
+static BOOL CALLBACK EnumMainWindowCb(HWND hwnd, LPARAM lParam)
+{
+    auto* state = reinterpret_cast<MainWindowSearch*>(lParam);
+    DWORD wpid = 0;
+    GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != state->pid)
+    {
+        return TRUE;
+    }
+    if (!IsWindowVisible(hwnd))
+    {
+        return TRUE;
+    }
+    if (GetWindowTextLengthW(hwnd) == 0)
+    {
+        return TRUE;
+    }
+    state->found = true;
+    return FALSE;
+}
+
+static bool TargetHasMainWindow(DWORD pid)
+{
+    if (pid == 0)
+    {
+        return false;
+    }
+    MainWindowSearch state;
+    state.pid = pid;
+    EnumWindows(EnumMainWindowCb, reinterpret_cast<LPARAM>(&state));
+    return state.found;
+}
+
+static bool ModuleNameIndicatesEngineReady(const std::wstring& baseName)
+{
+    std::wstring lower = baseName;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    return (lower.find(L"lua") != std::wstring::npos); // covers lua51.dll, luajit, lua5.1
+}
+
+static bool TargetHasEngineModules(HANDLE hProcess)
+{
+    HMODULE mods[512] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(hProcess, mods, sizeof(mods), &needed))
+    {
+        return false;
+    }
+    size_t count = needed / sizeof(HMODULE);
+    if (count > 512)
+    {
+        count = 512;
+    }
+    wchar_t name[MAX_PATH] = {};
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (GetModuleBaseNameW(hProcess, mods[i], name, MAX_PATH) > 0)
+        {
+            if (ModuleNameIndicatesEngineReady(name))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Bounded readiness gate: poll for LuaJIT/lua51 module presence OR a visible
+// main window (engine init) instead of a fixed Sleep. Times out gracefully.
+static void WaitForTargetReady(HANDLE hProcess)
+{
+    const DWORD kTimeoutMs = 30000;
+    const DWORD kPollMs = 250;
+    const DWORD pid = GetProcessId(hProcess);
+
+    DWORD elapsed = 0;
+    while (elapsed < kTimeoutMs)
+    {
+        if (TargetHasEngineModules(hProcess) || TargetHasMainWindow(pid))
+        {
+            return;
+        }
+        Sleep(kPollMs);
+        elapsed += kPollMs;
+    }
+
+    std::wcout << L"[*] Engine-readiness wait timed out after " << (kTimeoutMs / 1000)
+               << L"s (no LuaJIT/lua51 module or main window observed); proceeding with injection anyway.\n";
+    OutputDebugStringW(L"[Injector] Engine-readiness gate timed out; proceeding.\n");
+}
+
+// ---------------------------------------------------------------------------
 // Injection: Win32 CreateRemoteThread + LoadLibraryW
 // ---------------------------------------------------------------------------
 static bool InjectDLL(HANDLE hProcess, const std::wstring& rawDllPath)
@@ -121,6 +269,19 @@ static bool InjectDLL(HANDLE hProcess, const std::wstring& rawDllPath)
     }
 
     EnableDebugPrivilege();
+
+    // (a) Upfront bitness check: fail fast on x64-DLL-into-x86 (or vice versa).
+    {
+        DWORD targetPid = GetProcessId(hProcess);
+        if (!CheckBitnessCompatibility(hProcess, targetPid))
+        {
+            return false;
+        }
+    }
+
+    // (b) Readiness gate: bounded poll for LuaJIT/lua51 or main-window/engine
+    // init instead of a fixed Sleep. Runs before any remote allocation/thread.
+    WaitForTargetReady(hProcess);
 
     const size_t pathBytes = (dllPath.length() + 1) * sizeof(wchar_t);
     void* pRemoteBuf = VirtualAllocEx(hProcess, nullptr, pathBytes,
@@ -274,8 +435,8 @@ static int ModeWait(const std::wstring& dllPath)
     }
 
     std::wcout << L"[+] Detected target process: " << foundExe << L" (PID: " << pid << L")\n";
-    std::wcout << L"[*] Waiting 1.5s for process initialization...\n";
-    Sleep(1500);
+    std::wcout << L"[*] Waiting for engine readiness (bounded gate inside InjectDLL)...\n";
+    // No fixed Sleep here; InjectDLL polls for LuaJIT/lua51 or main window.
 
     std::wcout << L"[*] Injecting " << dllPath << L" into PID " << pid << L"...\n";
     if (InjectDLL(pid, dllPath))
@@ -387,8 +548,8 @@ static int ModeLaunch(const std::wstring& rawExePath,
     ResumeThread(pi.hThread);
 
     std::wcout << L"[*] Waiting for game engine initialization...\n";
-    WaitForInputIdle(pi.hProcess, 5000);
-    Sleep(2000);
+    WaitForInputIdle(pi.hProcess, 5000); // best-effort precursor only; bounded readiness gate runs inside InjectDLL
+    // No fixed Sleep(2000) here; InjectDLL polls for LuaJIT/lua51 or main window.
 
     // Verify process is still alive before attempting injection
     DWORD procExitCode = 0;
