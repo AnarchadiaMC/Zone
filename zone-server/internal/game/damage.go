@@ -58,13 +58,22 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 	attackerID := attacker.SessionID
 	attackerInSafe := attacker.InSafeZone
 	attackerPos := attacker.Position
+	attackerLevel := attacker.CurrentLevel
 	attacker.Unlock()
 
 	target.Lock()
 	targetID := target.SessionID
 	targetInSafe := target.InSafeZone
 	targetPos := target.Position
+	targetLevel := target.CurrentLevel
 	target.Unlock()
+
+	// PRODUCTION FIX: cross-map hits (Cordon -> Rostok) were possible because
+	// only 3D distance was checked. Levels are separate instances; damage
+	// across levels is always forged.
+	if attackerLevel != targetLevel {
+		return 0, false, "cross-level damage rejected"
+	}
 
 	if dmg.AttackerID != attackerID || dmg.TargetID != targetID {
 		return 0, false, "session mismatch"

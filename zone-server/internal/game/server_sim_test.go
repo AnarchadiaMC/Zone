@@ -217,8 +217,11 @@ func TestSim_AckQueueTicked(t *testing.T) {
 		t.Fatalf("expected packet retransmission in sink, got packet count %d", sink.PacketCount())
 	}
 
-	// Client sends incoming OpAck packet acknowledging seq
-	ackPkt := buildTestPacket(t, OpAck, seq, protocol.FlagReliable, nil)
+	// Client sends incoming OpAck packet acknowledging seq.
+	// Header seq must be the CLIENT's own seq (distinct); the acked server seq
+	// travels in the payload. The old test reused seq as the header seq with a
+	// nil payload, which only passed via the removed double-ack bug.
+	ackPkt := buildTestPacket(t, OpAck, seq+1000000, protocol.FlagReliable, seq)
 	s.HandlePacket(ackPkt, addr)
 
 	// Verify packet acknowledged and removed from ackQueue

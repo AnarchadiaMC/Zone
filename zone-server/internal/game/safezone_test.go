@@ -18,6 +18,8 @@ func TestSafeZone(t *testing.T) {
 }
 
 func TestSafeZone_AllCanonicalZones(t *testing.T) {
+	// Canonical 12 per GEMINI §13.1 (was 8; Dead City / Swamp / Zaton /
+	// Jupiter added so CLIENT-declared safe zones are server-enforced).
 	expectedZones := []string{
 		"sz_cordon_rookie",
 		"sz_cordon_farm",
@@ -27,6 +29,10 @@ func TestSafeZone_AllCanonicalZones(t *testing.T) {
 		"sz_agroprom_camp",
 		"sz_warehouses_base",
 		"sz_yantar_bunker",
+		"sz_deadcity_base",
+		"sz_swamp_clearsky",
+		"sz_zaton_skadovsk",
+		"sz_jupiter_yanov",
 	}
 
 	if len(defaultSafeZones) != len(expectedZones) {

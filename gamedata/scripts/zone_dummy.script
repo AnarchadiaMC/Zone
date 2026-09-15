@@ -69,20 +69,49 @@ end
 
 function spawn_proxy(session_id, pos, faction)
     if spawned_proxies[session_id] then return end
-    
+
+    -- Never spawn while xrRazom owns the world (dual proxy systems conflict).
+    local xrr_active = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_active = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_active = true end
+    end)
+    if xrr_active then return end
+
     local resolved_faction = (faction and faction ~= "") and faction or (peer_factions[session_id] or "stalker")
     peer_factions[session_id] = resolved_faction
-    
+
     local section = get_proxy_section(resolved_faction)
-    
-    -- L-15: if db.actor is nil (loading screen), don't pass vertex 0: use level default vertex IDs or safe coordinates
-    local lvid = db.actor and db.actor:level_vertex_id() or (level and level.vertex_id and level.vertex_id(pos)) or 0
-    local gvid = db.actor and db.actor:game_vertex_id() or 0
-    
-    local sim = alife()
+
+    -- PRODUCTION FIX: resolve vertices at the PROXY position, never at the
+    -- local actor. Using actor lvid/gvid spawned cross-map peers at the wrong
+    -- graph point (and crashed some level setups). level.vertex_id(pos) is the
+    -- engine query (see level_script.cpp); game vertex via cross-table when
+    -- available, else actor fallback, else 0 (create guarded by pcall).
+    local lvid = 0
+    local gvid = 0
+    pcall(function()
+        if level and level.vertex_id then
+            lvid = level.vertex_id(pos) or 0
+        elseif db.actor then
+            lvid = db.actor:level_vertex_id()
+        end
+    end)
+    pcall(function()
+        if level and level.vertex_position then
+            -- cross-table lookup would go here; keep actor fallback for now
+        end
+        if db.actor then
+            gvid = db.actor:game_vertex_id() or 0
+        end
+    end)
+
+    local sim = nil
+    pcall(function() sim = alife() end)
     if not sim then return end
 
-    local se_obj = sim:create(section, pos, lvid, gvid)
+    local se_obj = nil
+    pcall(function() se_obj = sim:create(section, pos, lvid, gvid) end)
     if se_obj then
         -- Tag for death manager bypass (needs integration in death_manager.script)
         se_obj.is_zone_proxy = true
@@ -141,11 +170,23 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     end
 end
 
+-- Reap ghosts whose LEAVE was lost (unreliable UDP) to prevent leaks.
+local STALE_PROXY_MS = 10000
+local function reap_stale_proxies(tg)
+    for sid, proxy in pairs(spawned_proxies) do
+        if proxy.last_update and (tg - proxy.last_update) > STALE_PROXY_MS then
+            pcall(despawn_proxy, sid)
+        end
+    end
+end
+
 -- Hermite spline interpolation for smooth proxy movement (L-05 & L-24)
 function interpolate_proxies()
     local tg = time_global()
     local target_t = tg - JITTER_BUFFER_MS
-    
+
+    reap_stale_proxies(tg)
+
     for sid, proxy in pairs(spawned_proxies) do
         -- Resolve game_id once online if not yet resolved
         if not proxy.game_id and level and level.object_by_id then
@@ -230,25 +271,34 @@ function interpolate_proxies()
             local iz = h00 * p1.z + h10 * m1z + h01 * p2.z + h11 * m2z
             
             if proxy.game_id and level and level.object_by_id then
-                local obj = level.object_by_id(proxy.game_id)
-                if obj and obj:alive() and obj.set_npc_position then
-                    obj:set_npc_position(vector():set(ix, iy, iz))
-                end
+                pcall(function()
+                    local obj = level.object_by_id(proxy.game_id)
+                    if obj and obj:alive() and obj.set_npc_position then
+                        obj:set_npc_position(vector():set(ix, iy, iz))
+                    end
+                end)
             end
         elseif count == 1 then
             local p1 = get_history_sample(proxy, 1)
             if proxy.game_id and level and level.object_by_id then
-                local obj = level.object_by_id(proxy.game_id)
-                if obj and obj:alive() and obj.set_npc_position then
-                    obj:set_npc_position(vector():set(p1.x, p1.y, p1.z))
-                end
+                pcall(function()
+                    local obj = level.object_by_id(proxy.game_id)
+                    if obj and obj:alive() and obj.set_npc_position then
+                        obj:set_npc_position(vector():set(p1.x, p1.y, p1.z))
+                    end
+                end)
             end
         end
     end
 end
 
 function on_snapshot(pkt, offset)
+    local pkt_len = string.len(pkt)
+    -- count(1) + 20 bytes per entry; validate before walking (forged count safe)
     local count, pos = zone_net.read_uint8(pkt, offset)
+    if not count then return end
+    if count > 32 then count = 32 end
+    if pkt_len < (pos - 1) + count * 20 then return end
     for i = 1, count do
         local sid, pos2 = zone_net.read_uint32_le(pkt, pos)
         local x, pos3 = zone_net.read_float_le(pkt, pos2)

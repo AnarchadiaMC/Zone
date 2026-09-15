@@ -93,28 +93,53 @@ end
 
 function on_game_start()
     if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) then
-        printf("Zone: ZoneClient.dll native library not loaded! DLL hook failed or missing.")
+        printf("Zone: ZoneClient.dll native library not loaded! Inject the DLL first.")
         return
     end
-    
+
+    -- Tick must exist for browser-initiated connections too (browser never
+    -- registers it). Register first, connect second.
+    if RegisterScriptCallback and zone_net and zone_net.on_tick then
+        pcall(RegisterScriptCallback, "actor_on_update", zone_net.on_tick)
+    end
+
+    -- Already connected from the main-menu browser: keep that session, don't
+    -- clobber it with the stored identity.
+    local already = false
+    pcall(function()
+        if ZoneNet and ZoneNet:IsConnected() then already = true end
+    end)
+    if already then
+        printf("Zone: keeping browser session")
+        return
+    end
+
+    -- xrRazom compatibility: never auto-dial Zone when co-op owns the world.
+    local xrr_active = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_active = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_active = true end
+    end)
+    if xrr_active then
+        printf("Zone: xrRazom session active, Zone staying offline")
+        return
+    end
+
     if not load_config() then
         printf("Zone: Failed to load config.")
         return
     end
-    
+
     local ip = config.server_ip or "127.0.0.1"
     local port = config.server_port or 27015
     local uuid = config.client_uuid
     local hwid = config.hwid_hash
     local nick = config.nickname or "Stalker"
-    
-    printf("Zone: Connecting to %s:%d as %s...", ip, port, nick)
-    ZoneNet:Connect(ip, port, uuid, hwid, nick)
-    
-    -- Register callbacks
-    if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_update", zone_net.on_tick)
-    end
+
+    -- NOTE: engine printf supports %s only.
+    printf(string.format("Zone: Connecting to %s:%s as %s",
+        tostring(ip), tostring(port), tostring(nick)))
+    pcall(function() ZoneNet:Connect(ip, port, uuid, hwid, nick) end)
 end
 
 function get_config()

@@ -238,11 +238,36 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	// PRODUCTION FIX: immediately ACK every reliable inbound packet (except
+	// ACKs themselves). Covers handshake/chat/disconnect explicit cases, not
+	// just the default branch. Stops client retransmit storms.
+	if hdr.Opcode != protocol.OpAck && hdr.FlagsChannel&protocol.FlagReliable != 0 {
+		s.sendAck(addr, hdr.SequenceNum)
+		if s.ackQueue != nil {
+			s.ackQueue.Acknowledge(hdr.SequenceNum)
+		}
+	}
+
 	switch hdr.Opcode {
 	case protocol.OpHandshakeReq:
 		var req protocol.HandshakeReq
 		if err := binary.Read(buf, binary.LittleEndian, &req); err == nil {
 			s.logger.Info("Handshake", zap.String("addr", addr.String()))
+			// PRODUCTION FIX: gate protocol version (client sends protoVer=1).
+			// Previously any version (e.g. test value 89) was accepted.
+			if req.ProtocolVer != protocol.ProtocolVer {
+				s.logger.Warn("Handshake version mismatch",
+					zap.String("addr", addr.String()),
+					zap.Uint8("got", req.ProtocolVer),
+					zap.Uint8("want", protocol.ProtocolVer))
+				res := protocol.HandshakeRes{
+					Status:    3, // 3 = version mismatch
+					WorldTime: uint64(time.Now().Unix()),
+				}
+				tempSess := &network.PlayerSession{UDPAddr: addr}
+				s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+				return
+			}
 			cleanUUID := nullTermString(req.UUID[:])
 			if cleanUUID == "" {
 				cleanUUID = string(bytes.Trim(req.UUID[:], "\x00"))
@@ -647,12 +672,33 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if binary.Read(buf, binary.LittleEndian, &ackSeq) == nil && ackSeq != 0 {
 				s.ackQueue.Acknowledge(ackSeq)
 			}
-			s.ackQueue.Acknowledge(hdr.SequenceNum)
+			// NOTE: do NOT acknowledge hdr.SequenceNum here — ACK packets are
+			// unreliable and never enqueued; acking their own seq is a no-op
+			// that masked the missing outbound-ACK bug below.
 		}
 	default:
-		if s.ackQueue != nil && (hdr.FlagsChannel&protocol.FlagReliable != 0 || hdr.Opcode == 0) {
-			s.ackQueue.Acknowledge(hdr.SequenceNum)
-		}
+		// Reliable inbound already ACKed above; nothing further needed.
+	}
+}
+
+// sendAck transmits an unreliable OpAck for seq back to addr. Fire-and-forget:
+// ACKs are never enqueued for retransmission.
+func (s *Server) sendAck(addr *net.UDPAddr, seq uint32) {
+	udp := s.GetUDP()
+	if udp == nil && activeSink == nil {
+		return
+	}
+	pktSeq := s.seq.Add(1)
+	var buf bytes.Buffer
+	if err := protocol.WritePacket(&buf, protocol.OpAck, pktSeq, protocol.FlagUnreliable, seq); err != nil {
+		return
+	}
+	data := buf.Bytes()
+	if activeSink != nil {
+		activeSink.Record(data)
+	}
+	if udp != nil {
+		_ = udp.Send(addr, data)
 	}
 }
 
@@ -697,13 +743,39 @@ func (s *Server) Tick(now time.Time) {
 		pos := sess.Position
 		yaw := sess.Rotation[0]
 		health := sess.Health
+		flagSafe := sess.InSafeZone
+		level := sess.CurrentLevel
+		inCombat := now.Before(sess.InCombatUntil)
+		addrStr := ""
+		if sess.UDPAddr != nil {
+			addrStr = sess.UDPAddr.String()
+		}
 		sess.Unlock()
+		// Authoritative safe-zone state: recompute from position, don't trust
+		// a possibly-stale session flag (direct-inserted test sessions and
+		// clients that never sent a transform have InSafeZone=false).
+		inSafe := flagSafe || CheckSafeZone(pos[0], pos[1], pos[2], level) != nil
 		if stale {
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
+			if s.ackQueue != nil && addrStr != "" {
+				s.ackQueue.RemoveByAddr(addrStr)
+			}
 			s.sessions.RemoveSession(sessID)
 			if uuid != "" && dirty {
 				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+			}
+			// PRODUCTION FIX (§17.1): pull-the-cable combat logging must spawn
+			// a sleeper exactly like explicit disconnect. Old code only did
+			// this on OpDisconnect, so timeouts escaped punishment.
+			if (!inSafe || inCombat) && s.sleepers != nil && health > 0 {
+				if sleeper := s.sleepers.CreateSleeper(sess, 30*time.Second); sleeper != nil {
+					s.grid.Insert(sleeper.EntityID, sleeper.Position[0], sleeper.Position[2])
+					s.logger.Info("Spawned sleeper proxy for timed-out player",
+						zap.String("uuid", uuid),
+						zap.Uint32("entity_id", sleeper.EntityID),
+					)
+				}
 			}
 		} else {
 			if isSecondTick && uuid != "" {

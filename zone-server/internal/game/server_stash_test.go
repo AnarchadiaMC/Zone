@@ -53,6 +53,31 @@ func parseResponseFromBytes(t *testing.T, data []byte) protocol.StashResponsePay
 	return resp
 }
 
+// lastStashResponse scans recorded packets for the last OpStashResponse,
+// skipping OpAck packets. Required since HandlePacket now sends an unreliable
+// OpAck for every reliable inbound packet before the actual response.
+func lastStashResponse(t *testing.T, sent [][]byte) protocol.StashResponsePayload {
+	t.Helper()
+
+	for i := len(sent) - 1; i >= 0; i-- {
+		r := bytes.NewReader(sent[i])
+		hdr, err := protocol.ReadHeader(r)
+		if err != nil {
+			continue
+		}
+		if hdr.Opcode == protocol.OpStashResponse {
+			var resp protocol.StashResponsePayload
+			if err := binary.Read(r, binary.LittleEndian, &resp); err != nil {
+				t.Fatalf("lastStashResponse: failed to read payload: %v", err)
+			}
+			return resp
+		}
+	}
+	t.Fatalf("lastStashResponse: no OpStashResponse found in %d packets", len(sent))
+	var empty protocol.StashResponsePayload
+	return empty
+}
+
 // newTestServer builds a minimal Server wired to a fake UDP sink and an
 // in-memory SQLite database.
 func newTestServer(t *testing.T) (*Server, *fakeSink, *database.DB) {
@@ -167,7 +192,7 @@ func TestHandleOpStashInteract_Open(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.StashID != stashID {
 		t.Errorf("StashID: want %d, got %d", stashID, resp.StashID)
 	}
@@ -191,7 +216,7 @@ func TestHandleOpStashInteract_Open_NotFound(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 1 {
 		t.Errorf("expected Status=1 (NotFound), got %d", resp.Status)
 	}
@@ -218,7 +243,7 @@ func TestHandleOpStashInteract_Take(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 0 {
 		t.Errorf("Take: expected Status=0, got %d", resp.Status)
 	}
@@ -254,7 +279,7 @@ func TestHandleOpStashInteract_Take_InsufficientCount(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 2 {
 		t.Errorf("expected Status=2 (Error/InsufficientCount), got %d", resp.Status)
 	}
@@ -279,7 +304,7 @@ func TestHandleOpStashInteract_Store(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 0 {
 		t.Errorf("Store: expected Status=0, got %d", resp.Status)
 	}
@@ -310,7 +335,7 @@ func TestHandleOpStashInteract_UnknownAction(t *testing.T) {
 	if len(sink.sent) == 0 {
 		t.Fatal("expected a response packet, got none")
 	}
-	resp := parseResponseFromBytes(t, sink.sent[0])
+	resp := lastStashResponse(t, sink.sent)
 	if resp.Status != 2 {
 		t.Errorf("expected Status=2 (Error) for unknown action, got %d", resp.Status)
 	}

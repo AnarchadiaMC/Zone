@@ -40,29 +40,40 @@ function inject_button(xml_file_name, xml_obj)
         log("[Zone-Online] menu: injected btn_zone_online into " .. xml_file_name)
     end
 
-    -- Query shniaga_wnd: set y = 350 (shifted up from 419) and height = 360 (expanded from 280 for 9 buttons)
+    -- shniaga_wnd sizing: accommodate BOTH Zone (btn_zone_online) and xrRazom
+    -- (btn_multiplayer). Vanilla is y=419 h=280 (8 buttons). Zone alone needs
+    -- y=350 h=360 (9 buttons); with xrRazom present we need room for 10, so use
+    -- y=330 h=400. Never shrink an already-taller box set by another mod.
     local shniaga_nodes = xml_obj:query("shniaga_wnd")
     if shniaga_nodes then
         for _, el in ipairs(shniaga_nodes) do
+            local cur_h = el.attr and tonumber(el.attr.height) or 0
+            local want_y, want_h = "330", "400"
+            if cur_h and cur_h >= 400 then
+                want_y = el.attr.y or want_y
+                want_h = el.attr.height or want_h
+            end
             if xml_obj.setElementAttr then
-                xml_obj:setElementAttr(el, { y = "350", height = "360" })
+                pcall(function()
+                    xml_obj:setElementAttr(el, { y = want_y, height = want_h })
+                end)
             end
             if el.attr then
-                el.attr.y = "350"
-                el.attr.height = "360"
+                el.attr.y = want_y
+                el.attr.height = want_h
             end
         end
     end
 
-    -- Query static_disclaimer: set y = 705 (shifted down so it never collides with buttons)
+    -- Query static_disclaimer: keep below the expanded button box.
     local disclaimer_nodes = xml_obj:query("static_disclaimer")
     if disclaimer_nodes then
         for _, el in ipairs(disclaimer_nodes) do
             if xml_obj.setElementAttr then
-                xml_obj:setElementAttr(el, { y = "705" })
+                pcall(function() xml_obj:setElementAttr(el, { y = "725" }) end)
             end
             if el.attr then
-                el.attr.y = "705"
+                el.attr.y = "725"
             end
         end
     end

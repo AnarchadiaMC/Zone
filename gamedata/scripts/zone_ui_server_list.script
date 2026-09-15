@@ -209,11 +209,12 @@ function UIZoneServerList:LoadFavorites()
     end
 
     -- Seed default localhost server if no favorites exist
+    -- NOTE: must match zone-server default (zone_server.yaml port 27015).
     if #self.favorites == 0 then
         self.favorites[1] = {
             label  = "Local Dev Server",
             ip     = "127.0.0.1",
-            port   = 3000,
+            port   = 27015,
             status = "Ready"
         }
     end
@@ -249,93 +250,81 @@ function UIZoneServerList:RefreshList()
     self.sel_idx = nil
 end
 
+-- PRODUCTION FIX (crash on Connect):
+-- The engine nils os.remove/os.rename/os.execute/os.exit (see
+-- xray-monolith/src/xrServerEntities/script_storage.cpp disable_os_funcs).
+-- The old atomic tmp->rename flow therefore raised
+-- "attempt to call field 'remove' (a nil value)" inside the UI callback,
+-- which CScriptEngine turns into a FATAL ERROR / CTD.
+-- This version uses io.* only (always available) with a direct write.
 function UIZoneServerList:SaveFavorites()
     local target_path = get_identity_path()
     local lines = {}
     local in_history = false
     local history_written = false
 
-    local file = io.open(target_path, "r")
+    local ok_read, file_or_err = pcall(io.open, target_path, "r")
+    local file = ok_read and file_or_err or nil
     if file then
-        for line in file:lines() do
-            local sec = line:match("^%s*%[([^%]]+)%]")
-            if sec then
-                if in_history and not history_written then
-                    self:_emit_history_block(lines)
-                    history_written = true
-                end
-                in_history = (sec:lower() == HISTORY_SEC:lower())
-                if not in_history then
-                    lines[#lines + 1] = line
-                end
-            elseif not in_history then
-                -- Update nickname line in identity if modified, sanitizing input
-                local k = line:match("^%s*([%w_]+)%s*=")
-                if k and k:lower() == "nickname" and self.nick then
-                    lines[#lines + 1] = "nickname = " .. sanitize_nickname(self.nick)
-                else
-                    lines[#lines + 1] = line
+        local ok_lines = pcall(function()
+            for line in file:lines() do
+                local sec = line:match("^%s*%[([^%]]+)%]")
+                if sec then
+                    if in_history and not history_written then
+                        self:_emit_history_block(lines)
+                        history_written = true
+                    end
+                    in_history = (sec:lower() == HISTORY_SEC:lower())
+                    if not in_history then
+                        lines[#lines + 1] = line
+                    end
+                elseif not in_history then
+                    -- Update nickname line in identity if modified, sanitizing input
+                    local k = line:match("^%s*([%w_]+)%s*=")
+                    if k and k:lower() == "nickname" and self.nick then
+                        lines[#lines + 1] = "nickname = " .. sanitize_nickname(self.nick)
+                    else
+                        lines[#lines + 1] = line
+                    end
                 end
             end
+        end)
+        pcall(function() file:close() end)
+        if not ok_lines then
+            printf("Zone UI Error: Failed reading favorites file")
+            return false
         end
-        file:close()
     end
 
     if not history_written then
         self:_emit_history_block(lines)
     end
 
-    -- Atomic file writing: write to a temporary file, then rename or handle write failure gracefully
-    local tmp_path = target_path .. ".tmp"
-    local bak_path = target_path .. ".bak"
-    local out = io.open(tmp_path, "w")
+    -- Direct io-only write. No os.remove/os.rename (nilled by engine).
+    local ok_open, out_or_err = pcall(io.open, target_path, "w")
+    local out = ok_open and out_or_err or nil
     if not out then
-        printf("Zone UI Error: Failed to open temporary file '%s' for saving favorites", tmp_path)
+        printf("Zone UI Error: Failed to open favorites file for saving")
         return false
     end
 
     local write_ok = true
-    for _, l in ipairs(lines) do
-        local ok = out:write(l .. "\n")
-        if not ok then
-            write_ok = false
-            break
-        end
-    end
-    out:close()
-
-    if not write_ok then
-        printf("Zone UI Error: Failed writing favorites data to '%s'", tmp_path)
-        os.remove(tmp_path)
-        return false
-    end
-
-    -- Windows atomic replacement sequence:
-    -- Remove any stale backup, rename current file to backup, rename temp file to target
-    os.remove(bak_path)
-    os.rename(target_path, bak_path)
-
-    local ren_ok, ren_err = os.rename(tmp_path, target_path)
-    if ren_ok then
-        os.remove(bak_path)
-        return true
-    else
-        printf("Zone UI Warning: Atomic rename failed (%s). Restoring backup.", tostring(ren_err))
-        os.rename(bak_path, target_path)
-        -- Fallback: read tmp and write directly to target
-        local fin = io.open(tmp_path, "r")
-        if fin then
-            local data = fin:read("*a")
-            fin:close()
-            local fout = io.open(target_path, "w")
-            if fout then
-                fout:write(data)
-                fout:close()
+    local ok_write = pcall(function()
+        for _, l in ipairs(lines) do
+            local ok = out:write(l .. "\n")
+            if not ok then
+                write_ok = false
+                break
             end
         end
-        os.remove(tmp_path)
-        return true
+    end)
+    pcall(function() out:close() end)
+
+    if not ok_write or not write_ok then
+        printf("Zone UI Error: Failed writing favorites data")
+        return false
     end
+    return true
 end
 
 function UIZoneServerList:_emit_history_block(lines)
@@ -357,74 +346,92 @@ end
 -- ============================================================
 
 function UIZoneServerList:OnConnect()
-    local ip   = self.edit_ip   and self.edit_ip:GetText()   or ""
-    local port = self.edit_port and self.edit_port:GetText() or ""
-    local nick = self.edit_nick and self.edit_nick:GetText() or ""
+    -- Never fatal: any error below must be a log line, not a CTD.
+    local ok, err = pcall(function()
+        local ip   = self.edit_ip   and self.edit_ip:GetText()   or ""
+        local port = self.edit_port and self.edit_port:GetText() or ""
+        local nick = self.edit_nick and self.edit_nick:GetText() or ""
 
-    ip   = ip:match("^%s*(.-)%s*$") or ""
-    port = port:match("^%s*(.-)%s*$") or ""
-    nick = nick:match("^%s*(.-)%s*$") or ""
+        ip   = ip:match("^%s*(.-)%s*$") or ""
+        port = port:match("^%s*(.-)%s*$") or ""
+        nick = nick:match("^%s*(.-)%s*$") or ""
 
-    if ip == "" then
-        if db.actor then
-            db.actor:give_game_news("Zone", "ERROR: Server IP address is required.", "ui_inGame2_PDA_icon", 0, 4000, 1)
+        if ip == "" then
+            printf("Zone: Cannot connect - empty server IP")
+            return
         end
-        printf("Zone: Cannot connect — empty server IP")
-        return
-    end
 
-    local port_n = tonumber(port)
-    if not port_n or port_n < 1 or port_n > 65535 then
-        if db.actor then
-            db.actor:give_game_news("Zone", "ERROR: Invalid port number (1 - 65535).", "ui_inGame2_PDA_icon", 0, 4000, 1)
+        local port_n = tonumber(port)
+        if not port_n or port_n < 1 or port_n > 65535 then
+            printf("Zone: Cannot connect - invalid port")
+            return
         end
-        printf("Zone: Cannot connect — invalid port '%s'", tostring(port))
-        return
-    end
 
-    nick = sanitize_nickname(nick)
-    self.nick = nick
+        nick = sanitize_nickname(nick)
+        self.nick = nick
 
-    if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) and type(ZoneNet) == "nil" then
-        if db.actor then
-            db.actor:give_game_news("Zone", "ERROR: ZoneNet native DLL is not loaded.", "ui_inGame2_PDA_icon", 0, 5000, 1)
+        -- xrRazom compatibility: refuse Zone connect while co-op session is live.
+        -- Both mods spawn proxy stalkers and hook actor update; running both
+        -- simultaneously desyncs alife and double-spawns dummies.
+        local xrr_busy = false
+        pcall(function()
+            if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_busy = true end
+            if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_busy = true end
+            if _G.XrrNet then
+                local okc, connected = pcall(function() return _G.XrrNet():IsConnected() end)
+                if okc and connected then xrr_busy = true end
+                local okh, listening = pcall(function() return _G.XrrNet():IsListening() end)
+                if okh and listening then xrr_busy = true end
+            end
+        end)
+        if xrr_busy then
+            printf("Zone: Cannot connect - xrRazom co-op session is active. Disconnect from co-op first.")
+            return
         end
-        printf("Zone: ZoneNet DLL missing, cannot connect.")
-        return
-    end
 
-    printf("Zone UI: Connecting to %s:%d as '%s' (UUID: %s, HWID: %s)...", ip, port_n, nick, self.uuid, tostring(self.hwid))
-    ZoneNet:Connect(ip, port_n, self.uuid, self.hwid, nick)
-
-    -- Confirmation news tip
-    if db.actor then
-        db.actor:give_game_news(
-            "Zone",
-            string.format("Connecting to %s:%d as '%s'...", ip, port_n, nick),
-            "ui_inGame2_PDA_icon", 0, 5000, 1
-        )
-    end
-
-    -- Auto-save to favorites/history
-    local found = false
-    for _, e in ipairs(self.favorites) do
-        if e.ip == ip and e.port == port_n then
-            found = true
-            break
+        -- DLL check: FFI polyfill defines ZoneNet even without DLL, but its
+        -- methods are no-ops. Gate on the real loader flag.
+        local dll_ok = false
+        pcall(function()
+            if zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded() then
+                dll_ok = true
+            end
+        end)
+        if not dll_ok then
+            printf("Zone: ZoneNet DLL missing, cannot connect.")
+            return
         end
-    end
-    if not found and #self.favorites < MAX_FAVORITES then
-        self.favorites[#self.favorites + 1] = {
-            label  = string.format("%s:%d", ip, port_n),
-            ip     = ip,
-            port   = port_n,
-            status = "Recent"
-        }
-    end
-    self:SaveFavorites()
 
-    -- Close dialog
-    self:OnBack()
+        -- NOTE: engine printf only supports %s (see xray log literal %d bug).
+        printf(string.format("Zone UI: Connecting to %s:%s as %s UUID %s HWID %s",
+            tostring(ip), tostring(port_n), tostring(nick),
+            tostring(self.uuid), tostring(self.hwid)))
+        ZoneNet:Connect(ip, port_n, self.uuid, self.hwid, nick)
+
+        -- Auto-save to favorites/history (io-only, never fatal)
+        local found = false
+        for _, e in ipairs(self.favorites) do
+            if e.ip == ip and e.port == port_n then
+                found = true
+                break
+            end
+        end
+        if not found and #self.favorites < MAX_FAVORITES then
+            self.favorites[#self.favorites + 1] = {
+                label  = string.format("%s:%s", tostring(ip), tostring(port_n)),
+                ip     = ip,
+                port   = port_n,
+                status = "Recent"
+            }
+        end
+        pcall(function() self:SaveFavorites() end)
+
+        -- Close dialog
+        pcall(function() self:OnBack() end)
+    end)
+    if not ok then
+        printf("Zone UI Error: Connect failed safely (no crash)")
+    end
 end
 
 function UIZoneServerList:OnAddFavorite()
@@ -472,8 +479,8 @@ function UIZoneServerList:OnAddFavorite()
         status = "Saved"
     }
 
-    self:SaveFavorites()
-    self:RefreshList()
+    pcall(function() self:SaveFavorites() end)
+    pcall(function() self:RefreshList() end)
 
     if db.actor then
         db.actor:give_game_news("Zone", "Server added to favorites.", "ui_inGame2_PDA_icon", 0, 3000, 1)
@@ -494,8 +501,8 @@ function UIZoneServerList:OnDelFavorite()
     table.remove(self.favorites, tbl_idx)
     self.sel_idx = nil
 
-    self:SaveFavorites()
-    self:RefreshList()
+    pcall(function() self:SaveFavorites() end)
+    pcall(function() self:RefreshList() end)
 
     if db.actor then
         db.actor:give_game_news("Zone", "Favorite server removed.", "ui_inGame2_PDA_icon", 0, 3000, 1)

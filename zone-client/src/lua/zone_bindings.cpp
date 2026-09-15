@@ -51,7 +51,16 @@ extern "C" {
         {
             return false;
         }
-        return NetClient::PollEvent(buf, *len);
+        // PRODUCTION FIX: pass explicit 1500 capacity (g_poll_buf size) instead
+        // of the stale *len value, which holds the previous packet's length on
+        // the Lua side. Prevents false drops and documents the contract.
+        size_t got = 0;
+        if (!NetClient::PollEvent(buf, 1500, got))
+        {
+            return false;
+        }
+        *len = got;
+        return true;
     }
 
     __declspec(dllexport) bool ZN_IsInSafeZone()

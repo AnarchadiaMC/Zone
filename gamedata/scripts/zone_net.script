@@ -142,77 +142,132 @@ function dispatch_packet(pkt)
     elseif opcode == 0x0030 then
         zone_worldevent.on_world_event(pkt, offset)
     elseif opcode == 0x0050 then
+        -- 4+4+4+1 = 13 bytes; bounds-check before parsing (malicious server safe)
+        if string.len(pkt) < offset + 13 - 1 then return end
         local target_id, pos = read_uint32_le(pkt, offset)
         local attacker_id, pos = read_uint32_le(pkt, pos)
         local damage, pos = read_float_le(pkt, pos)
         local bone_id, pos = read_uint8(pkt, pos)
         if zone_dummy and zone_dummy.on_damage_notify then
-            zone_dummy.on_damage_notify(target_id, attacker_id, damage, bone_id)
+            pcall(zone_dummy.on_damage_notify, target_id, attacker_id, damage, bone_id)
         end
     elseif opcode == 0x0060 then
         -- L-03: Chat text: sender ID (4 bytes) + text length (1 byte) + text
+        -- Clamp text_len to actual payload to prevent overread on forged packets.
+        if string.len(pkt) < offset + 5 - 1 then return end
         local sender_id, cpos = read_uint32_le(pkt, offset)
         local text_len, cpos = read_uint8(pkt, cpos)
+        local avail = string.len(pkt) - cpos + 1
+        if text_len > avail then text_len = avail end
+        if text_len < 0 then text_len = 0 end
         local txt, _ = read_string(pkt, cpos, text_len)
-        if db.actor then
-            db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
+        if db.actor and txt and txt ~= "" then
+            pcall(function()
+                db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
+            end)
         end
     elseif opcode == 0x0070 then
-        zone_ai_proxy.on_ai_action(pkt, offset)
+        if zone_ai_proxy and zone_ai_proxy.on_ai_action then
+            pcall(zone_ai_proxy.on_ai_action, pkt, offset)
+        end
     end
+end
+
+-- xrRazom guard: when co-op is live, Zone stays dormant so the two proxy
+-- systems (XrrPlayers dummies vs zone_dummy proxies) never fight over alife.
+local function xrr_session_active()
+    local active = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then active = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then active = true end
+    end)
+    return active
 end
 
 function on_tick()
     local tg = time_global()
-    
-    -- Let dummy system interpolate every frame
+
+    -- Let dummy system interpolate every frame (pcall: never fatal)
     if zone_dummy and zone_dummy.interpolate_proxies then
-        zone_dummy.interpolate_proxies()
+        pcall(zone_dummy.interpolate_proxies)
     end
-    
+
+    if last_tick == 0 then
+        -- Init on first frame to avoid a giant dt velocity spike.
+        last_tick = tg
+        return
+    end
     if tg - last_tick < TICK_RATE_MS then
         return
     end
     local dt = (tg - last_tick) / 1000.0
+    if dt <= 0 or dt > 1.0 then
+        -- Clamp degenerate dt (load hitch / pause menu).
+        last_tick = tg
+        last_pos = nil
+        return
+    end
     last_tick = tg
-    
+
     if type(ZoneNet) == "nil" or not ZoneNet:IsConnected() then
         last_pos = nil
         return
     end
-    
-    if db.actor then
-        local pos = db.actor:position()
-        local dir = db.actor:direction()
-        
-        local vx, vy, vz = 0, 0, 0
-        if last_pos and dt > 0 then
-            vx = (pos.x - last_pos.x) / dt
-            vy = (pos.y - last_pos.y) / dt
-            vz = (pos.z - last_pos.z) / dt
-        end
-        last_pos = vector():set(pos)
-        
-        local yaw = math.atan2(dir.x, dir.z)
-        local dir_y_clamped = math.max(-1.0, math.min(1.0, dir.y))
-        local pitch = math.asin(dir_y_clamped)
-        
-        -- L-04: Moving state bitmask detection (mcCrouch = 0x10, mcSprint = 0x1000)
-        local animflags = 0
-        local mstate = (level.actor_moving_state and level.actor_moving_state()) or 0
-        if bit.band(mstate, 16) ~= 0 then animflags = bit.bor(animflags, 1) end -- Crouch (mcCrouch = 0x10)
-        if bit.band(mstate, 4096) ~= 0 then animflags = bit.bor(animflags, 2) end -- Sprint (mcSprint = 0x1000)
-        -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
-        
-        -- Send yaw * 100 and pitch * 100 matching server decoding float32(ct.Yaw)/100.0
-        ZoneNet:SendTransform(pos.x, pos.y, pos.z, yaw * 100, pitch * 100, vx, vy, vz, animflags)
+
+    -- Mutual exclusion with xrRazom: do not send Zone telemetry or consume
+    -- Zone snapshots while co-op owns the world.
+    if xrr_session_active() then
+        last_pos = nil
+        return
     end
-    
-    -- Poll all pending events
+
+    if db.actor then
+        local ok_tick = pcall(function()
+            local pos = db.actor:position()
+            local dir = db.actor:direction()
+
+            local vx, vy, vz = 0, 0, 0
+            if last_pos and dt > 0 then
+                vx = (pos.x - last_pos.x) / dt
+                vy = (pos.y - last_pos.y) / dt
+                vz = (pos.z - last_pos.z) / dt
+                -- Clamp to int16 wire range; server anti-cheat drops >25 m/s.
+                local function clamp16(v)
+                    if v > 30000 then return 30000 end
+                    if v < -30000 then return -30000 end
+                    return math.floor(v + 0.5)
+                end
+                vx, vy, vz = clamp16(vx), clamp16(vy), clamp16(vz)
+            end
+            last_pos = vector():set(pos)
+
+            local yaw = math.atan2(dir.x, dir.z)
+            local dir_y_clamped = math.max(-1.0, math.min(1.0, dir.y))
+            local pitch = math.asin(dir_y_clamped)
+
+            -- L-04: Moving state bitmask detection (mcCrouch = 0x10, mcSprint = 0x1000)
+            local animflags = 0
+            local mstate = (level.actor_moving_state and level.actor_moving_state()) or 0
+            if bit.band(mstate, 16) ~= 0 then animflags = bit.bor(animflags, 1) end -- Crouch (mcCrouch = 0x10)
+            if bit.band(mstate, 4096) ~= 0 then animflags = bit.bor(animflags, 2) end -- Sprint (mcSprint = 0x1000)
+            -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
+
+            -- Send yaw * 100 and pitch * 100 matching server decoding float32(ct.Yaw)/100.0
+            ZoneNet:SendTransform(pos.x, pos.y, pos.z,
+                math.floor(yaw * 100 + 0.5), math.floor(pitch * 100 + 0.5),
+                vx, vy, vz, animflags)
+        end)
+        if not ok_tick then
+            last_pos = nil
+        end
+    end
+
+    -- Poll all pending events (each dispatch isolated; one bad packet can't kill tick)
     while true do
-        local pkt = ZoneNet:PollEvent()
-        if not pkt then break end
-        dispatch_packet(pkt)
+        local pkt = nil
+        local ok_poll = pcall(function() pkt = ZoneNet:PollEvent() end)
+        if not ok_poll or not pkt then break end
+        pcall(dispatch_packet, pkt)
     end
 end
 

@@ -53,7 +53,9 @@ func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *
 			if nID == sessID {
 				continue
 			}
-			if count >= 64 {
+			// PRODUCTION FIX: Entries is [32]; the old >=64 cap panicked on
+			// index 32..63 with >32 players in radius. Cap at wire capacity.
+			if count >= len(snapshot.Entries) {
 				break
 			}
 

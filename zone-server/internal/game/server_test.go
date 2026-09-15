@@ -98,7 +98,10 @@ func TestHandlePacket_Handshake(t *testing.T) {
 	var req protocol.HandshakeReq
 	copy(req.UUID[:], "test-uuid-handshake-1")
 	copy(req.Nickname[:], "Stalker1")
-	req.ProtocolVer = 89
+	// Zone wire protocol version (protocol.ProtocolVer == 1).
+	// NOTE: xrRazom co-op uses protocol 89 — different protocol, must not be
+	// accepted here.
+	req.ProtocolVer = protocol.ProtocolVer
 
 	raw := buildTestPacket(t, protocol.OpHandshakeReq, 1, protocol.FlagReliable, req)
 	s.HandlePacket(raw, addr)

@@ -278,12 +278,33 @@ namespace
                             if (res >= (int)(sizeof(ZO_Header) + sizeof(HandshakeRes)))
                             {
                                 HandshakeRes* hr = (HandshakeRes*)(recvBuf + sizeof(ZO_Header));
-                                g_SessionID = hr->sessionID;
+                                // PRODUCTION FIX: honor status (0=ok, 1=full,
+                                // 2=banned, 3=version mismatch). Old code set
+                                // CONNECTED unconditionally, so banned players
+                                // walked in and version mismatches desynced.
+                                if (hr->status != 0)
                                 {
                                     std::lock_guard<std::mutex> lock(g_StateMutex);
-                                    g_State = CONNECTED;
+                                    switch (hr->status)
+                                    {
+                                    case 2: g_LastError = "Handshake rejected: banned"; break;
+                                    case 1: g_LastError = "Handshake rejected: server full"; break;
+                                    case 3: g_LastError = "Handshake rejected: version mismatch"; break;
+                                    default: g_LastError = "Handshake rejected: status " + std::to_string(hr->status); break;
+                                    }
+                                    g_SessionID = 0;
+                                    g_State = DISCONNECTED;
+                                    g_StateCV.notify_all();
                                 }
-                                g_StateCV.notify_all();
+                                else
+                                {
+                                    g_SessionID = hr->sessionID;
+                                    {
+                                        std::lock_guard<std::mutex> lock(g_StateMutex);
+                                        g_State = CONNECTED;
+                                    }
+                                    g_StateCV.notify_all();
+                                }
                             }
                         }
                         else if (hdr->opcode == (uint16_t)Opcode::SAFEZONE_STATE)
@@ -448,7 +469,14 @@ namespace NetClient
         memset(&g_ServerAddr, 0, sizeof(g_ServerAddr));
         g_ServerAddr.sin_family = AF_INET;
         g_ServerAddr.sin_port = htons(port);
-        inet_pton(AF_INET, ip.c_str(), &g_ServerAddr.sin_addr);
+        int ptonRes = inet_pton(AF_INET, ip.c_str(), &g_ServerAddr.sin_addr);
+        if (ptonRes != 1)
+        {
+            g_LastError = "Invalid server IP address: " + ip;
+            g_State = DISCONNECTED;
+            g_StateCV.notify_all();
+            return;
+        }
         
         g_ConnectRetries = 0;
         g_ConnectBackoffMs = 1000;
@@ -496,6 +524,11 @@ namespace NetClient
 
     bool PollEvent(char* outBuf, size_t& outLen)
     {
+        // Legacy 2-arg overload: capacity is implicitly 1500 (the FFI
+        // g_poll_buf size). The Lua side never presets *len (it holds the
+        // previous packet's length), so reading it as a capacity would cause
+        // false drops. New native code must call the 3-arg overload with an
+        // explicit capacity. ZN_PollEvent below does exactly that.
         return PollEvent(outBuf, 1500, outLen);
     }
 

@@ -13,10 +13,17 @@ type DB struct {
 }
 
 func Open(dbPath string) (*DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+	// PRODUCTION FIX: full WAL tuning per spec (busy_timeout avoids
+	// "database is locked" under concurrent AutoProvision + write queue;
+	// foreign_keys enforces cascades; cache_size 64MB page cache).
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)")
 	if err != nil {
 		return nil, err
 	}
+	// Single-writer serialization: SQLite WAL reads concurrently, but writes
+	// must serialize through one conn to avoid lock contention with the
+	// async write-behind queue.
+	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(SchemaSQL); err != nil {
 		return nil, err
@@ -78,12 +85,21 @@ func (d *DB) RawDB() *sql.DB {
 }
 
 func (d *DB) AutoProvision(uuid, hwid, nick string) error {
-	_, err := d.db.Exec(`INSERT OR IGNORE INTO accounts (client_uuid, hwid_hash, nickname, created_at, last_seen) VALUES (?, ?, ?, ?, ?)`, uuid, hwid, nick, time.Now().Unix(), time.Now().Unix())
+	// PRODUCTION FIX: atomic single transaction (old two-Exec path could leave
+	// an account row without a character row on crash).
+	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = d.db.Exec(`INSERT OR IGNORE INTO characters (client_uuid, updated_at) VALUES (?, ?)`, uuid, time.Now().Unix())
-	return err
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO accounts (client_uuid, hwid_hash, nickname, created_at, last_seen) VALUES (?, ?, ?, ?, ?)`, uuid, hwid, nick, now, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO characters (client_uuid, updated_at) VALUES (?, ?)`, uuid, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) LoadCharacter(uuid string) (*Character, error) {

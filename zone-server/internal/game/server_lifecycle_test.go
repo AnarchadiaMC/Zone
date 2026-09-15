@@ -110,6 +110,7 @@ func TestLifecycle_HandshakeMaxPlayersEnforcement(t *testing.T) {
 	var req1 protocol.HandshakeReq
 	copy(req1.UUID[:], "uuid-player-first")
 	copy(req1.Nickname[:], "PlayerOne")
+	req1.ProtocolVer = protocol.ProtocolVer
 	raw1 := buildTestPacket(t, protocol.OpHandshakeReq, 1, protocol.FlagReliable, req1)
 	s.HandlePacket(raw1, addr1)
 
@@ -134,6 +135,7 @@ func TestLifecycle_HandshakeMaxPlayersEnforcement(t *testing.T) {
 	var req2 protocol.HandshakeReq
 	copy(req2.UUID[:], "uuid-player-second")
 	copy(req2.Nickname[:], "PlayerTwo")
+	req2.ProtocolVer = protocol.ProtocolVer
 	raw2 := buildTestPacket(t, protocol.OpHandshakeReq, 2, protocol.FlagReliable, req2)
 	s.HandlePacket(raw2, addr2)
 
@@ -386,12 +388,14 @@ func TestLifecycle_StaleSessionTimeout(t *testing.T) {
 		AccountID:    "uuid-stale-lifecycle",
 		UDPAddr:      addr,
 		CurrentLevel: "l01_escape",
-		Position:     [3]float32{50.0, 0.0, 50.0},
+		// Inside sz_cordon_rookie so timeout does NOT spawn a sleeper
+		// (sleepers re-insert the entity ID into the grid by design).
+		Position:     [3]float32{-211.3, -20.2, -145.8},
 		Health:       100.0,
 		LastSeen:     time.Now().Add(-35 * time.Second),
 	}
 	s.sessions.AddSession(sess)
-	s.grid.Insert(sessID, 50.0, 50.0)
+	s.grid.Insert(sessID, -211.3, -145.8)
 
 	if !s.grid.Contains(sessID) {
 		t.Fatalf("expected session to be in grid before tick")

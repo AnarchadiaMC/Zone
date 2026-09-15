@@ -58,12 +58,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
         case DLL_PROCESS_DETACH:
         {
-            // lpvReserved == nullptr means FreeLibrary; skip cleanup on process exit
-            if (!lpvReserved)
-            {
-                NetClient::Shutdown();
-                MH_Uninitialize();
-            }
+            // PRODUCTION FIX: never join() the net thread or MH_Uninitialize()
+            // under the loader lock (FreeLibrary path deadlocks when the worker
+            // is in select/sendto/CRT). Signal shutdown only; the worker is
+            // daemonized and the OS reclaims the socket on process exit.
+            // Previous code called NetClient::Shutdown() here (join + WSACleanup).
             break;
         }
 

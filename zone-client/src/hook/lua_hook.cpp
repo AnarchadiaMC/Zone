@@ -19,11 +19,25 @@ namespace
     }
 }
 
+// NOTE (production): the game (xray-monolith, LuaJIT 2.0.4) links LuaJIT
+// STATICALLY into AnomalyDX*.exe (luajit.vcxproj StaticLibrary, USE_LUAJIT_ONE
+// undefined, script_storage.cpp calls luaL_openlibs in-process). There is no
+// LuaJIT.dll / lua51.dll module at runtime, so a MinHook detour on
+// luaL_openlibs via GetModuleHandle is a deliberate no-op. The supported
+// ZoneNet path is LuaJIT FFI (zone_net.script ffi.load("ZoneClient") +
+// ZN_* exports). This hook is retained only for forward-compat with a
+// hypothetical DLL-based Lua build; it must never be required for Connect.
 namespace LuaHook
 {
     void Install()
     {
         HMODULE hLua = GetModuleHandleA("LuaJIT.dll");
+        if (!hLua) hLua = GetModuleHandleA("lua51.dll");
+        if (!hLua)
+        {
+            OutputDebugStringA("[ZoneClient] LuaHook::Install: no Lua DLL (static EXE) - FFI polyfill is primary, skipping hook.\n");
+            return;
+        }
         if (hLua)
         {
             void* pTarget = (void*)GetProcAddress(hLua, "luaL_openlibs");
@@ -50,6 +64,7 @@ namespace LuaHook
     void Uninstall()
     {
         HMODULE hLua = GetModuleHandleA("LuaJIT.dll");
+        if (!hLua) hLua = GetModuleHandleA("lua51.dll");
         if (hLua)
         {
             void* pTarget = (void*)GetProcAddress(hLua, "luaL_openlibs");
