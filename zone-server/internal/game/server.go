@@ -329,15 +329,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		sessID := s.seq.Add(1)
 		token, _ := GenerateSessionToken()
 		sess := &network.PlayerSession{
-			SessionID:      sessID,
-			SessionToken:   token,
-			AccountID:      cleanUUID,
-			UDPAddr:        addr,
-			LastSeen:       time.Now(),
-			LastCheckpoint: time.Now(),
-			Health:         100.0,
-			CurrentLevel:   "l01_escape",
-			LastSequence:   hdr.SequenceNum,
+			SessionID:         sessID,
+			SessionToken:      token,
+			AccountID:         cleanUUID,
+			UDPAddr:           addr,
+			LastSeen:          time.Now(),
+			LastCheckpoint:    time.Now(),
+			LastTransformTime: time.Now(),
+			Health:            100.0,
+			CurrentLevel:      "l01_escape",
+			LastSequence:      hdr.SequenceNum,
 		}
 			if s.db != nil {
 				nick := nullTermString(req.Nickname[:])
@@ -353,6 +354,9 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					sess.Position = [3]float32{char.PosX, char.PosY, char.PosZ}
 					sess.Health = char.Health
 				}
+			}
+			if sess.Position == [3]float32{0, 0, 0} {
+				sess.Position = [3]float32{-211.3, -20.2, -145.8}
 			}
 
 			// Reclaim active sleeper if reconnecting (Issue 16)
@@ -513,18 +517,52 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					newPos := [3]float32{ct.PosX, ct.PosY, ct.PosZ}
 					valid, reason := s.anticheat.ValidateMove(sess, newPos, dt)
 					if !valid {
-						violations := s.anticheat.RecordViolation(sess.SessionID, reason)
-						if s.anticheat.ShouldKick(violations) {
-							s.logger.Warn("Kicking player for repeated anticheat violations",
+						sess.Lock()
+						dx := float64(newPos[0] - sess.LastRejectedPos[0])
+						dy := float64(newPos[1] - sess.LastRejectedPos[1])
+						dz := float64(newPos[2] - sess.LastRejectedPos[2])
+						dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+						if sess.HasRejected && dist <= 5.0 {
+							sess.RejectConfirm++
+						} else {
+							sess.LastRejectedPos = newPos
+							sess.HasRejected = true
+							sess.RejectConfirm = 1
+						}
+						confirm := sess.RejectConfirm
+						sess.Unlock()
+						if confirm >= 4 {
+							sess.Lock()
+							sess.Position = newPos
+							sess.LastTransformTime = now
+							sess.HasRejected = false
+							sess.RejectConfirm = 0
+							sess.Unlock()
+							s.anticheat.Reset(sess.SessionID)
+							s.logger.Info("accepted client relocation (level change/load?)",
 								zap.Uint32("session", sess.SessionID),
-								zap.String("reason", reason),
-								zap.Int("violations", violations),
+								zap.Any("pos", newPos),
 							)
-							s.KickSession(sess.SessionID)
+						} else {
+							violations := s.anticheat.RecordViolation(sess.SessionID, reason)
+							if s.anticheat.ShouldKick(violations) {
+								s.logger.Warn("Kicking player for repeated anticheat violations",
+									zap.Uint32("session", sess.SessionID),
+									zap.String("reason", reason),
+									zap.Int("violations", violations),
+								)
+								s.KickSession(sess.SessionID)
+								return
+							}
+							// Rubberband: drop packet and do not update position
 							return
 						}
-						// Rubberband: drop packet and do not update position
-						return
+					} else {
+						s.anticheat.Reset(sess.SessionID)
+						sess.Lock()
+						sess.HasRejected = false
+						sess.RejectConfirm = 0
+						sess.Unlock()
 					}
 				}
 

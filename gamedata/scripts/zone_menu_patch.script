@@ -9,18 +9,25 @@ local function install_methods()
     cls.OnButton_zone_online_clicked = function(self)
         if self.zone_server_browser_dlg == nil then
             if zone_ui_server_list and zone_ui_server_list.UIZoneServerList then
-                self.zone_server_browser_dlg = zone_ui_server_list.UIZoneServerList(self)
-                self.zone_server_browser_dlg:InitControls()
-                self.zone_server_browser_dlg:InitCallBacks()
+                local dlg = zone_ui_server_list.UIZoneServerList(self)
+                local ok = dlg:InitControls()
+                dlg:InitCallBacks()
+                self.zone_server_browser_dlg = dlg
+                if not (ok ~= false and dlg.list_servers) then
+                    printf("Zone UI init failed")
+                    self.zone_server_browser_dlg = nil
+                    return
+                end
             end
         else
             self.zone_server_browser_dlg:LoadFavorites()
         end
-        if self.zone_server_browser_dlg then
-            self.zone_server_browser_dlg:ShowDialog(true)
-            self.zone_server_browser_dlg:Show(true)
-            self:HideDialog()
-            self:Show(false)
+        local dlg = self.zone_server_browser_dlg
+        if dlg and dlg.list_servers then
+            pcall(function() self:HideDialog() end)
+            pcall(function() self:Show(false) end)
+            pcall(function() dlg:ShowDialog(true) end)
+            pcall(function() dlg:Show(true) end)
         end
     end
 end

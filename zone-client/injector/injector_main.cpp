@@ -46,6 +46,194 @@ static bool FileExists(const std::wstring& path)
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+static std::wstring GetFullPath(const std::wstring& relPath);
+
+static void EnsureDir(const std::wstring& dir)
+{
+    if (dir.empty())
+    {
+        return;
+    }
+    for (size_t i = 0; i < dir.size(); ++i)
+    {
+        if (dir[i] == L'\\' || dir[i] == L'/')
+        {
+            if (i <= 3 && dir.size() > 1 && dir[1] == L':')
+            {
+                continue;
+            }
+            std::wstring part = dir.substr(0, i);
+            if (!part.empty())
+            {
+                CreateDirectoryW(part.c_str(), nullptr);
+            }
+        }
+    }
+    CreateDirectoryW(dir.c_str(), nullptr);
+}
+
+static const wchar_t* kProvisionedFiles[] = {
+    L"gamedata\\configs\\mod_system_zone_online.ltx",
+    L"gamedata\\configs\\ui\\zone_ui_server_list.xml",
+    L"gamedata\\configs\\text\\eng\\ui_zone.xml",
+    L"gamedata\\configs\\text\\rus\\ui_zone.xml",
+    L"gamedata\\scripts\\modxml_zone_main_menu.script",
+    L"gamedata\\scripts\\zone_menu_patch.script",
+    L"gamedata\\scripts\\zone_net.script",
+    L"gamedata\\scripts\\zone_main.script",
+    L"gamedata\\scripts\\zone_ui_server_list.script",
+    L"gamedata\\scripts\\zone_ai_proxy.script",
+    L"gamedata\\scripts\\zone_dummy.script",
+    L"gamedata\\scripts\\zone_hud.script",
+    L"gamedata\\scripts\\zone_safezone.script",
+    L"gamedata\\scripts\\zone_worldevent.script"
+};
+static const size_t kProvisionedFileCount = sizeof(kProvisionedFiles) / sizeof(kProvisionedFiles[0]);
+
+static void PreProvisionAssets(const std::wstring& gameRoot, const std::wstring& injectorDir)
+{
+    if (gameRoot.empty())
+    {
+        return;
+    }
+    std::wstring injDir = injectorDir;
+    if (injDir.empty())
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        injDir = exePath;
+        size_t lastSlash = injDir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            injDir = injDir.substr(0, lastSlash);
+        }
+    }
+    if (injDir.empty())
+    {
+        return;
+    }
+    const std::wstring kProbe = L"configs\\ui\\zone_ui_server_list.xml";
+    std::wstring srcBase;
+    const std::wstring kCand0 = injDir + L"\\..\\..\\gamedata\\";
+    const std::wstring kCand1 = injDir + L"\\..\\..\\..\\gamedata\\";
+    if (FileExists(GetFullPath(kCand0 + kProbe)))
+    {
+        srcBase = GetFullPath(kCand0);
+    }
+    else if (FileExists(GetFullPath(kCand1 + kProbe)))
+    {
+        srcBase = GetFullPath(kCand1);
+    }
+    if (srcBase.empty())
+    {
+        std::wcout << L"[*] Asset pre-provision skipped (no source gamedata found).\n";
+        return;
+    }
+    if (!srcBase.empty() && srcBase.back() != L'\\' && srcBase.back() != L'/')
+    {
+        srcBase += L"\\";
+    }
+    int copied = 0;
+    for (size_t i = 0; i < kProvisionedFileCount; ++i)
+    {
+        std::wstring relW(kProvisionedFiles[i]);
+        std::wstring sub = relW;
+        if (sub.compare(0, 9, L"gamedata\\") == 0)
+        {
+            sub = sub.substr(9);
+        }
+        std::wstring src = srcBase + sub;
+        std::wstring dst = gameRoot + L"\\" + relW;
+        size_t slash = dst.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            EnsureDir(dst.substr(0, slash));
+        }
+        if (CopyFileW(src.c_str(), dst.c_str(), FALSE))
+        {
+            ++copied;
+        }
+        else
+        {
+            std::wcout << L"[!] Pre-provision copy failed: " << src << L" -> " << dst << L" (error " << GetLastError() << L")\n";
+        }
+    }
+    std::wcout << L"[*] Asset pre-provision copied " << copied << L" files.\n";
+}
+
+static int PurgeProvisionedFiles(const std::wstring& gameRoot)
+{
+    if (gameRoot.empty())
+    {
+        return 1;
+    }
+    int removed = 0;
+    int missing = 0;
+    int errors = 0;
+    for (size_t i = 0; i < kProvisionedFileCount; ++i)
+    {
+        std::wstring rel(kProvisionedFiles[i]);
+        std::wstring path = gameRoot + L"\\" + rel;
+        if (!FileExists(path))
+        {
+            ++missing;
+        }
+        else if (DeleteFileW(path.c_str()))
+        {
+            ++removed;
+        }
+        else
+        {
+            DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            {
+                ++missing;
+            }
+            else
+            {
+                std::wcerr << L"[!] Cleanup failed: " << path << L" (error " << err << L")\n";
+                ++errors;
+            }
+        }
+        std::wstring pattern = gameRoot + L"\\" + rel + L".tmp.*";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            std::wstring dir = gameRoot;
+            size_t slash = rel.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+            {
+                dir = gameRoot + L"\\" + rel.substr(0, slash);
+            }
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                {
+                    continue;
+                }
+                std::wstring tmpPath = dir + L"\\" + fd.cFileName;
+                if (DeleteFileW(tmpPath.c_str()))
+                {
+                    ++removed;
+                }
+                else
+                {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+                    {
+                        std::wcerr << L"[!] Cleanup failed: " << tmpPath << L" (error " << err << L")\n";
+                        ++errors;
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+    std::wcout << L"[+] Cleanup: " << removed << L" removed, " << missing << L" already absent\n";
+    return (errors == 0) ? 0 : 1;
+}
+
 // ---------------------------------------------------------------------------
 // Utility: Resolve path to full absolute path
 // ---------------------------------------------------------------------------
@@ -471,7 +659,8 @@ static int ModePid(DWORD pid, const std::wstring& dllPath)
 // ---------------------------------------------------------------------------
 static int ModeLaunch(const std::wstring& rawExePath,
                       const std::vector<std::wstring>& extraArgs,
-                      const std::wstring& dllPath)
+                      const std::wstring& dllPath,
+                      bool ephemeral)
 {
     std::wstring exePath = GetFullPath(rawExePath);
     if (!FileExists(exePath))
@@ -496,6 +685,18 @@ static int ModeLaunch(const std::wstring& rawExePath,
                 workDir = candidateRoot;
             }
         }
+    }
+
+    {
+        wchar_t injPath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, injPath, MAX_PATH);
+        std::wstring injDir(injPath);
+        size_t injSlash = injDir.find_last_of(L"\\/");
+        if (injSlash != std::wstring::npos)
+        {
+            injDir = injDir.substr(0, injSlash);
+        }
+        PreProvisionAssets(workDir, injDir);
     }
 
     // Build command line string: "<exe>" [args...]
@@ -564,6 +765,24 @@ static int ModeLaunch(const std::wstring& rawExePath,
     // C-26: Keep pi.hProcess and pi.hThread open and pass pi.hProcess directly to eliminate TOCTOU PID reuse race
     std::wcout << L"[*] Injecting " << dllPath << L" into PID " << pi.dwProcessId << L"...\n";
     bool injected = InjectDLL(pi.hProcess, dllPath);
+    if (injected && ephemeral)
+    {
+        std::wcout << L"[*] Ephemeral mode: waiting for game exit...\n";
+        DWORD wr = WaitForSingleObject(pi.hProcess, INFINITE);
+        if (wr != WAIT_OBJECT_0)
+        {
+            std::wcerr << L"[!] Wait for game exit failed (error " << GetLastError() << L")\n";
+        }
+        int purgeRc = PurgeProvisionedFiles(workDir);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        std::wcout << L"[+] Ephemeral session ended - game files purged\n";
+        if (purgeRc != 0)
+        {
+            return 1;
+        }
+        return 0;
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
@@ -578,6 +797,66 @@ static int ModeLaunch(const std::wstring& rawExePath,
 }
 
 // ---------------------------------------------------------------------------
+// Mode: --cleanup <game_exe_or_root> (purge pre-provisioned zone files)
+// ---------------------------------------------------------------------------
+static int ModeCleanup(const std::wstring& rawPath)
+{
+    std::wstring full = GetFullPath(rawPath);
+    while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/'))
+    {
+        full.pop_back();
+    }
+    std::wstring gameRoot;
+    DWORD attr = GetFileAttributesW(full.c_str());
+    bool isDir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+    if (isDir)
+    {
+        gameRoot = full;
+        if (!FileExists(gameRoot + L"\\fsgame.ltx"))
+        {
+            size_t slash = gameRoot.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+            {
+                std::wstring parent = gameRoot.substr(0, slash);
+                if (FileExists(parent + L"\\fsgame.ltx"))
+                {
+                    gameRoot = parent;
+                }
+            }
+        }
+    }
+    else
+    {
+        size_t lastSlash = full.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            gameRoot = full.substr(0, lastSlash);
+        }
+        else
+        {
+            gameRoot = full;
+        }
+        size_t parentSlash = gameRoot.find_last_of(L"\\/");
+        if (parentSlash != std::wstring::npos)
+        {
+            std::wstring candidateRoot = gameRoot.substr(0, parentSlash);
+            if (FileExists(candidateRoot + L"\\fsgame.ltx"))
+            {
+                gameRoot = candidateRoot;
+            }
+        }
+    }
+    if (gameRoot.empty())
+    {
+        std::wcerr << L"[!] Cleanup failed: unable to resolve game root.\n";
+        return 1;
+    }
+    std::wcout << L"[*] Mode: CLEANUP\n";
+    std::wcout << L"[*] Game Root: " << gameRoot << L"\n";
+    return PurgeProvisionedFiles(gameRoot);
+}
+
+// ---------------------------------------------------------------------------
 // Usage Display
 // ---------------------------------------------------------------------------
 static void ShowUsage(const wchar_t* exeName)
@@ -586,13 +865,18 @@ static void ShowUsage(const wchar_t* exeName)
                << L"Modes:\n"
                << L"  --wait                     (Default) Poll for running Anomaly processes and inject\n"
                << L"  --launch <exe> [args...]   Spawn game process (CREATE_SUSPENDED -> Resume) and inject\n"
-               << L"  --pid <pid>                Inject directly into specified process ID\n\n"
+               << L"  --pid <pid>                Inject directly into specified process ID\n"
+               << L"  --cleanup <exe_or_root>    Purge pre-provisioned zone files from game root\n\n"
                << L"Options:\n"
                << L"  --dll <path>               Custom path to ZoneClient.dll (default: ZoneClient.dll next to injector)\n"
+               << L"  --ephemeral                With --launch: wait for game exit then purge zone files\n"
                << L"  --help, -h                 Display this help message\n\n"
                << L"Examples:\n"
                << L"  ZoneClient_Injector.exe --wait\n"
                << L"  ZoneClient_Injector.exe --launch \"C:\\Anomaly\\bin\\AnomalyDX11.exe\" -dbg -smap4096\n"
+               << L"  ZoneClient_Injector.exe --launch \"C:\\Anomaly\\bin\\AnomalyDX11.exe\" --ephemeral\n"
+               << L"  ZoneClient_Injector.exe --cleanup \"C:\\Anomaly\\bin\\AnomalyDX11.exe\"\n"
+               << L"  ZoneClient_Injector.exe --cleanup \"C:\\Anomaly\"\n"
                << L"  ZoneClient_Injector.exe --pid 12345\n"
                << L"  ZoneClient_Injector.exe --dll \"C:\\Path\\To\\ZoneClient.dll\" --wait\n";
 }
@@ -648,7 +932,39 @@ int main(int argc, char** argv)
 
     std::wcout << L"[*] DLL Target: " << dllPath << L"\n\n";
 
+    bool ephemeral = false;
+    for (size_t i = 1; i < args.size();)
+    {
+        if (args[i] == L"--ephemeral")
+        {
+            ephemeral = true;
+            args.erase(args.begin() + static_cast<ptrdiff_t>(i));
+        }
+        else
+        {
+            ++i;
+        }
+    }
+
+    if (ephemeral && (args.size() < 2 || args[1] != L"--launch"))
+    {
+        std::wcerr << L"[!] Error: --ephemeral requires --launch.\n\n";
+        ShowUsage(progName);
+        return 1;
+    }
+
     // Determine Mode
+    if (args.size() >= 2 && args[1] == L"--cleanup")
+    {
+        if (args.size() < 3)
+        {
+            std::wcerr << L"[!] Error: --cleanup requires a game exe or root argument.\n\n";
+            ShowUsage(progName);
+            return 1;
+        }
+        return ModeCleanup(args[2]);
+    }
+
     if (args.size() >= 2 && args[1] == L"--pid")
     {
         if (args.size() < 3)
@@ -695,7 +1011,7 @@ int main(int argc, char** argv)
             extraArgs.push_back(args[i]);
         }
 
-        return ModeLaunch(exePath, extraArgs, dllPath);
+        return ModeLaunch(exePath, extraArgs, dllPath, ephemeral);
     }
 
     if (args.size() >= 2 && args[1] != L"--wait")

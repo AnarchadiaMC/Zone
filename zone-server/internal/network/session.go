@@ -22,6 +22,9 @@ type PlayerSession struct {
 	LastSeen          time.Time
 	LastSequence      uint32
 	LastTransformTime time.Time
+	LastRejectedPos   [3]float32
+	RejectConfirm     int
+	HasRejected       bool
 	SessionToken      uint64
 	Dirty             bool
 	LastCheckpoint    time.Time

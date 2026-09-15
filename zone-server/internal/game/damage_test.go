@@ -83,16 +83,16 @@ func TestDamage_SessionMismatch(t *testing.T) {
 func TestDamage_SafeZoneImmunity(t *testing.T) {
 	dh := NewDamageHandler()
 
-	// Case 1: Attacker in safe zone, target outside
+	// Case 1: Attacker in safe zone, target outside -> allowed
 	attacker, target := createTestSessions()
 	attacker.InSafeZone = true
 	dmg := &protocol.DamageNotify{AttackerID: 1, TargetID: 2, Damage: 50.0}
 	applied, valid, reason := dh.ValidateAndApplyDamage(attacker, target, dmg)
-	if valid || applied != 0 || reason != "safe zone immunity" {
-		t.Fatalf("expected safe zone immunity when attacker is in safe zone, got valid=%v, applied=%v, reason=%q", valid, applied, reason)
+	if !valid || applied != 50.0 || reason != "" {
+		t.Fatalf("expected damage allowed when only attacker in safe zone, got valid=%v, applied=%v, reason=%q", valid, applied, reason)
 	}
-	if target.Health != 100.0 {
-		t.Fatalf("target health should not decrease, got %f", target.Health)
+	if target.Health != 50.0 {
+		t.Fatalf("target health should decrease to 50, got %f", target.Health)
 	}
 
 	// Case 2: Attacker outside, target in safe zone

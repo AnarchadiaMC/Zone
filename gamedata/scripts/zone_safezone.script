@@ -1,18 +1,88 @@
 -- zone_safezone.script
--- Safe zone enforcement and combat protection for Zone.
+-- Safe zone damage gate. Weapons always function, keys never blocked.
+-- Hits deal no damage to PROTECTED victims inside safe zones.
 
 local in_safe_zone = false
 local safe_zone_active = false
 local safe_zone_id = ""
-local last_reholster_time = 0
-local REHOLSTER_INTERVAL_MS = 1000 -- 1 Hz max re-holster (never every frame)
 
---- Handles server packet PKT_SAFEZONE_STATE (opcode 0x0020).
---- @param pkt string  raw network packet buffer
---- @param offset number  1-based byte offset following 12-byte header
+local SAFE_ZONES = {
+    { id = "sz_cordon_rookie", level = "l01_escape", x = -211.3, y = -20.2, z = -145.8, r = 65.0, h = 20.0 },
+    { id = "sz_cordon_farm", level = "l01_escape", x = 32.4, y = 3.1, z = 150.2, r = 50.0, h = 20.0 },
+    { id = "sz_garbage_flea", level = "l02_garbage", x = -88.5, y = -0.5, z = -8.2, r = 45.0, h = 20.0 },
+    { id = "sz_rostok_bar", level = "l05_bar_rostok", x = 30.5, y = 0.5, z = 138.2, r = 120.0, h = 20.0 },
+    { id = "sz_darkvalley_base", level = "l04_darkvalley", x = 122.0, y = 1.2, z = -260.5, r = 80.0, h = 20.0 },
+    { id = "sz_agroprom_camp", level = "l03_agroprom", x = -150.2, y = 5.4, z = -40.0, r = 55.0, h = 20.0 },
+    { id = "sz_warehouses_base", level = "l07_military", x = -15.4, y = -5.2, z = 220.6, r = 110.0, h = 20.0 },
+    { id = "sz_yantar_bunker", level = "l08_yantar", x = 32.8, y = -11.5, z = -270.2, r = 45.0, h = 20.0 },
+    { id = "sz_deadcity_base", level = "l09_deadcity", x = 5.0, y = 2.1, z = 30.5, r = 75.0, h = 20.0 },
+    { id = "sz_swamp_clearsky", level = "k00_marsh", x = -140.2, y = 1.5, z = -305.0, r = 85.0, h = 20.0 },
+    { id = "sz_zaton_skadovsk", level = "zaton", x = 112.5, y = -4.5, z = 182.3, r = 65.0, h = 20.0 },
+    { id = "sz_jupiter_yanov", level = "jupiter", x = -40.0, y = 3.5, z = 220.0, r = 75.0, h = 20.0 },
+}
+
+local function pos_in_safezone(pos, cur_level)
+    if not pos then return false end
+    local px = tonumber(pos.x)
+    local py = tonumber(pos.y)
+    local pz = tonumber(pos.z)
+    if not px or not py or not pz then return false end
+    for i = 1, #SAFE_ZONES do
+        local sz = SAFE_ZONES[i]
+        if sz.level == cur_level then
+            local dx = px - sz.x
+            local dz = pz - sz.z
+            if (dx * dx + dz * dz) <= (sz.r * sz.r) then
+                if math.abs(py - sz.y) <= (sz.h / 2) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local BLOCKED = {}
+
+local function build_blocklist()
+    local names = { "kWPN_FIRE" }
+    for _, n in ipairs(names) do
+        if key_bindings then
+            local bind = key_bindings[n]
+            if bind then BLOCKED[bind] = true end
+        end
+    end
+end
+
+local function actor_in_zone()
+    if not db or not db.actor then return false end
+    local ok_pos, apos = pcall(function() return db.actor:position() end)
+    if not ok_pos or not apos then return false end
+    if not tonumber(apos.x) or not tonumber(apos.y) or not tonumber(apos.z) then return false end
+    local ok_lvl, lvl = pcall(function() return level.name() end)
+    if not ok_lvl or type(lvl) ~= "string" or lvl == "" then return false end
+    local ok_geo, inside = pcall(function() return pos_in_safezone(apos, lvl) end)
+    if not ok_geo then return false end
+    return inside == true
+end
+
+local function on_before_key_press(dik, bind, dis, flags)
+    pcall(function()
+        if actor_in_zone() and flags and BLOCKED[bind] then flags.ret_value = false end
+    end)
+end
+
+local function on_before_key_hold(dik, bind, dis, flags)
+    pcall(function()
+        if actor_in_zone() and flags and BLOCKED[bind] then flags.ret_value = false end
+    end)
+end
+
 function on_safezone_state(pkt, offset)
-    local locked, pos = zone_net.read_uint8(pkt, offset)
-    local zone_id_raw, _ = zone_net.read_string(pkt, pos, 32)
+    local ok_r, locked, pos = pcall(function() return zone_net.read_uint8(pkt, offset) end)
+    if not ok_r then return end
+    local ok_s, zone_id_raw, _ = pcall(function() return zone_net.read_string(pkt, pos, 32) end)
+    if not ok_s then return end
     local zid = zone_id_raw and zone_id_raw:gsub("%z+", "") or ""
 
     local is_locked = (locked == 1)
@@ -22,9 +92,6 @@ function on_safezone_state(pkt, offset)
 
     if is_locked then
         safe_zone_id = zid
-        if db.actor and db.actor.hide_weapon then
-            pcall(function() db.actor:hide_weapon() end)
-        end
         if zone_hud and zone_hud.notify_safezone then
             pcall(function() zone_hud.notify_safezone(true, zid) end)
         end
@@ -33,81 +100,39 @@ function on_safezone_state(pkt, offset)
         if zone_hud and zone_hud.notify_safezone then
             pcall(function() zone_hud.notify_safezone(false, "") end)
         end
-        if db.actor and db.actor.restore_weapon then
-            pcall(function() db.actor:restore_weapon() end)
-        end
     end
 end
 
---- Prevents all damage to the actor while inside a safe zone.
---- NOTE: draftsman/safe-position consideration deliberately omitted here
---- (would need unverified position APIs; do NOT call them from this callback).
-function on_before_hit(npc, s_hit, bone_id)
-    if not db.actor then return end
-    if not safe_zone_active and not in_safe_zone then return end
-
+function on_before_hit(victim, s_hit, bone_id)
+    if not victim or not s_hit then return end
     pcall(function()
-        -- Check if it is the local player taking damage inside a safe zone
-        if npc and db.actor and npc.id and db.actor.id and npc:id() == db.actor:id() then
-            if s_hit then
-                s_hit.power = 0
-            end
-        elseif npc and s_hit then
-            -- FIX: zero the hit power (s_hit), not npc.power (wrong object).
-            s_hit.power = 0
+        local ok_pos, vpos = pcall(function() return victim:position() end)
+        if not ok_pos or not vpos then return end
+
+        local cur_level = nil
+        local ok_lvl, lvl = pcall(function() return level.name() end)
+        if ok_lvl and type(lvl) == "string" and lvl ~= "" then
+            cur_level = lvl
+        else
+            cur_level = nil
         end
+
+        local ok_geo, inside = pcall(function() return pos_in_safezone(vpos, cur_level) end)
+        if not ok_geo or inside ~= true then return end
+
+        pcall(function() s_hit.power = 0 end)
     end)
 end
 
---- Intercepts weapon fire input inside safe zones.
-function on_key_press(key)
-    if not (safe_zone_active or in_safe_zone) or not db.actor then return end
-
-    pcall(function()
-        if dik_to_bind and key_bindings then
-            local bind = dik_to_bind(key)
-            if bind == key_bindings.kWPN_FIRE or (key_bindings.kWPN_ZOOM and bind == key_bindings.kWPN_ZOOM) then
-                if db.actor and db.actor.hide_weapon then
-                    db.actor:hide_weapon()
-                end
-            end
-        end
-    end)
-end
-
---- Periodically ensures weapons stay holstered while in safe zone.
---- NOTE: weapon_safemode API from the old spec does not exist in this engine
---- build, so hide_weapon/restore_weapon (guarded by pcall + nil check) is the
---- correct fallback. Throttled to at most 1 Hz (not every frame).
-local function on_actor_update()
-    if not (safe_zone_active or in_safe_zone) or not db.actor then return end
-
-    pcall(function()
-        local tg = 0
-        if time_global then tg = time_global() end
-        if tg - last_reholster_time < REHOLSTER_INTERVAL_MS then return end
-        local wpn = db.actor:active_item()
-        if (IsWeapon and wpn and IsWeapon(wpn)) or (wpn and wpn.is_weapon and wpn:is_weapon()) then
-            if db.actor and db.actor.hide_weapon then
-                db.actor:hide_weapon()
-                last_reholster_time = tg
-            end
-        end
-    end)
-end
-
---- Resets safe zone state (e.g. on level transition or disconnect).
 function reset()
     safe_zone_active = false
     in_safe_zone = false
     safe_zone_id = ""
-    last_reholster_time = 0
     if zone_hud and zone_hud.notify_safezone then
         pcall(function() zone_hud.notify_safezone(false, "") end)
     end
 end
 
---- Handle player or network disconnect
 function on_disconnect()
     reset()
 end
@@ -116,24 +141,23 @@ local function on_level_changing()
     reset()
 end
 
---- Query if local player is currently within a safe zone.
---- @return boolean
 function is_in_safe_zone()
     return safe_zone_active == true or in_safe_zone == true
 end
 
---- Query the ID of the current safe zone, if any.
---- @return string
 function get_safe_zone_id()
     return safe_zone_id or ""
 end
 
 function on_game_start()
+    build_blocklist()
     if RegisterScriptCallback then
-        RegisterScriptCallback("actor_on_before_hit",  on_before_hit)
-        RegisterScriptCallback("on_key_press",         on_key_press)
-        RegisterScriptCallback("actor_on_update",      on_actor_update)
-        RegisterScriptCallback("on_level_changing",    on_level_changing)
-        RegisterScriptCallback("actor_on_net_destroy", reset)
+        pcall(function() RegisterScriptCallback("actor_on_before_hit", on_before_hit) end)
+        pcall(function() RegisterScriptCallback("npc_on_before_hit", on_before_hit) end)
+        pcall(function() RegisterScriptCallback("monster_on_before_hit", on_before_hit) end)
+        pcall(function() RegisterScriptCallback("on_level_changing", on_level_changing) end)
+        pcall(function() RegisterScriptCallback("actor_on_net_destroy", reset) end)
+        pcall(function() RegisterScriptCallback("on_before_key_press", on_before_key_press) end)
+        pcall(function() RegisterScriptCallback("on_before_key_hold", on_before_key_hold) end)
     end
 end
