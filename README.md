@@ -21,7 +21,7 @@ graph TB
         SRV --> UDP["network.UDPListener<br/>8 worker goroutines<br/>FNV-1a address affinity"]
         SRV --> SPATIAL["game.SpatialGrid<br/>64m cells"]
         SRV --> AOI["game.AoIManager<br/>220m interest radius"]
-        SRV --> SZ["game.SafeZone<br/>8 cylindrical zones"]
+        SRV --> SZ["game.SafeZone<br/>12 cylindrical zones"]
         SRV --> ACK["network.AckQueue<br/>500ms retransmit"]
         SRV --> AI["ai.SquadManager"]
         DB[("SQLite WAL<br/>7 tables<br/>zone_world.db")] --- SRV
@@ -38,11 +38,11 @@ graph TB
         HOOK["MinHook detour on<br/>luaL_openlibs in LuaJIT.dll"]
         PROV["AssetProvisioner<br/>auto-writes missing configs"]
         ID["Identity<br/>UUID + HWID hash<br/>persisted in %APPDATA%"]
-        BIND["ZoneNet Lua Polyfill<br/>8 FFI wrappers in zone_net.script"]
+        BIND["ZoneNet Lua Polyfill<br/>10 Lua wrappers in zone_net.script"]
         RING["Lock-free SPSC Ring Buffer<br/>256 entries × 1500 bytes"]
     end
 
-    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 14 opcodes"| NET
+    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 16 opcodes"| NET
     BIND <-.->|"ZoneNet.* Lua calls"| SCRIPTS
 
     style Server fill:#1a1a2e,stroke:#0f3460,color:#e0e0e0
@@ -58,13 +58,13 @@ graph TB
 
 - **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue (buffered channel, capacity 1000) is wired into the game loop for non-blocking DB writes.
 
-- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — never overwrites existing files.
+- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — DLTX configs only if missing (user edits preserved); scripts + UI XML overwritten atomically (temp + `MoveFileEx`) to match the DLL.
 
 - **Native X-Ray UI** — Zero external overlay layers or DirectX Present hooks. Injects a native `CUI3tButton` on the main menu via Lua script, opening a native `CUIScriptWnd` Server Browser with Direct Connect, persistent Favorites (up to 16), and double-click-to-connect.
 
 - **Cubic Hermite Spline Interpolation** — Remote stalker proxies are smoothed using Catmull-Rom tangent estimation with a **100ms jitter buffer** and an 8-sample position history ring buffer, eliminating stuttering and rubberbanding.
 
-- **Cylindrical Safe Zones** — 8 canonical Zone locations enforce weapon holstering, godmode protection, and PDA alerts on entry/leave. Server-authoritative boundary checks use 2D distance + vertical half-extent.
+- **Cylindrical Safe Zones** — 12 canonical Zone locations enforce weapon holstering, godmode protection, and PDA alerts on entry/leave. Server-authoritative boundary checks use 2D distance + vertical half-extent.
 
 - **Lock-Free Networking** — Client uses a single-producer/single-consumer ring buffer (256 entries) for received packets. Server dispatches packets across 8 worker goroutines using FNV-1a hash of the client address for per-client ordering guarantees.
 
@@ -222,13 +222,13 @@ sequenceDiagram
 | Opcode | Name | Dir | Payload |
 |:---:|:---|:---:|:---|
 | `0x0001` | `PKT_HANDSHAKE_REQ` | C→S | UUID (37B), HWID (32B SHA-256), Nickname (32B), ProtoVer (1B) |
-| `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B) |
+| `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B: 0=ok/1=full/2=banned/3=version), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B) |
 | `0x0003` | `PKT_DISCONNECT` | Both | Reason (1B) |
 | `0x0004` | `PKT_HEARTBEAT` | Both | Timestamp (8B) |
 | `0x0005` | `PKT_ACK` | Both | Sequence (4B) |
-| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (1B) |
+| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | 27B total: SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (1B) |
 | `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), Array of 32: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
-| `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | EntityID (4B), Type (1B), Section (32B), PosXYZ (12B), Faction (1B), Health (2B) |
+| `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | EntityID (4B), Type (1B), Section (32B), PosXYZ (12B), Faction (16B), Health (1B) |
 | `0x0013` | `PKT_ENTITY_LEAVE_AOI` | S→C | EntityID (4B) |
 | `0x0020` | `PKT_SAFEZONE_STATE` | S→C | Locked (1B: 0=free, 1=locked), ZoneID (32B) |
 | `0x0030` | `PKT_WORLD_EVENT` | S→C | EventType (1B), State (1B), Timer (4B) |
@@ -237,6 +237,8 @@ sequenceDiagram
 | `0x0050` | `PKT_DAMAGE_NOTIFY` | Both | TargetSessionID (4B), AttackerSessionID (4B), Damage (4B float), BoneID (1B) |
 | `0x0060` | `PKT_CHAT_TEXT` | Both | SenderID (4B), Length (1B), Message Text (up to 255B) |
 | `0x0070` | `PKT_AI_ACTION_EVENT` | S→C | EntityID (4B), Action (1B: Idle/Patrol/Attack/Flee/Death), TargetID (4B) |
+
+Handshake `Status` surfaces distinct client errors via `ZN_GetLastError` (full/banned/version). Chat is level-filtered + rate-limited (5 msgs/5s per session). Reliable inbound packets are ACKed immediately; replayed reliable sequences are dropped after ACK.
 
 ---
 
@@ -257,14 +259,14 @@ cmake --build build --config Release
 ```
 
 ### 3. Launch & Connect
-Launch Anomaly using the automated injector:
+Inject first, then use the in-game browser (the DLL must be loaded before the menu opens):
 ```bat
 ZoneClient_Injector.exe --launch "C:\Anomaly\bin\AnomalyDX11.exe"
 ```
 Once in the main menu:
 1. Click the native **Zone** button below the menu options.
 2. Enter the server IP (default `127.0.0.1`), port (`27015`), and your callsign.
-3. Click **Connect**.
+3. Click **Connect** and keep the dialog open: the footer polls `ZoneNet:IsConnected()` (~2 Hz) from `Connecting` to `Connected` (then close via **Back** and start/load a game) or `Failed` after ~16s with the `ZN_GetLastError` reason. Do not run xrRazom co-op at the same time — Zone refuses while co-op is live.
 
 ---
 
@@ -278,32 +280,33 @@ Once in the main menu:
 | Database schema (7 tables) | accounts, characters, character_inventory, world_stashes, safe_zones, audit_log, ai_squads. WAL mode via pragma. |
 | Database CRUD & Lifecycle | AutoProvision, LoadCharacter, SaveCharacter, FlushPlayerTransform, GetCharacterInventory (with `rows.Err()` checks), IsPlayerBanned, BanAccount, GetStash, SaveStash, UpdateStashContents, clean `Close()` method. |
 | DB async write queue | `StartWriteQueue()` routes writes through buffered channel (cap 1000). Gracefully drains all pending jobs on server shutdown. |
-| Safe zone seeding + detection | 8 cylindrical zones hardcoded, seeded into DB on startup. 2D distance + height check. |
+| Safe zone seeding + detection | 12 cylindrical zones hardcoded, seeded into DB on startup. 2D distance + height check. |
 | UDP listener + worker pool | 8 goroutines, FNV-1a address affinity, sync.Pool buffer recycling, atomic dropped packet counter + warnings. |
 | Session management | Dual-index map (by ID + by addr), cached slice for lock-free reads, 30s stale timeout, session ID collision cleanup. |
-| Binary protocol read/write | 12-byte header, little-endian, 14 opcodes defined. `WritePacket` bounds-checks payload length <= 65535. Sparse `ServerSnapshot` delta serialization. |
-| Reliable delivery (send + retransmit) | 500ms timeout, 100ms scan interval. Retransmit loop is wired into game loop. |
+| Binary protocol read/write | 12-byte header, little-endian, 16 wire opcodes (incl. `0x0005` ACK). `WritePacket` bounds-checks payload length <= 65535. Sparse `ServerSnapshot` delta serialization. Replay protection via per-session `LastSequence` (stale reliable dropped after ACK). |
+| Reliable delivery (send + retransmit) | 500ms retransmit interval, 5 retries, checked each game tick. Client sends immediate `0x0005` ACK on reliable receipt; server ACKs inbound reliable packets the same way. |
 | AI pathfinding (A*) | Full implementation with priority queue, 3D Euclidean heuristic, quantized integer waypoint keys, 5000-iteration ceiling. |
 | Anti-Cheat & Transform Validation | Total 3D speed magnitude validation (`sqrt(vx^2 + vy^2 + vz^2) <= 25m/s`), NaN/Inf coordinate rejection, +/-10000 coordinate clamping. |
 | Core Server Unit Test Suite | Comprehensive unit test suite in `server_test.go` covering `HandlePacket` (handshake, heartbeat, chat sanitization, transform bounds), `Tick` (exact 1s play time accumulation), `KickSession`, `BanPlayer`, `AntiCheat`. |
 | Dynamic Lua Runtime Hooking | `lua_hook.cpp` compiled into DLL. Detours `luaL_openlibs` via MinHook, dynamically exports and populates LuaJIT function pointers, registers native `ZoneNet` table. |
 | Thread-Safe UDP Client | Background thread with `std::atomic<uint32_t>` sequence & session IDs, `std::mutex` socket send serialization, 10s server liveness watchdog, 5-retry handshake ceiling, graceful `PKT_DISCONNECT` on unload. |
-| DLL Injection & Protection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege. UAF-safe `VirtualFreeEx` timeout handling, PID preservation avoiding TOCTOU races. |
+| DLL Injection & Protection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege. Upfront injector/target bitness check + bounded Lua-readiness gate (LuaJIT module or main window, 30s). UAF-safe `VirtualFreeEx` timeout handling, PID preservation avoiding TOCTOU races. |
 | Identity Persistence | UUID via UuidCreate, HWID via CryptoAPI SHA-256 binary hash over MachineGuid + ComputerName (32 bytes), atomic UTF-8 `%APPDATA%` path conversion. |
-| Asset provisioning | Auto-writes DLTX config + UI XML if missing. Robust `\bin` directory matching preventing over-stripping. |
+| Asset provisioning | DLTX configs written only if missing; scripts + UI XML overwritten atomically (temp + `MoveFileEx`). Robust `\bin` directory matching preventing over-stripping. |
 | Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering, dropped packet tracking, capacity-checked event polling. |
 | Player proxy interpolation | Cubic Hermite (Catmull-Rom), 100ms jitter buffer, O(1) ring buffer history, non-uniform time scaling, smooth edge interval handling. |
 | Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0`), fire input block (`kWPN_FIRE`/`kWPN_ZOOM`), weapon re-holster every frame, state reset on level change & disconnect. |
-| Server browser UI | CUIScriptWnd with favorites (max 16), direct connect, double-click-to-connect, atomic temporary-file LTX persistence, nickname sanitization. |
+| Server browser UI | CUIScriptWnd with favorites (max 16), direct connect, double-click-to-connect, direct io-only LTX write (no tmp/rename), nickname sanitization. Dialog stays open with `Connecting→Connected/Failed` footer (~2 Hz `IsConnected()` poll, 16s timeout); Connect gated on DLL-loaded (`ffi.load`) and xrRazom-idle. |
 | HUD status overlay | CUIStatic at top-right, 1 Hz update, dynamic screen resolution and aspect-ratio tracking via `device().width`/`device().height`, PDA news on transitions. |
 | World event sync | Emission warn/active/clear, raid start/end. 6-byte wire protocol (`eventType`, `state`, `timer`), weather changes + siren sounds, nil-safe audio objects, state reset on disconnect. |
-| Economy & Stash systems | Buy/sell transactions, ruble currency, atomic balance checks, tier progression, unmarshal-safe stash CRUD without lock starvation. |
-| Admin server (named pipe & Unix socket) | Windows named pipe + Unix socket fallback with 0600 permissions and configurable path. Commands: `status`, `kick`, `ban`, `broadcast`. Token-based authentication support, 50ms exponential accept backoff. |
+| Economy & Stash systems | Buy/sell transactions, ruble currency, atomic balance checks, tier progression, unmarshal-safe stash CRUD without lock starvation. Stash access is 5m + same-level + passcode-gated, fail-closed (no passcode field on the wire yet, so locked stashes reject). |
+| Admin server (named pipe & Unix socket) | Windows named pipe + Unix socket fallback with 0600 permissions and configurable path. Commands: `status`, `kick`, `ban`, `broadcast`. Per-connection token auth (one client's `auth` never unlocks others), 50ms exponential accept backoff. |
 | Per-IP Rate Limiting | Token bucket per client IP (100 pkt/s, burst 150) in raw UDP ingestion loop with 60s idle cleanup, early-dropping flood traffic before worker queue. |
+| Chat (level-filtered + rate-limited) | Sender-ID forgery rejected, 5 msgs/5s per-session limit, sanitized UTF-8, broadcast to sender's level only (admin sender 0 still global). |
 | Client Reliable ACK Engine | Immediate `Opcode::ACK` (0x0005) dispatch on receiving reliable packets (`flags & 0x01`), halting server retransmission timeouts. |
-| Anti-Combat Logging Sleeper System | Spawns authoritative 30-second sleeper proxy entities on disconnect outside safe zones or during active combat; persists damage and death to database. |
+| Anti-Combat Logging Sleeper System | Spawns authoritative 30-second sleeper proxy entities on explicit disconnect AND 30s timeout outside safe zones or during active combat; persists damage and death to database. |
 | Server-Authoritative Combat & Damage Rules | Validates attack distance (300m ceiling), enforces safe zone damage immunity for attacker and target, clamps damage, tracks 30-second combat engagement status. |
-| Session Authentication & Ban Enforcement | Validates session IDs and tokens on incoming client packets, enforcing immediate status 2 rejection for banned accounts during handshake. |
+| Session Authentication & Ban Enforcement | Validates session IDs and tokens on incoming client packets; handshake returns Status 0/1/2/3 (ok/full/banned/version) with distinct `ZN_GetLastError` client errors. |
 | Periodic 60s DB Checkpointing | Replaced 30Hz per-transform DB writes with in-memory session tracking, flushing dirty sessions on 60-second intervals, safe zone transitions, and disconnects (>98% I/O reduction). |
 | CI/CD Pipeline | Automated GitHub Actions workflow (`ci.yml`) testing Go server with race detection (`go test -race ./...`) and building client Release DLL with MSVC on Windows. |
 

@@ -43,7 +43,7 @@ function zone_inject_button(xml_file_name, xml_obj)
         if inject_list(xml_obj, list_name) then injected = injected + 1 end
     end
     if injected > 0 then
-        log("[Zone-Online] menu: injected btn_zone_online into " .. xml_file_name)
+        log("[Zone] menu: injected btn_zone_online into " .. xml_file_name)
     end
 
     -- shniaga_wnd sizing: accommodate BOTH Zone (btn_zone_online) and xrRazom
@@ -108,7 +108,7 @@ function zone_modxml_on_xml_read()
             zone_menu_patch.on_main_menu_init(menu)
         end
     end)
-    log("[Zone-Online] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
+    log("[Zone] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
 
     -- Re-entrancy guard (protects against mutual A-calls-B-calls-A chains).
     if _zone_modxml_chaining then return end

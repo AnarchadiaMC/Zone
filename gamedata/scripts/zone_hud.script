@@ -64,7 +64,13 @@ end
 -- ============================================================
 
 local function get_hud_rect()
-    local dev = device and device()
+    -- device() is an engine call: pcall-guard it so a mid-load failure
+    -- degrades to the default 1024x768 layout instead of a fatal CTD.
+    local dev = nil
+    if device then
+        local ok_dev, d = pcall(function() return device() end)
+        if ok_dev then dev = d end
+    end
     local dev_w = (dev and dev.width) or 1024
     local dev_h = (dev and dev.height) or 768
     local screen_ratio = dev_w / dev_h
@@ -84,15 +90,24 @@ local function get_hud_rect()
     local y1 = margin_top
     local y2 = y1 + base_h
 
-    return Frect():set(x1, y1, x2, y2)
+    -- Frect():set() is an engine call: never let it throw out of here.
+    -- Callers invoke SetWndRect inside pcall, so a nil return degrades
+    -- to "skip HUD creation this tick" instead of a fatal CTD.
+    local ok_rect, rect = pcall(function() return Frect():set(x1, y1, x2, y2) end)
+    if ok_rect and rect then return rect end
+    return nil
 end
 
 local function clear_hud_static()
     if hud_static then
-        local hud_mgr = get_hud and get_hud()
-        if hud_mgr then
-            local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
-            if ui and ui.DetachChild then
+        -- get_hud()/GetUI() are engine calls: guard them so cleanup during
+        -- level change / actor destroy can never throw (fatal CTD on load).
+        local ok_mgr, hud_mgr = pcall(function() return get_hud and get_hud() end)
+        if ok_mgr and hud_mgr then
+            local ok_ui, ui = pcall(function()
+                return (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+            end)
+            if ok_ui and ui and ui.DetachChild then
                 pcall(function() ui:DetachChild(hud_static) end)
             end
         end
@@ -101,30 +116,55 @@ local function clear_hud_static()
 end
 
 local function get_or_create_static()
-    local hud_mgr = get_hud and get_hud()
-    if not hud_mgr then return nil end
+    -- get_hud() is an engine call: guard it for the save-load window where
+    -- the HUD manager may not exist yet.
+    local ok_mgr, hud_mgr = pcall(function() return get_hud and get_hud() end)
+    if not ok_mgr or not hud_mgr then return nil end
 
-    local ui = (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
-    if not ui then return nil end
+    local ok_ui, ui = pcall(function()
+        return (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+    end)
+    if not ok_ui or not ui then return nil end
 
     if hud_static then
         return hud_static
     end
 
-    local s = CUIStatic()
-    -- DO NOT USE SetAutoDelete(true) because we are maintaining a Lua reference
-    -- s:SetAutoDelete(true)
-    s:SetWndRect(get_hud_rect())
+    -- The ENTIRE creation sequence runs inside one pcall: any single
+    -- engine failure returns nil (callers nil-check) instead of a fatal
+    -- CTD via CScriptEngine::lua_pcall_failed in actor_on_update.
+    -- ROOT CAUSE of the save-load crash: CUIStatic exposes NO SetFont
+    -- method (see CUIStatic::script_register in UIStatic_script.cpp —
+    -- only CUILines and CUITextWnd bind SetFont), so the old
+    -- s:SetFont(...) call raised "attempt to call method 'SetFont'
+    -- (a nil value)". The engine-correct equivalent is
+    -- s:TextControl():SetFont(...) (CUILines::SetFont binding).
+    local ok, s = pcall(function()
+        local st = CUIStatic()
+        if not st then error("CUIStatic() returned nil") end
+        local rect = get_hud_rect()
+        if not rect then error("get_hud_rect() returned nil") end
+        st:SetWndRect(rect)
 
-    if GetFontLetterica16Russian then
-        s:SetFont(GetFontLetterica16Russian())
-    end
+        if GetFontLetterica16Russian and st.TextControl then
+            local tc_font = st:TextControl()
+            if tc_font and tc_font.SetFont then
+                tc_font:SetFont(GetFontLetterica16Russian())
+            end
+        end
 
-    s:TextControl():SetTextColor(COLOR_CONNECTED)
-    s:TextControl():SetText("")
-    s:Show(true)
+        local tc = nil
+        if st.TextControl then tc = st:TextControl() end
+        if not tc then error("TextControl() returned nil") end
+        tc:SetTextColor(COLOR_CONNECTED)
+        tc:SetText("")
+        st:Show(true)
 
-    ui:AttachChild(s)
+        if not ui.AttachChild then error("ui:AttachChild missing") end
+        ui:AttachChild(st)
+        return st
+    end)
+    if not ok or not s then return nil end
     hud_static = s
     return hud_static
 end
@@ -133,11 +173,18 @@ local function update_hud_display(text, color)
     local s = get_or_create_static()
     if not s then return end
 
-    if s.TextControl then
-        s:TextControl():SetText(text)
-        s:TextControl():SetTextColor(color)
-    end
-    s:Show(true)
+    -- All engine calls pcall-guarded: TextControl()/SetText/SetTextColor/
+    -- Show must never throw out of actor_on_update (fatal CTD on load).
+    pcall(function()
+        if s.TextControl then
+            local tc = s:TextControl()
+            if tc then
+                if text ~= nil and tc.SetText then tc:SetText(text) end
+                if color ~= nil and tc.SetTextColor then tc:SetTextColor(color) end
+            end
+        end
+        if s.Show then s:Show(true) end
+    end)
 end
 
 local function hide_hud_display()
@@ -151,22 +198,31 @@ end
 -- ============================================================
 
 local function on_actor_update()
-    if not db.actor then return end
+    if not (db and db.actor) then return end
 
-    local dev = device and device()
-    if dev then
-        local dev_w = dev.width
-        local dev_h = dev.height
-        if dev_w ~= last_dev_w or dev_h ~= last_dev_h then
-            last_dev_w = dev_w
-            last_dev_h = dev_h
-            if hud_static then
-                hud_static:SetWndRect(get_hud_rect())
+    -- Resolution tracking: engine calls guarded so a mid-load failure
+    -- just skips the re-layout this tick instead of a fatal CTD.
+    -- The .width/.height reads are inside the pcall: a half-constructed
+    -- device object must not throw out of actor_on_update.
+    if device then
+        pcall(function()
+            local dev = device()
+            if not dev then return end
+            local dev_w = dev.width
+            local dev_h = dev.height
+            if dev_w ~= last_dev_w or dev_h ~= last_dev_h then
+                last_dev_w = dev_w
+                last_dev_h = dev_h
+                if hud_static then
+                    local r = get_hud_rect()
+                    if r then hud_static:SetWndRect(r) end
+                end
             end
-        end
+        end)
     end
 
-    local tg = time_global()
+    local ok_tg, tg = pcall(function() return time_global() end)
+    if not ok_tg or type(tg) ~= "number" then return end
     if tg - last_update_time < UPDATE_INTERVAL_MS then return end
     last_update_time = tg
 
@@ -184,20 +240,24 @@ local function on_actor_update()
     if is_dll_loaded() then
         if connected and last_connected ~= true then
             last_connected = true
-            db.actor:give_game_news(
-                "Zone",
-                string.format("Connected to session #%s | Ping: %d ms", tostring(sid), ping),
-                "ui_inGame2_PDA_icon",
-                0, 5000, 1
-            )
+            pcall(function()
+                db.actor:give_game_news(
+                    "Zone",
+                    string.format("Connected to session #%s | Ping: %d ms", tostring(sid), ping),
+                    "ui_inGame2_PDA_icon",
+                    0, 5000, 1
+                )
+            end)
         elseif not connected and last_connected == true then
             last_connected = false
-            db.actor:give_game_news(
-                "Zone",
-                "Disconnected from server.",
-                "ui_inGame2_PDA_icon",
-                0, 5000, 1
-            )
+            pcall(function()
+                db.actor:give_game_news(
+                    "Zone",
+                    "Disconnected from server.",
+                    "ui_inGame2_PDA_icon",
+                    0, 5000, 1
+                )
+            end)
         end
     else
         last_connected = false
@@ -217,28 +277,32 @@ function notify_safezone(locked, zone_id)
 
     if is_locked and not safe_zone_active then
         safe_zone_active = true
-        if db.actor then
+        if db and db.actor then
             local enter_text = "[Safe Zone] Weapons locked — peaceful territory"
             if zid ~= "" then enter_text = enter_text .. " (" .. zid .. ")" end
-            db.actor:give_game_news(
-                "Zone",
-                enter_text,
-                "ui_inGame2_PDA_icon",
-                0, 5000, 1
-            )
+            pcall(function()
+                db.actor:give_game_news(
+                    "Zone",
+                    enter_text,
+                    "ui_inGame2_PDA_icon",
+                    0, 5000, 1
+                )
+            end)
         end
         local _, _, _, text, color = get_status_data()
         update_hud_display(text, color)
 
     elseif not is_locked and safe_zone_active then
         safe_zone_active = false
-        if db.actor then
-            db.actor:give_game_news(
-                "Zone",
-                "[Safe Zone] You have left the safe zone",
-                "ui_inGame2_PDA_icon",
-                0, 3000, 1
-            )
+        if db and db.actor then
+            pcall(function()
+                db.actor:give_game_news(
+                    "Zone",
+                    "[Safe Zone] You have left the safe zone",
+                    "ui_inGame2_PDA_icon",
+                    0, 3000, 1
+                )
+            end)
         end
         local _, _, _, text, color = get_status_data()
         update_hud_display(text, color)
