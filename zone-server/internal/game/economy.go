@@ -163,16 +163,12 @@ func (e *EconomyManager) SellItem(uuid string, itemSection string, price int) (b
 	}
 	defer tx.Rollback()
 
-	var itemID int
-	row := tx.QueryRow("SELECT id FROM character_inventory WHERE client_uuid = ? AND item_section = ? LIMIT 1", uuid, itemSection)
-	if err := row.Scan(&itemID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	// Remove exactly one copy from the stack (stack-preserving) instead of
+	// deleting the whole row for a single unit's price.
+	if _, _, err := database.RemoveInventoryItemsLocked(tx, uuid, itemSection, 1, -1); err != nil {
+		if errors.Is(err, database.ErrInsufficientItems) {
 			return false, nil
 		}
-		return false, err
-	}
-
-	if _, err := tx.Exec("DELETE FROM character_inventory WHERE id = ?", itemID); err != nil {
 		return false, err
 	}
 

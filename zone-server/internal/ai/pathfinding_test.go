@@ -7,7 +7,7 @@ import (
 
 // MockGraph is a simple graph for testing.
 type MockGraph struct {
-	nodes     map[Waypoint][]Waypoint
+	nodes map[Waypoint][]Waypoint
 }
 
 func (m *MockGraph) GetNeighbors(node Waypoint) []Waypoint {
@@ -52,7 +52,7 @@ func TestAStar(t *testing.T) {
 	}
 
 	// Test Path with Obstacle (A -> B -> C vs A -> D -> C where D is shorter but blocked, A -> B -> C is faster)
-    // Wait, simple mock:
+	// Wait, simple mock:
 	// A - B - C
 	// |       |
 	// D - - - E
@@ -62,11 +62,11 @@ func TestAStar(t *testing.T) {
 
 	graph2 := &MockGraph{
 		nodes: map[Waypoint][]Waypoint{
-			nodeA: {nodeB, nodeD2},
-			nodeB: {nodeA, nodeC},
-			nodeC: {nodeB, nodeE},
+			nodeA:  {nodeB, nodeD2},
+			nodeB:  {nodeA, nodeC},
+			nodeC:  {nodeB, nodeE},
 			nodeD2: {nodeA, nodeE},
-			nodeE: {nodeD2, nodeC},
+			nodeE:  {nodeD2, nodeC},
 		},
 	}
 	// Euclidean distance A to C is 2. Path A-B-C cost is 1+1 = 2

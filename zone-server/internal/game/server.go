@@ -37,17 +37,6 @@ var packetBufferPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
 
-// LeaveAoI carries entity leave notification payload.
-type LeaveAoI struct {
-	SessionID uint32
-}
-
-const (
-	OpLeave    = protocol.OpEntityLeaveAoI
-	OpAiAction = protocol.OpAIActionEvent
-	OpAck      = 0x0005
-)
-
 // DefaultActorVisual is the actor section used for player entities that have
 // not sent an OpPlayerVisual yet.
 const DefaultActorVisual = `actors\stalker_neutral\stalker_neutral_1`
@@ -76,10 +65,6 @@ func boolToUint8(b bool) uint8 {
 	return 0
 }
 
-type EventManager struct{}
-
-func NewEventManager() *EventManager { return &EventManager{} }
-
 type Server struct {
 	cfg       *config.Config
 	db        *database.DB
@@ -87,17 +72,15 @@ type Server struct {
 	udp       *network.UDPListener
 	udpMu     sync.RWMutex
 	nickMu    sync.Mutex
-	sessions  *network.SessionManager
-	grid      *SpatialGrid
-	events    *EventManager
-	economy   *EconomyManager
-	stashMgr  *StashManager
-	anticheat *AntiCheatManager
-	aoi       *AoIManager
-	squads    *ai.SquadManager
-	aiRepl    *aiReplication
-	logger    *zap.Logger
-	seq       atomic.Uint32
+	sessions *network.SessionManager
+	grid     *SpatialGrid
+	economy  *EconomyManager
+	stashMgr *StashManager
+	aoi      *AoIManager
+	squads   *ai.SquadManager
+	aiRepl   *aiReplication
+	logger   *zap.Logger
+	seq      atomic.Uint32
 	// sessionIDSeq allocates session IDs independently of the packet sequence
 	// counter so AI entity IDs (base 1_000_000) can never collide with a
 	// session ID.
@@ -105,13 +88,21 @@ type Server struct {
 	ackQueue              *network.AckQueue
 	emissionMgr           *EmissionOrchestrator
 	damageHandler         *DamageHandler
-	movementGuard         *MovementGuard
 	itemLedger            *ItemLedger
 	sleepers              *SleeperManager
 	groups                *GroupManager
 	startTime             time.Time
-	tickCount             atomic.Uint64
 	lastSafezoneBroadcast time.Time
+	// damageAuditMu guards lastDamageRejectAudit, the per-attacker throttle
+	// for rejected-damage audit rows.
+	damageAuditMu         sync.Mutex
+	lastDamageRejectAudit map[uint32]time.Time
+	// lastPlayTimeCredit is the wall-clock instant the last whole-second of
+	// play time was credited. Time-based, so play_time_sec accrues once per
+	// real second at any configured tick rate.
+	lastPlayTimeCredit time.Time
+	// lastWorldItemSweep throttles the world_items TTL sweep (see Tick).
+	lastWorldItemSweep time.Time
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {
@@ -125,10 +116,8 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		dbQueue:               q,
 		sessions:              network.NewSessionManager(),
 		grid:                  NewSpatialGrid(64.0),
-		events:                NewEventManager(),
 		economy:               NewEconomyManager(db),
 		stashMgr:              NewStashManager(db),
-		anticheat:             NewAntiCheatManager(),
 		aoi:                   NewAoIManager(),
 		squads:                ai.NewSquadManager(),
 		logger:                logger,
@@ -173,11 +162,8 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	s.groups = NewGroupManager(groupMax, inviteTTL)
 	s.damageHandler.SetGroupManager(s.groups)
 
-	// Server-authoritative movement + item ledger wiring. Defaults apply when
-	// cfg is nil (tests) or a key is unset.
-	s.movementGuard = NewMovementGuard(cfg)
-	s.damageHandler.SetMovementGuard(s.movementGuard)
-	s.damageHandler.SetAntiCheatManager(s.anticheat)
+	// Hit-registration wiring: the rolling damage budget is the only
+	// combat-rate limiter. Movement is client-authoritative.
 	if cfg != nil && cfg.DamageBudgetPerS > 0 {
 		s.damageHandler.SetDamageBudgetPerS(cfg.DamageBudgetPerS)
 	}
@@ -191,11 +177,10 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	// the default l01_escape set when the table is empty) only while
 	// ai_enabled is true. Disabled means no AI entities, no counters, no
 	// packets. Wave A replication is patrol-only; combat/damage are roadmap.
-	aiRadius := float32(AoIRadius)
-	if cfg != nil && cfg.AIOnlineRadiusM > 0 {
-		aiRadius = float32(cfg.AIOnlineRadiusM)
-	}
-	s.aiRepl = newAIReplication(aiRadius)
+	// Enter/leave radii implement AoI hysteresis; ai_max_entities caps the
+	// replicated set.
+	aiEnter, aiLeave := resolveAIRadii(cfg)
+	s.aiRepl = newAIReplication(aiEnter, aiLeave, resolveAIMaxEntities(cfg), s.logger)
 	if db != nil && cfg.AIEnabledOrDefault() {
 		if err := SeedAISquads(db); err != nil && s.logger != nil {
 			s.logger.Warn("Failed to seed AI squads", zap.Error(err))
@@ -222,16 +207,6 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	return s
 }
 
-// Groups returns the active GroupManager instance.
-func (s *Server) Groups() *GroupManager {
-	return s.groups
-}
-
-// DamageHandler returns the active DamageHandler instance.
-func (s *Server) DamageHandler() *DamageHandler {
-	return s.damageHandler
-}
-
 // Sleepers returns the active SleeperManager instance.
 func (s *Server) Sleepers() *SleeperManager {
 	return s.sleepers
@@ -240,16 +215,6 @@ func (s *Server) Sleepers() *SleeperManager {
 // EmissionMgr returns the active EmissionOrchestrator instance.
 func (s *Server) EmissionMgr() *EmissionOrchestrator {
 	return s.emissionMgr
-}
-
-// Squads returns the active SquadManager instance.
-func (s *Server) Squads() *ai.SquadManager {
-	return s.squads
-}
-
-// AckQueue returns the active AckQueue instance.
-func (s *Server) AckQueue() *network.AckQueue {
-	return s.ackQueue
 }
 
 // GetUDP safely retrieves the active UDPListener.
@@ -390,12 +355,11 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 
 	// PRODUCTION FIX: immediately ACK every reliable inbound packet (except
 	// ACKs themselves). Covers handshake/chat/disconnect explicit cases, not
-	// just the default branch. Stops client retransmit storms.
+	// just the default branch. Stops client retransmit storms. The inbound
+	// sequence lives in the client's own space; client acknowledgements of
+	// server packets travel in OpAck payloads only.
 	if hdr.Opcode != protocol.OpAck && hdr.FlagsChannel&protocol.FlagReliable != 0 {
 		s.sendAck(addr, hdr.SequenceNum)
-		if s.ackQueue != nil {
-			s.ackQueue.Acknowledge(hdr.SequenceNum)
-		}
 	}
 
 	// Server query is answered before replay gating and before any session
@@ -501,17 +465,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			sessID := s.sessionIDSeq.Add(1)
 			token, _ := GenerateSessionToken()
 			sess := &network.PlayerSession{
-				SessionID:         sessID,
-				SessionToken:      token,
-				AccountID:         cleanUUID,
-				Name:              nick,
-				UDPAddr:           addr,
-				LastSeen:          time.Now(),
-				LastCheckpoint:    time.Now(),
-				LastTransformTime: time.Now(),
-				Health:            100.0,
-				CurrentLevel:      "l01_escape",
-				LastSequence:      hdr.SequenceNum,
+				SessionID:      sessID,
+				SessionToken:   token,
+				AccountID:      cleanUUID,
+				Name:           nick,
+				UDPAddr:        addr,
+				LastSeen:       time.Now(),
+				LastCheckpoint: time.Now(),
+				Health:         100.0,
+				CurrentLevel:   "l01_escape",
+				LastSequence:   hdr.SequenceNum,
 			}
 			isNew := false
 			charFaction := ""
@@ -586,15 +549,11 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				maxPlayers = s.cfg.MaxPlayers
 			}
 			s.nickMu.Lock()
-			var evicted []*network.PlayerSession
-			added := true
-			if maxPlayers > 0 {
-				evicted, added = s.sessions.TryAddCapped(sess, maxPlayers)
-				if added {
-					s.sessions.EnsureUniqueName(sess)
-				}
-			} else {
-				s.sessions.AddSession(sess)
+			// TryAddCapped handles max<=0 as uncapped; running it even when
+			// uncapped keeps same-address and same-AccountID eviction (one live
+			// session per account) on every path.
+			evicted, added := s.sessions.TryAddCapped(sess, maxPlayers)
+			if added {
 				s.sessions.EnsureUniqueName(sess)
 			}
 			s.nickMu.Unlock()
@@ -640,6 +599,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				// Returning player: straight into the spawn, no menu detour.
 				s.sendLoadLevel(sess)
 				s.syncInventoryForLevel(sess)
+				s.sendWorldItemsInAoI(sess)
 			}
 			// Spawn flow is on the wire first; enforcement + AOI follow it.
 			s.sendSafezoneState(sess)
@@ -695,6 +655,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 
 			s.sessions.RemoveSession(sessID)
 			s.clearSessionTracking(sessID)
+			// Drop any reliable retransmit entry still queued for this endpoint
+			// so a same-address reconnect cannot receive the old session's
+			// packets.
+			if s.ackQueue != nil {
+				s.ackQueue.RemoveByAddr(addr.String())
+			}
 			s.logger.Info("Client disconnected",
 				zap.Uint32("session_id", sessID),
 				zap.String("addr", addr.String()),
@@ -706,7 +672,6 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
 				sess.LastSeen = time.Now()
-				sess.LastHeartbeat = time.Now()
 				sess.Unlock()
 				s.SendToSession(sess, protocol.OpHeartbeat, protocol.FlagUnreliable, hb)
 			}
@@ -715,7 +680,6 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
 				sess.LastSeen = time.Now()
-				sess.LastHeartbeat = time.Now()
 				sess.Unlock()
 			}
 		}
@@ -743,134 +707,11 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					return
 				}
 
+				// Movement is client-authoritative: the server accepts any
+				// finite, in-bounds position and never rejects, corrects or
+				// kicks for distance. Hit registration validates range against
+				// these last-known positions separately.
 				now := time.Now()
-				newPos := [3]float32{ct.PosX, ct.PosY, ct.PosZ}
-
-				sess.Lock()
-				lastPos := sess.Position
-				lastTransform := sess.LastTransformTime
-				lastAlive := sess.LastHeartbeat
-				if lastAlive.IsZero() {
-					lastAlive = sess.LastSeen
-				}
-				hasHistory := sess.TransformHistory.Len() > 0
-				sess.Unlock()
-
-				dt := now.Sub(lastTransform).Seconds()
-				firstTransform := lastTransform.IsZero()
-
-				// Lag-switch signature: transform gap beyond lagswitch_gap_ms
-				// while heartbeats/ACKs prove the session is otherwise alive.
-				// Repeated signatures inside a rolling 60 s window kick. Plain
-				// packet loss (no heartbeat/ACK during the gap) never strikes.
-				if !firstTransform && s.movementGuard != nil && s.anticheat != nil {
-					gap := now.Sub(lastTransform)
-					if s.movementGuard.IsLagswitchSignature(gap, hasHistory, now.Sub(lastAlive)) {
-						strikes := s.anticheat.RecordLagswitchStrike(sess.SessionID, now)
-						if strikes >= s.movementGuard.StrikesLimit() {
-							sess.Lock()
-							uuid := sess.AccountID
-							sess.Unlock()
-							s.audit(uuid, "lagswitch_kick",
-								fmt.Sprintf("session=%d strikes=%d gap_ms=%d reason=network abuse suspected",
-									sess.SessionID, strikes, gap.Milliseconds()))
-							if s.logger != nil {
-								s.logger.Warn("Kicking player for suspected network abuse",
-									zap.Uint32("session", sess.SessionID),
-									zap.Int("strikes", strikes),
-									zap.Duration("gap", gap),
-								)
-							}
-							s.KickSession(sess.SessionID)
-							return
-						}
-					}
-				}
-
-				// Server-authoritative movement validation: displacement must
-				// fit the speed budget (max_speed_mps + correction_tolerance_m)
-				// over the real elapsed time. On top of that, keep the legacy
-				// vertical/speed anticheat as a second gate.
-				valid := true
-				reason := ""
-				if !firstTransform {
-					dist := Displacement(lastPos, newPos)
-					if s.movementGuard != nil && !s.movementGuard.ValidDisplacement(dist, dt) {
-						valid = false
-						reason = "speed violation"
-					} else if s.anticheat != nil {
-						var acValid bool
-						acValid, reason = s.anticheat.ValidateMove(sess, newPos, float32(dt))
-						if !acValid {
-							valid = false
-						}
-					}
-				}
-
-				if !valid {
-					sess.Lock()
-					dx := float64(newPos[0] - sess.LastRejectedPos[0])
-					dy := float64(newPos[1] - sess.LastRejectedPos[1])
-					dz := float64(newPos[2] - sess.LastRejectedPos[2])
-					dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-					if sess.HasRejected && dist <= 5.0 {
-						sess.RejectConfirm++
-					} else {
-						sess.LastRejectedPos = newPos
-						sess.HasRejected = true
-						sess.RejectConfirm = 1
-					}
-					confirm := sess.RejectConfirm
-					lastValid := sess.Position
-					sess.Unlock()
-					if confirm >= 4 {
-						sess.Lock()
-						sess.Position = newPos
-						sess.LastTransformTime = now
-						sess.HasRejected = false
-						sess.RejectConfirm = 0
-						sess.Unlock()
-						if s.anticheat != nil {
-							s.anticheat.Reset(sess.SessionID)
-						}
-						if s.logger != nil {
-							s.logger.Info("accepted client relocation (level change/load?)",
-								zap.Uint32("session", sess.SessionID),
-								zap.Any("pos", newPos),
-							)
-						}
-					} else {
-						var violations int
-						if s.anticheat != nil {
-							violations = s.anticheat.RecordViolation(sess.SessionID, reason)
-						}
-						if s.anticheat != nil && s.anticheat.ShouldKick(violations) {
-							if s.logger != nil {
-								s.logger.Warn("Kicking player for repeated anticheat violations",
-									zap.Uint32("session", sess.SessionID),
-									zap.String("reason", reason),
-									zap.Int("violations", violations),
-								)
-							}
-							s.KickSession(sess.SessionID)
-							return
-						}
-						// Correction packet: do not update the server position;
-						// tell the client where it actually is.
-						s.SendToSession(sess, protocol.OpPositionCorrection, protocol.FlagUnreliable,
-							protocol.PositionCorrection{X: lastValid[0], Y: lastValid[1], Z: lastValid[2]})
-						return
-					}
-				} else {
-					if s.anticheat != nil {
-						s.anticheat.Reset(sess.SessionID)
-					}
-					sess.Lock()
-					sess.HasRejected = false
-					sess.RejectConfirm = 0
-					sess.Unlock()
-				}
-
 				sess.Lock()
 				sessID := sess.SessionID
 				sess.Position = [3]float32{ct.PosX, ct.PosY, ct.PosZ}
@@ -879,14 +720,6 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.AnimFlags = ct.AnimFlags
 				sess.Gvid = ct.Gvid
 				sess.LastSeen = now
-				sess.LastTransformTime = now
-				sess.TransformHistory.Push(network.TransformSample{
-					At:   now,
-					X:    ct.PosX,
-					Y:    ct.PosY,
-					Z:    ct.PosZ,
-					Gvid: ct.Gvid,
-				})
 				uuid := sess.AccountID
 				health := sess.Health
 				level := sess.CurrentLevel
@@ -999,6 +832,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		if attackerSess == nil {
 			return
 		}
+		attackerID := attackerSess.SessionID
 
 		// Check if target is a sleeper proxy (Issue 16). Sleeper damage is
 		// routed through the same ValidateAndApplyDamage path as live targets
@@ -1018,10 +852,11 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 
 				applied, valid, reason := s.damageHandler.ValidateAndApplyDamage(attackerSess, sleeperTarget, &dmg)
 				if !valid {
-					s.logger.Debug("Sleeper damage rejected", zap.String("reason", reason))
+					s.auditDamageRejected(attackerID, reason)
 					return
 				}
 				remHealth, isDead := s.sleepers.ApplyDamage(dmg.TargetID, applied)
+				s.auditDamageAccepted(attackerID, sleeperTarget.SessionID, applied)
 				s.logger.Info("Damage applied to sleeper",
 					zap.Uint32("sleeper", dmg.TargetID),
 					zap.Float32("damage", applied),
@@ -1061,12 +896,17 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		if s.damageHandler != nil {
 			applied, valid, reason := s.damageHandler.ValidateAndApplyDamage(attackerSess, targetSess, &dmg)
 			if !valid {
-				s.logger.Debug("Damage rejected", zap.String("reason", reason))
+				s.auditDamageRejected(attackerID, reason)
 				return
 			}
+			// Relay the validated hit to the victim only, with the attacker's
+			// real session id and the clamped damage actually applied.
 			dmgOut := dmg
+			dmgOut.AttackerID = attackerID
+			dmgOut.TargetID = targetSess.SessionID
 			dmgOut.Damage = applied
 			s.SendToSession(targetSess, protocol.OpDamageNotify, protocol.FlagReliable, dmgOut)
+			s.auditDamageAccepted(attackerID, targetSess.SessionID, applied)
 			targetSess.Lock()
 			tuuid := targetSess.AccountID
 			tpos := targetSess.Position
@@ -1086,164 +926,6 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 		}
-	case protocol.OpStashInteract:
-		var pkt protocol.StashInteractPayload
-		if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
-			s.logger.Warn("OpStashInteract: failed to parse payload", zap.Error(err))
-			return
-		}
-
-		sess := s.sessions.GetByAddr(addr.String())
-		if sess == nil {
-			s.logger.Warn("OpStashInteract: unknown session", zap.String("addr", addr.String()))
-			s.sendStashResponse(addr, protocol.StashResponsePayload{
-				StashID: pkt.StashID,
-				Status:  2,
-				Count:   pkt.Count,
-			})
-			return
-		}
-		sess.Lock()
-		sessionID := sess.SessionID
-		playerPos := sess.Position
-		playerLevel := sess.CurrentLevel
-		sess.Unlock()
-
-		stashID := pkt.StashID
-		section := nullTermString(pkt.ItemSection[:])
-		count := int(pkt.Count)
-
-		// Unknown action short-circuits before DB load (Status 2 semantics).
-		if pkt.Action != 1 && pkt.Action != 2 && pkt.Action != 3 {
-			s.logger.Warn("OpStashInteract: unknown action", zap.Uint8("action", pkt.Action))
-			s.sendStashResponse(addr, protocol.StashResponsePayload{
-				StashID: stashID,
-				Status:  2,
-				Count:   pkt.Count,
-			})
-			return
-		}
-
-		// Load stash record for access validation.
-		var rec *database.StashRecord
-		if s.db != nil {
-			r, err := s.db.GetStash(stashID)
-			if err != nil {
-				s.sendStashResponse(addr, protocol.StashResponsePayload{
-					StashID: stashID,
-					Status:  1,
-					Count:   pkt.Count,
-				})
-				return
-			}
-			rec = r
-		} else if s.stashMgr != nil {
-			data, err := s.stashMgr.GetStash(stashID)
-			if err != nil {
-				status := uint8(2)
-				if err == ErrStashNotFound {
-					status = 1
-				}
-				s.sendStashResponse(addr, protocol.StashResponsePayload{
-					StashID: stashID,
-					Status:  status,
-					Count:   pkt.Count,
-				})
-				return
-			}
-			rec = &database.StashRecord{
-				StashID:   data.StashID,
-				LevelName: data.LevelName,
-				PosX:      data.PosX,
-				PosY:      data.PosY,
-				PosZ:      data.PosZ,
-				OwnerUUID: data.OwnerUUID,
-				Passcode:  data.Passcode,
-			}
-		} else {
-			s.sendStashResponse(addr, protocol.StashResponsePayload{
-				StashID: stashID,
-				Status:  2,
-				Count:   pkt.Count,
-			})
-			return
-		}
-
-		// Enforce proximity / level / passcode. NOTE: the wire protocol
-		// currently carries no passcode field, so fail closed with "" —
-		// passcode-protected stashes reject until the protocol is extended.
-		if s.stashMgr == nil {
-			s.sendStashResponse(addr, protocol.StashResponsePayload{
-				StashID: stashID,
-				Status:  2,
-				Count:   pkt.Count,
-			})
-			return
-		}
-		if verr := s.stashMgr.ValidateAccess(rec, playerPos, playerLevel, ""); verr != nil {
-			status := uint8(2)
-			if verr == ErrStashNotFound {
-				status = 1
-			}
-			s.logger.Warn("OpStashInteract: access denied",
-				zap.Uint32("stash_id", stashID),
-				zap.Uint32("session_id", sessionID),
-				zap.Error(verr))
-			s.sendStashResponse(addr, protocol.StashResponsePayload{
-				StashID: stashID,
-				Status:  status,
-				Count:   pkt.Count,
-			})
-			return
-		}
-
-		var status uint8
-		var contents []byte
-
-		switch pkt.Action {
-		case 1: // Open
-			s.logger.Info("Stash opened", zap.Uint32("stash_id", stashID), zap.Uint32("session_id", sessionID))
-			var err error
-			contents, err = s.stashMgr.OpenStash(stashID, sessionID)
-			if err != nil {
-				if err == ErrStashNotFound {
-					status = 1
-				} else {
-					status = 2
-				}
-			}
-		case 2: // Take
-			s.logger.Info("Stash take", zap.Uint32("stash_id", stashID), zap.String("section", section), zap.Int("count", count))
-			if err := s.stashMgr.ModifyStashItem(stashID, section, -count); err != nil {
-				if err == ErrStashNotFound {
-					status = 1
-				} else {
-					status = 2
-				}
-			}
-		case 3: // Store
-			s.logger.Info("Stash store", zap.Uint32("stash_id", stashID), zap.String("section", section), zap.Int("count", count))
-			if err := s.stashMgr.StoreStashItem(stashID, sess.AccountID, section, count); err != nil {
-				if err == ErrStashNotFound {
-					status = 1
-				} else {
-					status = 2
-				}
-			}
-		default:
-			s.logger.Warn("OpStashInteract: unknown action", zap.Uint8("action", pkt.Action))
-			status = 2
-		}
-
-		resp := protocol.StashResponsePayload{
-			StashID: stashID,
-			Status:  status,
-			Count:   pkt.Count,
-		}
-		if len(contents) > 0 && len(contents) <= len(resp.Data) {
-			copy(resp.Data[:], contents)
-		}
-		s.sendStashResponse(addr, resp)
 	case protocol.OpCharacterSelect:
 		var sel protocol.CharacterSelect
 		if err := binary.Read(buf, binary.LittleEndian, &sel); err != nil {
@@ -1295,6 +977,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.grid.Insert(sessID, -211.3, -145.8)
 		s.sendLoadLevel(sess)
 		s.syncInventoryForLevel(sess)
+		s.sendWorldItemsInAoI(sess)
 		res := protocol.HandshakeRes{Status: 0, SpawnX: -211.3, SpawnY: -20.2, SpawnZ: -145.8, WorldTime: uint64(time.Now().Unix()), EcoTier: 1, HasCharacter: 1}
 		copyNulTerm(res.Faction[:], faction)
 		binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
@@ -1335,12 +1018,21 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			)
 			return
 		}
+		// Level change is a hard position reset: the client is being loaded at
+		// the level's server-known spawn, so position and safe-zone state
+		// restart from that spawn.
+		spawn := levelSpawnFor(levelName)
 		sess.Lock()
 		oldLevel := sess.CurrentLevel
 		sess.CurrentLevel = levelName
+		sess.Position = spawn
+		sess.Rotation = [2]float32{}
+		sess.Velocity = [3]float32{}
 		sess.InSafeZone = false
 		sess.SafeZoneID = ""
+		sessID := sess.SessionID
 		sess.Unlock()
+		s.grid.Update(sessID, spawn[0], spawn[2])
 
 		s.aoi.RemoveSession(sess.SessionID)
 		if oldLevel != levelName {
@@ -1350,6 +1042,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			sess.EnterBroadcastLevel = ""
 			sess.Unlock()
 			s.sendExistingPeersToNewcomer(sess)
+			s.sendWorldItemsInAoI(sess)
 		}
 		// The client reports its level after a level load. Deliver the kit only
 		// when the level actually changed; syncInventoryForLevel advances the
@@ -1382,20 +1075,20 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.handleItemAction(addr, buf)
 	case protocol.OpContainerAction:
 		s.handleContainerAction(addr, buf)
-	case OpAck:
-		// Client ACK of a reliable server packet is liveness evidence for the
-		// anti-lag-switch alive check.
+	case protocol.OpAck:
+		// Any inbound traffic from a live session refreshes LastSeen.
 		if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 			now := time.Now()
 			sess.Lock()
 			sess.LastSeen = now
-			sess.LastHeartbeat = now
 			sess.Unlock()
 		}
 		if s.ackQueue != nil {
 			var ackSeq uint32
 			if binary.Read(buf, binary.LittleEndian, &ackSeq) == nil && ackSeq != 0 {
-				s.ackQueue.Acknowledge(ackSeq)
+				// Address-scoped: an ACK only clears retransmits queued for the
+				// acking endpoint, never another session's pending packets.
+				s.ackQueue.AcknowledgeFrom(ackSeq, addr)
 			}
 			// NOTE: do NOT acknowledge hdr.SequenceNum here — ACK packets are
 			// unreliable and never enqueued; acking their own seq is a no-op
@@ -1660,6 +1353,116 @@ func (s *Server) syncInventoryForLevel(sess *network.PlayerSession) {
 	}
 }
 
+// worldItemTTL returns the configured world-item lifetime, or 0 when the TTL
+// sweep is disabled (world_item_ttl_min: 0).
+func (s *Server) worldItemTTL() time.Duration {
+	if s.cfg == nil {
+		return config.DefaultWorldItemTTLMin * time.Minute
+	}
+	minutes := s.cfg.WorldItemTTLMinutes()
+	if minutes <= 0 {
+		return 0
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// worldItemMaxPerLevel returns the configured per-level world item cap
+// (config world_item_max_per_level, default 500).
+func (s *Server) worldItemMaxPerLevel() int {
+	if s.cfg == nil || s.cfg.WorldItemMaxPerLevel <= 0 {
+		return config.DefaultWorldItemMaxPerLevel
+	}
+	return s.cfg.WorldItemMaxPerLevel
+}
+
+// sendWorldItemsInAoI delivers one reliable OpItemUpdate (result=OK, action=1
+// drop, the same shape as a live drop broadcast) per persisted world item
+// inside the AoI radius, so a joining or level-changing client sees items that
+// were dropped before it arrived.
+func (s *Server) sendWorldItemsInAoI(sess *network.PlayerSession) {
+	if sess == nil || s.db == nil {
+		return
+	}
+	sess.Lock()
+	uuid := sess.AccountID
+	level := sess.CurrentLevel
+	pos := sess.Position
+	sess.Unlock()
+	if uuid == "" || level == "" {
+		return
+	}
+	items, err := s.db.GetWorldItemsByLevel(level)
+	if err != nil {
+		s.logger.Warn("world item sync: load failed", zap.String("level", level), zap.Error(err))
+		return
+	}
+	for _, wi := range items {
+		if Displacement([3]float32{wi.PosX, wi.PosY, wi.PosZ}, pos) > float64(AoIRadius) {
+			continue
+		}
+		var sec [64]byte
+		copyNulTerm(sec[:], wi.Section)
+		s.SendToSession(sess, protocol.OpItemUpdate, protocol.FlagReliable, protocol.ItemUpdatePacket{
+			Result:    protocol.ItemResultOK,
+			Action:    protocol.ItemActionDrop,
+			ItemID:    uint32(wi.ID),
+			Count:     clampCountToInt16(wi.Count),
+			Section:   sec,
+			X:         wi.PosX,
+			Y:         wi.PosY,
+			Z:         wi.PosZ,
+			Condition: conditionToWire(wi.Condition),
+		})
+	}
+}
+
+// sweepWorldItems deletes world items older than ttl and tells every client on
+// the item's level to remove the visual. Expiry reuses a pickup-shaped
+// OpItemUpdate (result=OK, action=2, count=0) so clients drop the ground item
+// without crediting anything to a receiving player's inventory.
+func (s *Server) sweepWorldItems(now time.Time, ttl time.Duration) {
+	if s.db == nil || ttl <= 0 {
+		return
+	}
+	expired, err := s.db.DeleteWorldItemsOlderThan(now.Add(-ttl))
+	if err != nil {
+		s.logger.Warn("world item TTL sweep failed", zap.Error(err))
+		return
+	}
+	for _, wi := range expired {
+		s.broadcastWorldItemRemoval(wi)
+	}
+	if len(expired) > 0 && s.logger != nil {
+		s.logger.Info("world item TTL sweep removed items", zap.Int("count", len(expired)))
+	}
+}
+
+// broadcastWorldItemRemoval tells same-level clients to remove a world item
+// visual (TTL expiry path).
+func (s *Server) broadcastWorldItemRemoval(wi database.WorldItem) {
+	var sec [64]byte
+	copyNulTerm(sec[:], wi.Section)
+	update := protocol.ItemUpdatePacket{
+		Result:    protocol.ItemResultOK,
+		Action:    protocol.ItemActionPickup,
+		ItemID:    uint32(wi.ID),
+		Count:     0,
+		Section:   sec,
+		X:         wi.PosX,
+		Y:         wi.PosY,
+		Z:         wi.PosZ,
+		Condition: conditionToWire(wi.Condition),
+	}
+	for _, sess := range s.sessions.GetAll() {
+		sess.Lock()
+		same := sess.CurrentLevel == wi.LevelName
+		sess.Unlock()
+		if same {
+			s.SendToSession(sess, protocol.OpItemUpdate, protocol.FlagReliable, update)
+		}
+	}
+}
+
 // sendError delivers an explicit, displayable failure to the client.
 func (s *Server) sendError(sess *network.PlayerSession, code uint8, message string) {
 	var payload protocol.ErrorPayload
@@ -1858,15 +1661,30 @@ func (s *Server) handleServerQuery(addr *net.UDPAddr) {
 }
 
 func (s *Server) Tick(now time.Time) {
-	// S-01: Only increment play time once per second (every 30 ticks at 30Hz)
-	tick := s.tickCount.Add(1)
-	isSecondTick := (tick%30 == 0)
+	// S-01: play time is credited once per real second, independent of the
+	// configured tick rate. The old tick%30==0 gate credited 1 s per 30 ticks
+	// regardless of actual elapsed time, so 60 Hz servers doubled play time.
+	if s.lastPlayTimeCredit.IsZero() {
+		s.lastPlayTimeCredit = now
+	}
+	playTimeCredit := 0
+	if elapsed := now.Sub(s.lastPlayTimeCredit); elapsed >= time.Second {
+		playTimeCredit = int(elapsed / time.Second)
+		s.lastPlayTimeCredit = s.lastPlayTimeCredit.Add(time.Duration(playTimeCredit) * time.Second)
+	}
 
 	// Group invitation TTL sweep.
 	if s.groups != nil {
 		s.groups.Tick(now)
 	}
 
+	// World item TTL sweep: throttled so the table is not scanned every tick.
+	if ttl := s.worldItemTTL(); ttl > 0 {
+		if s.lastWorldItemSweep.IsZero() || now.Sub(s.lastWorldItemSweep) >= worldItemSweepInterval {
+			s.lastWorldItemSweep = now
+			s.sweepWorldItems(now, ttl)
+		}
+	}
 	// Sleeper Tick (Issue 16)
 	if s.sleepers != nil {
 		s.sleepers.Tick(now, func(sl *Sleeper) {
@@ -1963,8 +1781,8 @@ func (s *Server) Tick(now time.Time) {
 				}
 			}
 		} else {
-			if isSecondTick && uuid != "" {
-				s.QueuePeriodicStats(uuid, 1)
+			if playTimeCredit > 0 && uuid != "" {
+				s.QueuePeriodicStats(uuid, playTimeCredit)
 			}
 			// 60s Checkpoint (Issue 19)
 			if ShouldCheckpointSession(sess, now, 60*time.Second) && uuid != "" {
@@ -1988,14 +1806,6 @@ func (s *Server) Tick(now time.Time) {
 		s.ackQueue.Tick(now)
 	}
 
-	if udp := s.GetUDP(); udp != nil {
-		if s.squads != nil {
-			s.squads.Tick(now, func(squadID uint32, state ai.AIState, pos [3]float32) {
-				s.broadcastSquadAction(squadID, state, pos)
-			})
-		}
-	}
-
 	// Wave A AI replication: puppet patrolsim + AoI enter/leave + OpAIState.
 	s.tickAIReplication(now)
 
@@ -2010,20 +1820,22 @@ func (s *Server) Tick(now time.Time) {
 	}
 }
 
-func (s *Server) broadcastSquadAction(squadID uint32, state ai.AIState, pos [3]float32) {
-	payload := protocol.AIActionPayload{
-		EntityID: squadID,
-		Action:   uint8(state),
-		TargetID: 0,
-	}
-	for _, sess := range s.sessions.GetAll() {
-		s.SendToSession(sess, OpAiAction, protocol.FlagUnreliable, payload)
-	}
+// defaultLevelSpawn is the server-known spawn used when a session enters a
+// level: the Cordon rookie village centre for l01_escape. Every hosted level
+// currently shares it until per-level spawn tables exist; what matters is that
+// the server, not the client, owns the post-level-change position.
+var defaultLevelSpawn = [3]float32{-211.3, -20.2, -145.8}
+
+// levelSpawnFor returns the server-known spawn for a supported level name.
+func levelSpawnFor(name string) [3]float32 {
+	return defaultLevelSpawn
 }
 
-func (s *Server) BroadcastSquadAction(squadID uint32, state ai.AIState, pos [3]float32) {
-	s.broadcastSquadAction(squadID, state, pos)
-}
+const (
+	// worldItemSweepInterval throttles the world_items TTL sweep so the table is
+	// not scanned on every tick.
+	worldItemSweepInterval = 30 * time.Second
+)
 
 func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{}) {
 	udp := s.GetUDP()
@@ -2243,7 +2055,18 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	yaw := sess.Rotation[0]
 	health := sess.Health
 	level := sess.CurrentLevel
+	addrStr := ""
+	if sess.UDPAddr != nil {
+		addrStr = sess.UDPAddr.String()
+	}
 	sess.Unlock()
+
+	// Purge queued retransmits for this endpoint before the kick disconnect is
+	// enqueued: no stale reliable packet may survive into a later session that
+	// reuses the address.
+	if s.ackQueue != nil && addrStr != "" {
+		s.ackQueue.RemoveByAddr(addrStr)
+	}
 
 	if uuid != "" {
 		s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
@@ -2272,17 +2095,27 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	return true
 }
 
-// clearSessionTracking drops per-session anticheat, item-ledger and damage
-// budget state on every disconnect/kick/timeout path.
+// clearSessionTracking drops per-session item-ledger, damage budget and
+// reject-audit throttle, AI-visibility and pending-invite state on every
+// disconnect, kick, timeout and eviction path.
 func (s *Server) clearSessionTracking(sessionID uint32) {
-	if s.anticheat != nil {
-		s.anticheat.Reset(sessionID)
-	}
 	if s.itemLedger != nil {
 		s.itemLedger.Remove(sessionID)
 	}
 	if s.damageHandler != nil {
 		s.damageHandler.ClearBudget(sessionID)
+	}
+	s.clearDamageAudit(sessionID)
+	// AI visibility is normally reaped by the replication tick's retain pass,
+	// but clearing it synchronously keeps a stopped/DB-less loop from holding
+	// a departed session's visibility set.
+	if s.aiRepl != nil {
+		s.aiRepl.forgetSession(sessionID)
+	}
+	// Pending group invitations naming this session (as target or inviter) are
+	// dropped immediately instead of waiting out the TTL.
+	if s.groups != nil {
+		s.groups.ForgetSession(sessionID)
 	}
 }
 
@@ -2304,35 +2137,6 @@ func (s *Server) BanPlayer(uuid string, reason string) error {
 		}
 	}
 	return nil
-}
-
-// sendStashResponse serialises resp as OpStashResponse and sends it directly
-// to addr without requiring an established session (client may not be registered yet).
-func (s *Server) sendStashResponse(addr *net.UDPAddr, resp protocol.StashResponsePayload) {
-	udp := s.GetUDP()
-	if udp == nil && activeSink == nil {
-		return
-	}
-	seq := s.seq.Add(1)
-	buf := packetBufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer packetBufferPool.Put(buf)
-	if err := protocol.WritePacket(buf, protocol.OpStashResponse, seq, protocol.FlagReliable, resp); err != nil {
-		s.logger.Error("sendStashResponse: failed to write packet", zap.Error(err))
-		return
-	}
-	data := buf.Bytes()
-	if activeSink != nil {
-		activeSink.Record(data)
-	}
-	if s.ackQueue != nil {
-		s.ackQueue.EnqueueReliable(seq, addr, data)
-	}
-	if udp != nil {
-		if err := udp.Send(addr, data); err != nil {
-			s.logger.Error("sendStashResponse: send failed", zap.Error(err))
-		}
-	}
 }
 
 // nullTermString converts a null-terminated fixed-width byte slice to a Go string.

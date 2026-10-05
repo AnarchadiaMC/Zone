@@ -26,6 +26,9 @@ const (
 	onlineStepClampSec          = 0.25
 	offlineStepInterval         = time.Second
 	offlineStepClampSec         = 2.0
+	// puppetDespawnDelay is how long a dead puppet keeps broadcasting its
+	// death animation before the squad is despawned and its entity released.
+	puppetDespawnDelay = 5 * time.Second
 )
 
 // PuppetDef describes one server-replicated AI puppet squad loaded from the
@@ -48,17 +51,16 @@ type PuppetDef struct {
 // PuppetState is an immutable snapshot of one puppet squad, copied under the
 // manager lock so callers (game tick, tests) can read it without data races.
 type PuppetState struct {
-	ID           uint32
-	Label        string
-	Section      string
-	Faction      string
-	Level        string
-	Position     [3]float32
-	Yaw          float32
-	Anim         uint8
-	Online       bool
-	Health       float32
-	PatrolRadius float32
+	ID       uint32
+	Label    string
+	Section  string
+	Faction  string
+	Level    string
+	Position [3]float32
+	Yaw      float32
+	Anim     uint8
+	Online   bool
+	Health   float32
 }
 
 // RegisterPuppet creates a replicable puppet squad with a generated loop when
@@ -94,16 +96,15 @@ func (sm *SquadManager) RegisterPuppet(def PuppetDef) *Squad {
 
 	sq := &Squad{
 		ID:           id,
+		DBID:         def.DBID,
 		Level:        def.Level,
 		Position:     def.Spawn,
 		State:        AIStatePatrol,
 		Health:       100.0,
 		Faction:      def.Faction,
-		SpawnedAt:    time.Now(),
 		Puppet:       true,
 		Label:        def.Label,
 		Section:      def.Section,
-		Spawn:        def.Spawn,
 		PatrolRadius: radius,
 		WalkSpeed:    walk,
 		RunSpeed:     run,
@@ -116,20 +117,37 @@ func (sm *SquadManager) RegisterPuppet(def PuppetDef) *Squad {
 
 // TickPuppets advances every puppet squad one simulation step. Squads whose ID
 // is present in online step at the caller's tick rate with elapsed time (the
-// game tick, 30 Hz); all other squads use a 1 Hz macro-step so off-screen
-// patrols keep moving cheaply. Must be called from the single game-loop
-// goroutine.
-func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) {
+// game tick); all other squads use a 1 Hz macro-step so off-screen patrols keep
+// moving cheaply. Dead squads are still processed: they broadcast AnimDeath and
+// are despawned (returned in the result) after puppetDespawnDelay, so the
+// caller can release their replication entity instead of leaking a corpse
+// forever. Must be called from the single game-loop goroutine.
+func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uint32 {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	for _, sq := range sm.squads {
-		if !sq.Puppet || sq.State == AIStateDead {
+	var despawned []uint32
+	for id, sq := range sm.squads {
+		if !sq.Puppet {
 			continue
 		}
 
 		isOnline := online[sq.ID]
 		sq.Online = isOnline
+
+		if sq.State == AIStateDead {
+			// Death branch runs BEFORE any skip: the death animation must be
+			// visible, and the squad must eventually be released.
+			if sq.deadSince.IsZero() {
+				sq.deadSince = now
+			}
+			applyPuppetStep(sq, now, 0)
+			if now.Sub(sq.deadSince) >= puppetDespawnDelay {
+				delete(sm.squads, id)
+				despawned = append(despawned, id)
+			}
+			continue
+		}
 
 		if isOnline {
 			dt := 0.0
@@ -138,6 +156,8 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) {
 				if dt < 0 {
 					dt = 0
 				} else if dt > onlineStepClampSec {
+					// Clamp: a paused loop resumes with at most a 250 ms step
+					// instead of teleporting the puppet by the full gap.
 					dt = onlineStepClampSec
 				}
 			}
@@ -159,15 +179,19 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) {
 			continue
 		}
 		if elapsed > offlineStepClampSec {
+			// Clamp: at most a 2 s macro-step after a long stall.
 			elapsed = offlineStepClampSec
 		}
 		sq.lastStep = now
 		applyPuppetStep(sq, now, elapsed)
 	}
+	return despawned
 }
 
 // applyPuppetStep moves sq along its patrol loop by speed*dt seconds and
-// refreshes Yaw/Anim. dt <= 0 only refreshes the stationary animation.
+// refreshes Yaw/Anim. dt <= 0 only refreshes the stationary animation. The
+// walk/run animation is derived directly from whether the runUntil window is
+// active, so Anim always matches the chosen speed.
 func applyPuppetStep(sq *Squad, now time.Time, dt float64) {
 	if len(sq.Loop) == 0 {
 		sq.Anim = AnimIdle
@@ -182,14 +206,13 @@ func applyPuppetStep(sq *Squad, now time.Time, dt float64) {
 		return
 	}
 
+	usingRun := !sq.runUntil.IsZero() && sq.runUntil.After(now) && sq.RunSpeed > 0
 	speed := sq.WalkSpeed
+	if usingRun {
+		speed = sq.RunSpeed
+	}
 	if speed <= 0 {
 		speed = defaultWalkSpeed
-	}
-	if !sq.runUntil.IsZero() && sq.runUntil.After(now) {
-		if sq.RunSpeed > 0 {
-			speed = sq.RunSpeed
-		}
 	}
 
 	if sq.LoopIndex < 0 || sq.LoopIndex >= len(sq.Loop) {
@@ -218,7 +241,7 @@ func applyPuppetStep(sq *Squad, now time.Time, dt float64) {
 		sq.Position[2] += dz / dist * step
 	}
 	sq.Yaw = float32(math.Atan2(float64(dx), float64(dz)))
-	if speed >= (defaultWalkSpeed+defaultRunSpeed)/2 {
+	if usingRun {
 		sq.Anim = AnimRun
 	} else {
 		sq.Anim = AnimWalk
@@ -228,29 +251,35 @@ func applyPuppetStep(sq *Squad, now time.Time, dt float64) {
 // SnapshotPuppets returns value copies of all puppet squads (including dead
 // ones, so callers can see the death animation).
 func (sm *SquadManager) SnapshotPuppets() []PuppetState {
+	return sm.SnapshotPuppetsInto(nil)
+}
+
+// SnapshotPuppetsInto is SnapshotPuppets with a caller-provided reusable
+// buffer, so the per-tick replication path performs no slice allocation after
+// warmup. The returned slice aliases buf.
+func (sm *SquadManager) SnapshotPuppetsInto(buf []PuppetState) []PuppetState {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	out := make([]PuppetState, 0, len(sm.squads))
+	buf = buf[:0]
 	for _, sq := range sm.squads {
 		if !sq.Puppet {
 			continue
 		}
-		out = append(out, PuppetState{
-			ID:           sq.ID,
-			Label:        sq.Label,
-			Section:      sq.Section,
-			Faction:      sq.Faction,
-			Level:        sq.Level,
-			Position:     sq.Position,
-			Yaw:          sq.Yaw,
-			Anim:         sq.Anim,
-			Online:       sq.Online,
-			Health:       sq.Health,
-			PatrolRadius: sq.PatrolRadius,
+		buf = append(buf, PuppetState{
+			ID:       sq.ID,
+			Label:    sq.Label,
+			Section:  sq.Section,
+			Faction:  sq.Faction,
+			Level:    sq.Level,
+			Position: sq.Position,
+			Yaw:      sq.Yaw,
+			Anim:     sq.Anim,
+			Online:   sq.Online,
+			Health:   sq.Health,
 		})
 	}
-	return out
+	return buf
 }
 
 // PuppetCount returns the number of registered puppet squads.
@@ -266,8 +295,10 @@ func (sm *SquadManager) PuppetCount() int {
 	return n
 }
 
-// SetPuppetRun makes the squad move at RunSpeed until until. It exists for the
-// optional run transition (not scheduled by default in wave A).
+// SetPuppetRun makes the squad move at RunSpeed until until, with the wire
+// animation derived from the same window (AnimRun while active, AnimWalk
+// otherwise). Not scheduled by default in wave A; exposed for future combat
+// hooks.
 func (sm *SquadManager) SetPuppetRun(id uint32, until time.Time) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()

@@ -37,6 +37,8 @@ local spawned_world_items = {}
 -- is forward-declared so reset_state can disarm the on-disk join marker.
 local on_load_level, on_inventory_sync, on_server_error, handle_show_start
 local clear_pending_join
+-- Defined near on_tick; dispatch (0x007C gate) and on_tick both call it.
+local xrr_session_active
 
 function read_uint8(pkt, pos)
     return string.byte(pkt, pos), pos + 1
@@ -459,7 +461,7 @@ function ZoneNet:GetSpawn()
     local y = ffi.new("float[1]")
     local z = ffi.new("float[1]")
     -- Real C signature is 5 pointers (level/ecoTier out params) - pass
-    -- throwaway buffers instead of calling the old 3-arg ABI bug.
+    -- throwaway buffers for the two out params.
     local lvl = ffi.new("uint8_t[1]")
     local eco = ffi.new("uint8_t[1]")
     local ok = pcall(function() zone_client.ZN_GetSpawn(x, y, z, lvl, eco) end)
@@ -551,6 +553,12 @@ end
 local ITEM_ACTION_TTL_MS = 30000
 local ITEM_ACTION_PAYLOAD_LEN = 88
 local ITEM_DROP_FORWARD = 1.0
+-- Unconfirmed item actions are retransmitted with the SAME payload/ActionID
+-- every 500 ms, up to 4 times. The server keeps a per-session ActionID
+-- idempotency cache and echoes the cached OpItemUpdate for a replay
+-- (item_ledger.go:68, :278-282), so a retransmit can never double-apply.
+local ITEM_ACTION_RESEND_MS = 500
+local ITEM_ACTION_MAX_RESENDS = 4
 local g_item_payload = ffi.new("char[88]")
 
 local function item_payload_u8(buf, off, v)
@@ -642,6 +650,35 @@ local function prune_pending_item_actions(tg)
     end
 end
 
+-- Retransmit unacknowledged item actions. Runs from the connected tick; a
+-- failed send leaves the entry in place for the next tick (the connection
+-- check in on_tick is the gate, not item_send_allowed, so a transient
+-- SendRaw failure is retried).
+local function retransmit_pending_item_actions(tg)
+    if not (ZoneNet and type(ZoneNet.SendRaw) == "function") then return end
+    for id, entry in pairs(pending_item_actions) do
+        if not entry.timed_out and entry.next_resend_tg and tg >= entry.next_resend_tg then
+            if entry.resends < ITEM_ACTION_MAX_RESENDS then
+                entry.resends = entry.resends + 1
+                entry.next_resend_tg = tg + ITEM_ACTION_RESEND_MS
+                local sent = ZoneNet:SendRaw(0x007D, entry.payload, ITEM_ACTION_PAYLOAD_LEN, 1)
+                if not sent then
+                    printf("Zone: item action %u resend %d failed",
+                        tonumber(id) or 0, entry.resends)
+                end
+            else
+                entry.timed_out = true
+                -- Keep one visible timeout notice; reconciliation happens when
+                -- the next server inventory sync lands.
+                surface_message(tr("ui_zone_item_action_timeout",
+                    "Server did not confirm an item action; inventory will be reconciled on the next sync"))
+                printf("Zone: item action %u timed out after %d resends (section %s)",
+                    tonumber(id) or 0, entry.resends, tostring(entry.section))
+            end
+        end
+    end
+end
+
 local function send_item_action(action, item_id, section, count, x, y, z, condition, local_se_id)
     if not item_send_allowed() then return nil end
     if type(section) ~= "string" or section == "" then return nil end
@@ -665,7 +702,11 @@ local function send_item_action(action, item_id, section, count, x, y, z, condit
     item_payload_f32(buf, 83, z or 0)
     item_payload_u8(buf, 87, condition or 0)
 
-    local sent = ZoneNet:SendRaw(0x007D, buf, ITEM_ACTION_PAYLOAD_LEN, 1)
+    -- Snapshot the exact bytes: retransmits must be byte-identical to the
+    -- original (same ActionID and payload), so the shared g_item_payload
+    -- buffer cannot be reused.
+    local payload = ffi.string(buf, ITEM_ACTION_PAYLOAD_LEN)
+    local sent = ZoneNet:SendRaw(0x007D, payload, ITEM_ACTION_PAYLOAD_LEN, 1)
     if not sent then
         printf("Zone: failed to send item action %d for section %s",
             tonumber(action) or 0, section)
@@ -677,6 +718,10 @@ local function send_item_action(action, item_id, section, count, x, y, z, condit
     pending_item_actions[action_id] = {
         action = action, section = section, count = count or 1,
         time = tg, local_se_id = local_se_id,
+        payload = payload,
+        resends = 0,
+        next_resend_tg = tg + ITEM_ACTION_RESEND_MS,
+        timed_out = false,
     }
     return action_id
 end
@@ -981,21 +1026,6 @@ function dispatch_packet(pkt)
         if zone_ai_proxy and zone_ai_proxy.on_entity_leave then
             safe_call("entity_leave_ai", zone_ai_proxy.on_entity_leave, pkt, offset)
         end
-    elseif opcode == 0x0041 then
-        -- Stash responses have no consumer UI yet (no committed stash sender).
-        -- Parse minimally and surface errors; never fatal. Future stash UI
-        -- should hook here for full contents display.
-        safe_call("stash_response", function()
-            if string.len(pkt) >= offset + 5 - 1 then
-                local stash_id, ppos = read_uint32_le(pkt, offset)
-                local status, _ = read_uint8(pkt, ppos)
-                if status ~= 0 and db.actor then
-                    db.actor:give_game_news("Zone", "Stash unavailable.", "ui_inGame2_PDA_icon", 0, 3000, 0)
-                end
-            else
-                log_dispatch_once("short_0041", "Zone: dropped short STASH_RESPONSE packet (%d bytes)", string.len(pkt))
-            end
-        end)
     elseif opcode == 0x0020 then
         if zone_safezone and zone_safezone.on_safezone_state then
             safe_call("safezone", zone_safezone.on_safezone_state, pkt, offset)
@@ -1041,10 +1071,6 @@ function dispatch_packet(pkt)
                 safe_call("chat_hud", zone_hud.on_chat_message, pkt, offset)
             end
         end)
-    elseif opcode == 0x0070 then
-        if zone_ai_proxy and zone_ai_proxy.on_ai_action then
-            safe_call("ai_action", zone_ai_proxy.on_ai_action, pkt, offset)
-        end
     elseif opcode == 0x0071 then
         safe_call("show_start", function()
             if type(handle_show_start) == "function" then handle_show_start(pkt, offset) end
@@ -1068,6 +1094,13 @@ function dispatch_packet(pkt)
         if zone_hud and zone_hud.on_group_invite then
             safe_call("group_invite", zone_hud.on_group_invite, pkt, offset)
         end
+    elseif opcode == 0x0079 then
+        -- OpGroupResponse (0x0079) is client->server only and chat-command
+        -- driven: /accept and /decline are sent as chat text via
+        -- ZN_SendChatText (see the 0x007A handler above). A server copy is
+        -- unexpected; log once, never act on it.
+        log_dispatch_once("op_0079",
+            "Zone: ignored server-sent OpGroupResponse 0x0079 (chat-command-driven opcode)")
     elseif opcode == 0x007A then
         -- OpGroupState (S->C): memberCount u8, then per member sessionID u32,
         -- name[32], faction[16], isLeader u8. 0x0079 (OpGroupResponse) is
@@ -1075,20 +1108,6 @@ function dispatch_packet(pkt)
         if zone_hud and zone_hud.on_group_state then
             safe_call("group_state", zone_hud.on_group_state, pkt, offset)
         end
-    elseif opcode == 0x007B then
-        -- OpPositionCorrection (S->C unreliable, 12 B): x f32, y f32, z f32.
-        safe_call("position_correction", function()
-            if string.len(pkt) < offset + 12 - 1 then
-                log_dispatch_once("short_007B", "Zone: dropped short POSITION_CORRECTION packet (%d bytes)", string.len(pkt))
-                return
-            end
-            local x, p2 = read_float_le(pkt, offset)
-            local y, p3 = read_float_le(pkt, p2)
-            local z, _ = read_float_le(pkt, p3)
-            if zone_dummy and zone_dummy.on_position_correction then
-                safe_call("position_correction_dummy", zone_dummy.on_position_correction, x, y, z)
-            end
-        end)
     elseif opcode == 0x007C then
         -- OpAIState (S->C unreliable, protocol v5): count u8, then per entity
         -- 19 bytes (EntityID u32, X/Y/Z f32, Yaw u16, Anim u8). Multiple
@@ -1097,12 +1116,8 @@ function dispatch_packet(pkt)
         if zone_ai_proxy and zone_ai_proxy.on_ai_state then
             local connected = false
             pcall(function() connected = ZoneNet:IsConnected() and true or false end)
-            local co_op = false
-            pcall(function()
-                if _G.XrrIsConnected and _G.XrrIsConnected() then co_op = true end
-                if _G.XrrIsHosted and _G.XrrIsHosted() then co_op = true end
-            end)
-            if connected and not co_op then
+            -- Single co-op gate: zone_main.xrr_is_active() (also covers XrrNet).
+            if connected and not (type(xrr_session_active) == "function" and xrr_session_active()) then
                 safe_call("ai_state", function()
                     local len = string.len(pkt)
                     if len < offset then
@@ -1122,11 +1137,19 @@ function dispatch_packet(pkt)
             end
         end
     elseif opcode == 0x007F then
-        -- TODO(protocol v5): container opcode 0x007F. Client container UI is
-        -- out of scope for this wave; reserved dispatch hook, not implemented.
+        -- ACTIVE STUB (protocol v5): OpContainerAction 0x007F is client->server
+        -- (zone-server/docs/INVENTORY_V2.md:12). No container sender exists in
+        -- this wave; a received copy is logged, not silently dropped.
+        log_dispatch_once("op_007F",
+            "Zone: container action 0x007F received but no container UI/sender is implemented (%d payload bytes)",
+            paylen)
     elseif opcode == 0x0080 then
-        -- TODO(protocol v5): container opcode 0x0080. Client container UI is
-        -- out of scope for this wave; reserved dispatch hook, not implemented.
+        -- ACTIVE STUB (protocol v5): OpContainerUpdate 0x0080 is server->client
+        -- (zone-server/docs/INVENTORY_V2.md:13). No container UI consumes it
+        -- yet; logged once instead of silently dropped.
+        log_dispatch_once("op_0080",
+            "Zone: container update 0x0080 received but no container UI is implemented (%d payload bytes)",
+            paylen)
     elseif opcode == 0x007E then
         -- OpItemUpdate (S->C reliable, 89 B). Prefer an external zone_item
         -- module when present; otherwise the ledger section in this file.
@@ -1575,7 +1598,21 @@ on_inventory_sync = function(pkt, offset)
         return
     end
     local item_count, pos = read_uint8(pkt, offset)
-    if not item_count or item_count == 0 then return end
+    if not item_count then return end
+    if item_count == 0 then
+        -- Empty sync semantics: the server sends one empty 0x0076 when the
+        -- character inventory is empty and the initial sync is complete
+        -- (zone-server/internal/game/server.go sendInventorySync). It is a
+        -- state statement, NOT a delete command: clear the un-drained local
+        -- reconciliation queue and mark reconcile complete, but never remove
+        -- existing real items from an empty sync alone (destroying real items
+        -- on one packet would be unrecoverable).
+        pending_inventory = {}
+        apply_inventory_pending = false
+        log_dispatch_once("inv_sync_empty",
+            "Zone: inventory sync: empty (pending reconcile queue cleared; existing items kept)")
+        return
+    end
 
     local entries = {}
     for _ = 1, item_count do
@@ -1716,7 +1753,14 @@ end
 
 -- xrRazom guard: when co-op is live, Zone stays dormant so the two proxy
 -- systems (XrrPlayers dummies vs zone_dummy proxies) never fight over alife.
-local function xrr_session_active()
+-- Single owner is zone_main.xrr_is_active(), which also checks XrrNet; the raw
+-- Xrr* globals are a nil-safe fallback while zone_main is not loaded.
+function xrr_session_active()
+    local fn = zone_main and zone_main.xrr_is_active
+    if type(fn) == "function" then
+        local ok, res = pcall(fn)
+        if ok then return res == true end
+    end
     local active = false
     pcall(function()
         if _G.XrrIsConnected and _G.XrrIsConnected() then active = true end
@@ -1752,6 +1796,22 @@ function on_tick()
             -- safezone enforcement so weapons/input are never left locked.
             pcall(function()
                 if zone_safezone and zone_safezone.reset then zone_safezone.reset() end
+            end)
+            -- Also reap proxies/puppets now instead of leaving them frozen
+            -- until the next level change (whichever cleanup entry exists).
+            pcall(function()
+                if zone_dummy then
+                    if type(zone_dummy.on_disconnect) == "function" then
+                        zone_dummy.on_disconnect()
+                    elseif type(zone_dummy.on_level_changing) == "function" then
+                        zone_dummy.on_level_changing()
+                    end
+                end
+            end)
+            pcall(function()
+                if zone_ai_proxy and type(zone_ai_proxy.release_puppets) == "function" then
+                    zone_ai_proxy.release_puppets()
+                end
             end)
             -- Surface the drop reason captured by the DLL (kick, liveness
             -- timeout, ...). Never leave a silent disconnect.
@@ -1810,6 +1870,11 @@ function on_tick()
         pcall(drain_inventory_queue)
     end
 
+    -- Retransmit unconfirmed item actions (~500 ms apart, max 4) while the
+    -- session is live; after the final retry a timeout notice is surfaced and
+    -- the next inventory sync reconciles.
+    pcall(retransmit_pending_item_actions, tg)
+
     if db.actor then
         pcall(function()
             local pos = db.actor:position()
@@ -1824,7 +1889,6 @@ function on_tick()
             local mstate = (level.actor_moving_state and level.actor_moving_state()) or 0
             if bit.band(mstate, 16) ~= 0 then animflags = bit.bor(animflags, 1) end -- Crouch (mcCrouch = 0x10)
             if bit.band(mstate, 4096) ~= 0 then animflags = bit.bor(animflags, 2) end -- Sprint (mcSprint = 0x1000)
-            -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
 
             local gvid = 0
             pcall(function() gvid = db.actor:game_vertex_id() or 0 end)

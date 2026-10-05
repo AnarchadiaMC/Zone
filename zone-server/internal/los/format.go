@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 )
@@ -12,9 +13,11 @@ const (
 	fileMagic     = "ZLOS"
 	fileVersion   = 1
 	headerSize    = 88
+	maxFileBytes  = 256 << 20
 	maxVertices   = 50_000_000
 	maxTriangles  = 50_000_000
 	maxGridDim    = 1_000_000
+	maxCells      = 1 << 26
 	maxCellRefs   = 400_000_000
 	flagsQuantize = 1
 )
@@ -27,6 +30,10 @@ func indexWidth(n int) int {
 		return 3
 	}
 	return 4
+}
+
+func isFinite32(v float32) bool {
+	return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
 }
 
 func (o *Occluders) Save(path string) error {
@@ -89,14 +96,32 @@ func (o *Occluders) Save(path string) error {
 }
 
 func Load(path string) (*Occluders, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
+	}
+	if info.Size() > maxFileBytes {
+		return nil, fmt.Errorf("los: file too large (%d bytes, limit %d)", info.Size(), int64(maxFileBytes))
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxFileBytes {
+		return nil, fmt.Errorf("los: file too large (%d bytes, limit %d)", len(data), int64(maxFileBytes))
 	}
 	return parse(data)
 }
 
 func parse(data []byte) (*Occluders, error) {
+	if len(data) > maxFileBytes {
+		return nil, fmt.Errorf("los: file too large (%d bytes, limit %d)", len(data), int64(maxFileBytes))
+	}
 	if len(data) < headerSize {
 		return nil, errors.New("los: file too small")
 	}
@@ -112,84 +137,103 @@ func parse(data []byte) (*Occluders, error) {
 	if flags&flagsQuantize == 0 {
 		return nil, errors.New("los: unsupported vertex encoding")
 	}
+	if flags&^uint32(flagsQuantize) != 0 {
+		return nil, fmt.Errorf("los: unsupported flags 0x%08x", flags)
+	}
 	width := int(data[12])
 	if width != 2 && width != 3 && width != 4 {
 		return nil, fmt.Errorf("los: invalid index width %d", width)
 	}
-	vc := int(le.Uint32(data[64:]))
-	tc := int(le.Uint32(data[68:]))
-	gx := int(le.Uint32(data[56:]))
-	gz := int(le.Uint32(data[60:]))
-	if vc <= 0 || tc <= 0 || vc > maxVertices || tc > maxTriangles {
-		return nil, errors.New("los: invalid vertex/triangle count")
+
+	vc := int64(le.Uint32(data[64:]))
+	tc := int64(le.Uint32(data[68:]))
+	if vc > maxVertices || tc > maxTriangles {
+		return nil, fmt.Errorf("los: vertex/triangle count too large (verts=%d tris=%d)", vc, tc)
 	}
+	if (vc == 0) != (tc == 0) {
+		return nil, fmt.Errorf("los: inconsistent vertex/triangle count (verts=%d tris=%d)", vc, tc)
+	}
+	gx := int64(le.Uint32(data[56:]))
+	gz := int64(le.Uint32(data[60:]))
 	if gx <= 0 || gz <= 0 || gx > maxGridDim || gz > maxGridDim {
-		return nil, errors.New("los: invalid grid dimensions")
+		return nil, fmt.Errorf("los: invalid grid dimensions %dx%d", gx, gz)
 	}
 	nCells := gx * gz
-
-	need := headerSize + vc*6 + tc*3*width + (nCells+1)*4
-	if len(data) < need {
-		return nil, errors.New("los: truncated file")
+	if nCells > maxCells {
+		return nil, fmt.Errorf("los: grid too large (%dx%d)", gx, gz)
 	}
-	refBytes := len(data) - need
-	if refBytes%width != 0 {
+
+	need := int64(headerSize) + vc*6 + tc*3*int64(width) + (nCells+1)*4
+	if int64(len(data)) < need {
+		return nil, fmt.Errorf("los: truncated file (need %d bytes, have %d)", need, len(data))
+	}
+	refBytes := int64(len(data)) - need
+	if refBytes%int64(width) != 0 {
 		return nil, errors.New("los: truncated cell reference table")
 	}
-	refs := refBytes / width
+	refs := refBytes / int64(width)
 	if refs > maxCellRefs {
-		return nil, errors.New("los: cell reference table too large")
+		return nil, fmt.Errorf("los: cell reference table too large (%d)", refs)
 	}
 
 	o := &Occluders{
-		gridX:     gx,
-		gridZ:     gz,
-		cellSize:  getF32(data[52:]),
+		gridX:     int(gx),
+		gridZ:     int(gz),
 		fileBytes: int64(len(data)),
+	}
+	o.cellSize = getF32(data[52:])
+	if !isFinite32(o.cellSize) || o.cellSize <= 0 {
+		return nil, fmt.Errorf("los: invalid cell size %v", o.cellSize)
 	}
 	for a := 0; a < 3; a++ {
 		o.boundsMin[a] = getF32(data[16+a*4:])
 		o.boundsMax[a] = getF32(data[28+a*4:])
 		o.origin[a] = getF32(data[40+a*4:])
 		o.scale[a] = getF32(data[72+a*4:])
-	}
-	if !(o.cellSize > 0) {
-		return nil, errors.New("los: invalid cell size")
+		if !isFinite32(o.boundsMin[a]) || !isFinite32(o.boundsMax[a]) || !isFinite32(o.origin[a]) {
+			return nil, fmt.Errorf("los: non-finite bounds on axis %d", a)
+		}
+		if o.boundsMin[a] > o.boundsMax[a] {
+			return nil, fmt.Errorf("los: inverted bounds on axis %d", a)
+		}
+		if !isFinite32(o.scale[a]) || o.scale[a] < 0 {
+			return nil, fmt.Errorf("los: invalid scale on axis %d", a)
+		}
 	}
 
 	off := headerSize
-	o.verts = make([]int16, vc*3)
+	o.verts = make([]int16, int(vc)*3)
 	for i := range o.verts {
 		o.verts[i] = int16(le.Uint16(data[off:]))
 		off += 2
 	}
-	o.tris = make([]uint32, tc*3)
+	o.tris = make([]uint32, int(tc)*3)
 	for i := range o.tris {
 		idx := getIndex(data[off:], width)
-		if int(idx) >= vc {
-			return nil, errors.New("los: triangle index out of range")
+		if int64(idx) >= vc {
+			return nil, fmt.Errorf("los: triangle index %d out of range (verts=%d)", idx, vc)
 		}
 		o.tris[i] = idx
 		off += width
 	}
-	o.cellStart = make([]uint32, nCells+1)
+	o.cellStart = make([]uint32, int(nCells)+1)
 	for i := range o.cellStart {
 		o.cellStart[i] = le.Uint32(data[off:])
 		off += 4
 	}
-	if int(o.cellStart[0]) != 0 || int(o.cellStart[nCells]) != refs {
+	if int64(o.cellStart[0]) != 0 || int64(o.cellStart[nCells]) != refs {
 		return nil, errors.New("los: inconsistent cell table")
 	}
-	for i := 0; i < nCells; i++ {
+	for i := 0; i < int(nCells); i++ {
 		if o.cellStart[i] > o.cellStart[i+1] {
-			return nil, errors.New("los: non-monotonic cell table")
+			return nil, fmt.Errorf("los: non-monotonic cell table at cell %d", i)
 		}
 	}
-	o.cellTris = make([]uint32, refs)
+	o.cellTris = make([]uint32, int(refs))
 	for i := range o.cellTris {
 		idx := getIndex(data[off:], width)
-		if int(idx) >= tc {
-			return nil, errors.New("los: cell triangle index out of range")
+		if int64(idx) >= tc {
+			return nil, fmt.Errorf("los: cell triangle index %d out of range (tris=%d)", idx, tc)
 		}
 		o.cellTris[i] = idx
 		off += width

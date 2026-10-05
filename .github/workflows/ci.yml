@@ -41,3 +41,21 @@ jobs:
       - name: Build Client (Release)
         run: cmake --build zone-client/build --config Release
 
+  lua-syntax:
+    name: Lua Syntax (LuaJIT 2.1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install lupa (bundled LuaJIT 2.1)
+        run: "python -m pip install --only-binary=:all: lupa"
+
+      - name: Validate Lua scripts
+        run: python tools/check_lua_syntax.py 'gamedata/scripts/*.script'
+

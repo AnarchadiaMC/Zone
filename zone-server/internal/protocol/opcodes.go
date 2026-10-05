@@ -24,11 +24,8 @@ const (
 	OpEntityLeaveAoI     = 0x0013
 	OpSafezoneState      = 0x0020
 	OpWorldEvent         = 0x0030
-	OpStashInteract      = 0x0040
-	OpStashResponse      = 0x0041
 	OpDamageNotify       = 0x0050
 	OpChatText           = 0x0060
-	OpAIActionEvent      = 0x0070
 	OpShowStart          = 0x0071
 	OpCharacterSelect    = 0x0072
 	OpLoadLevel          = 0x0073
@@ -39,7 +36,6 @@ const (
 	OpGroupInviteNotify  = 0x0078
 	OpGroupResponse      = 0x0079
 	OpGroupState         = 0x007A
-	OpPositionCorrection = 0x007B
 	OpAIState            = 0x007C
 	OpItemAction         = 0x007D
 	OpItemUpdate         = 0x007E

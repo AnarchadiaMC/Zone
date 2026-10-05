@@ -102,6 +102,8 @@ func (aq *AckQueue) Enqueue(seq uint32, addr *net.UDPAddr, data []byte) {
 
 // Acknowledge removes the packet with the specified sequence number from the queue.
 // Returns true if the packet was found and removed, false otherwise.
+// It is address-blind; network callers must use AcknowledgeFrom so one client
+// cannot clear another client's retransmit entry.
 func (aq *AckQueue) Acknowledge(seq uint32) bool {
 	aq.mu.Lock()
 	defer aq.mu.Unlock()
@@ -110,6 +112,32 @@ func (aq *AckQueue) Acknowledge(seq uint32) bool {
 		return true
 	}
 	return false
+}
+
+// AcknowledgeFrom removes the packet with the given sequence number only when
+// the pending entry was enqueued for addr. Sequence numbers are one global
+// space, so an address-blind ACK would let any client suppress another
+// client's reliable retransmissions. Returns true when the entry was removed.
+func (aq *AckQueue) AcknowledgeFrom(seq uint32, addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	aq.mu.Lock()
+	defer aq.mu.Unlock()
+	entry, exists := aq.entries[seq]
+	if !exists || !sameUDPAddr(entry.Addr, addr) {
+		return false
+	}
+	delete(aq.entries, seq)
+	return true
+}
+
+// sameUDPAddr reports whether two UDP endpoints identify the same peer.
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
 }
 
 // Tick checks unacknowledged packets and retransmits any whose retransmission
@@ -213,29 +241,4 @@ func (aq *AckQueue) EnqueueReliable(seq uint32, addr *net.UDPAddr, data []byte) 
 // AckReceived provides backwards-compatible naming for Acknowledge.
 func (aq *AckQueue) AckReceived(seq uint32) {
 	aq.Acknowledge(seq)
-}
-
-// RetransmitExpired provides backwards-compatible retransmission with a UDPListener.
-func (aq *AckQueue) RetransmitExpired(now time.Time, listener *UDPListener) {
-	type sendItem struct {
-		addr *net.UDPAddr
-		data []byte
-	}
-	var toSend []sendItem
-
-	aq.mu.Lock()
-	for _, entry := range aq.entries {
-		if now.Sub(entry.LastSentAt) > aq.retransmitInterval {
-			entry.LastSentAt = now
-			entry.Retries++
-			toSend = append(toSend, sendItem{addr: entry.Addr, data: entry.Data})
-		}
-	}
-	aq.mu.Unlock()
-
-	for _, item := range toSend {
-		if listener != nil {
-			_ = listener.Send(item.addr, item.data)
-		}
-	}
 }

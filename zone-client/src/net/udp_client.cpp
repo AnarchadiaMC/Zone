@@ -10,7 +10,6 @@
 #include <vector>
 #include <algorithm>
 #include <condition_variable>
-#include <iostream>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -706,39 +705,6 @@ namespace NetClient
         return true;
     }
 
-    bool PollEvent(char* outBuf, size_t& outLen)
-    {
-        // Legacy 2-arg overload: capacity is implicitly 1500 (the FFI
-        // g_poll_buf size). The Lua side never presets *len (it holds the
-        // previous packet's length), so reading it as a capacity would cause
-        // false drops. New native code must call the 3-arg overload with an
-        // explicit capacity. ZN_PollEvent below does exactly that.
-        return PollEvent(outBuf, 1500, outLen);
-    }
-
-    bool PollEvent(int a, int& b)
-    {
-        uint32_t tail = g_RingTail.load(std::memory_order_relaxed);
-        if (tail == g_RingHead.load(std::memory_order_acquire))
-            return false;
-
-        size_t packetLen = g_Ring[tail].len;
-        if (packetLen >= sizeof(ZO_Header))
-        {
-            ZO_Header* hdr = (ZO_Header*)g_Ring[tail].data;
-            a = (int)hdr->opcode;
-            b = (int)hdr->payload_len;
-        }
-        else
-        {
-            a = 0;
-            b = (int)packetLen;
-        }
-
-        g_RingTail.store((tail + 1) % 256, std::memory_order_release);
-        return true;
-    }
-    
     bool IsConnected() { return g_State == CONNECTED; }
     bool IsInSafeZone() { return g_InSafeZone.load(std::memory_order_acquire); }
     bool IsPendingCreate() { return g_PendingCreate.load(std::memory_order_acquire); }
@@ -771,11 +737,6 @@ namespace NetClient
         return g_LastError;
     }
 
-    uint64_t GetDroppedPackets()
-    {
-        return g_DroppedPackets.load(std::memory_order_relaxed);
-    }
-    
     void SendChatText(const std::string& text)
     {
         if (g_State != CONNECTED) return;

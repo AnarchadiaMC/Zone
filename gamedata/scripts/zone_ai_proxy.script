@@ -15,14 +15,27 @@ local ai_entities = {}
 -- ENTITY_ENTER with an unresolved gvid (packet gvid 0 and out of fallback
 -- range): held here and retried from the next 0x007C state update.
 local pending_spawns = {}
+-- Last ENTITY_ENTER wire data per entity, kept past the pending-spawn TTL so a
+-- later 0x007C state update can re-create a stranded pending entry instead of
+-- dropping the squad forever.
+local known_entities = {}
 -- One fallback log per entity spawn lifecycle.
 local gvid_fallback_logged = {}
+-- One-time section-fallback warnings keyed by requested section name.
+local section_fallback_warned = {}
+
+-- Fallback spawn section. A local constant, not a config key: the server
+-- config surface is being changed concurrently and Lua must not depend on it.
+local AI_FALLBACK_SECTION = "sim_default_stalker_0"
 
 local STATE_ENTRY_BYTES = 19
 local FREEZE_MS = 4000
 local GVID_FALLBACK_MAX_DIST = 150
 local GVID_FALLBACK_DIST_SQ = GVID_FALLBACK_MAX_DIST * GVID_FALLBACK_MAX_DIST
 local PENDING_SPAWN_TTL_MS = 60000
+-- ENTITY_ENTER recovery cache lifetime: longer than the pending TTL so a
+-- pruned squad can always be re-created from the next state update.
+local KNOWN_ENTER_TTL_MS = 300000
 local MOVE_STALL_DIST_SQ = 3 * 3
 local MOVE_STALL_EPS_SQ = 0.05 * 0.05
 local MOVE_STALL_SAMPLES = 2
@@ -38,8 +51,15 @@ local MOVE_RUN = 1
 local MOVE_STAND = 2
 
 -- Mutual exclusion with xrRazom co-op (mirrors zone_dummy.spawn_proxy):
--- never spawn Zone puppets while co-op owns the world.
+-- never spawn Zone puppets while co-op owns the world. Single owner is
+-- zone_main.xrr_is_active() (also covers XrrNet); the raw Xrr* globals are a
+-- nil-safe fallback while zone_main is not loaded.
 local function xrr_active()
+    local fn = zone_main and zone_main.xrr_is_active
+    if type(fn) == "function" then
+        local ok, res = pcall(fn)
+        if ok then return res == true end
+    end
     local active = false
     pcall(function()
         if _G.XrrIsConnected and _G.XrrIsConnected() then active = true end
@@ -65,6 +85,58 @@ local function release_one(sim, entity)
     local se = nil
     pcall(function() se = sim:object(entity.se_id) end)
     if se then pcall(function() sim:release(se, true) end) end
+end
+
+-- Reusable vectors for the per-state path: one module-level instance instead of
+-- a fresh vector allocation per entity per packet. Created lazily because
+-- vector() may not be bound during the very first script load pass.
+local g_state_pos, g_steer_dir, g_spawn_pos
+
+local function ensure_vectors()
+    if g_state_pos then return end
+    g_state_pos = vector():set(0, 0, 0)
+    g_steer_dir = vector():set(0, 0, 1)
+    g_spawn_pos = vector():set(0, 0, 0)
+end
+
+-- Named wrappers so pcall(fn, ...) does not allocate a closure per entity per
+-- state update (the bindings are SAFE_WRAP-guarded: script_game_object_script2
+-- .cpp:287-288,303-307,351).
+local function go_get_position(obj)
+    return obj:position()
+end
+
+local function go_set_desired_position(obj)
+    obj:set_desired_position(g_state_pos)
+end
+
+local function go_set_desired_direction(obj)
+    obj:set_desired_direction(g_steer_dir)
+end
+
+local function go_set_npc_position(obj)
+    obj:set_npc_position(g_state_pos)
+end
+
+local function go_set_body_state(obj, state)
+    obj:set_body_state(state)
+end
+
+local function go_set_movement_type(obj, movement_type)
+    obj:set_movement_type(movement_type)
+end
+
+-- level.object_by_id is an engine call; always reached through pcall.
+local function level_object(id)
+    return level.object_by_id(id)
+end
+
+-- system_ini() access is pcall-guarded everywhere (see ini_has_section).
+local function ini_has_section(sec)
+    if type(sec) ~= "string" or sec == "" then return false end
+    local ini = system_ini and system_ini()
+    if not ini or not ini.section_exist then return false end
+    return ini:section_exist(sec) and true or false
 end
 
 -- Lua has no binding that maps a world position or level_vertex_id to a game
@@ -100,11 +172,12 @@ function resolve_gvid(pos, packet_gvid)
     return actor_gvid
 end
 
--- Yaw u16 (0..65535) -> direction. X-Ray yaw is atan2(dir.x, dir.z), so the
--- inverse is dir = (sin(yaw), 0, cos(yaw)).
+-- Yaw u16 (0..65535) -> direction written into the shared g_steer_dir. X-Ray
+-- yaw is atan2(dir.x, dir.z), so the inverse is dir = (sin(yaw), 0, cos(yaw)).
 local function yaw_direction(yaw_u16)
     local rad = (tonumber(yaw_u16) or 0) * (2 * math.pi / 65536.0)
-    return vector():set(math.sin(rad), 0, math.cos(rad))
+    g_steer_dir:set(math.sin(rad), 0, math.cos(rad))
+    return g_steer_dir
 end
 
 -- Cosmetic anim mapping. Engine enum values differ from the wire ids: wire 0
@@ -112,37 +185,39 @@ end
 -- exists (EBodyState is crouch/stand only), so attack is stand + facing.
 local function apply_anim_state(obj, anim)
     if anim == 1 then
-        pcall(function() obj:set_body_state(BODY_STAND) end)
-        pcall(function() obj:set_movement_type(MOVE_WALK) end)
+        pcall(go_set_body_state, obj, BODY_STAND)
+        pcall(go_set_movement_type, obj, MOVE_WALK)
     elseif anim == 2 then
-        pcall(function() obj:set_body_state(BODY_STAND) end)
-        pcall(function() obj:set_movement_type(MOVE_RUN) end)
+        pcall(go_set_body_state, obj, BODY_STAND)
+        pcall(go_set_movement_type, obj, MOVE_RUN)
     else
-        pcall(function() obj:set_body_state(BODY_STAND) end)
-        pcall(function() obj:set_movement_type(MOVE_STAND) end)
+        pcall(go_set_body_state, obj, BODY_STAND)
+        pcall(go_set_movement_type, obj, MOVE_STAND)
     end
 end
 
 -- Smooth steering: desired position + desired direction every state update.
 -- set_npc_position is only a recovery snap: if the puppet is still more than
 -- 3 m from the reported position and did not move across two consecutive
--- state updates, desired-position steering is having no effect.
-local function steer_puppet(entity, obj, target, dir)
-    local cur = nil
-    pcall(function() cur = obj:position() end)
-    if not cur then return end
-    local dx = cur.x - target.x
-    local dy = cur.y - target.y
-    local dz = cur.z - target.z
+-- state updates, desired-position steering is having no effect. Target and
+-- previous positions are scalars so no vector is allocated per state.
+local function steer_puppet(entity, obj)
+    local tx, ty, tz = entity.target_x, entity.target_y, entity.target_z
+    if tx == nil then return end
+    local ok_pos, cur = pcall(go_get_position, obj)
+    if not ok_pos or not cur then return end
+    local dx = cur.x - tx
+    local dy = cur.y - ty
+    local dz = cur.z - tz
     if (dx * dx + dy * dy + dz * dz) > MOVE_STALL_DIST_SQ then
         local moved_sq = nil
-        if entity.prev_pos then
-            local mx = cur.x - entity.prev_pos.x
-            local my = cur.y - entity.prev_pos.y
-            local mz = cur.z - entity.prev_pos.z
+        if entity.prev_x then
+            local mx = cur.x - entity.prev_x
+            local my = cur.y - entity.prev_y
+            local mz = cur.z - entity.prev_z
             moved_sq = mx * mx + my * my + mz * mz
         end
-        entity.prev_pos = vector():set(cur.x, cur.y, cur.z)
+        entity.prev_x, entity.prev_y, entity.prev_z = cur.x, cur.y, cur.z
         if moved_sq ~= nil and moved_sq < MOVE_STALL_EPS_SQ then
             entity.stall = (entity.stall or 0) + 1
         else
@@ -150,16 +225,19 @@ local function steer_puppet(entity, obj, target, dir)
         end
         if entity.stall >= MOVE_STALL_SAMPLES then
             entity.stall = 0
-            entity.prev_pos = nil
-            pcall(function() obj:set_npc_position(target) end)
+            entity.prev_x, entity.prev_y, entity.prev_z = nil, nil, nil
+            g_state_pos:set(tx, ty, tz)
+            pcall(go_set_npc_position, obj)
             return
         end
     else
         entity.stall = 0
-        entity.prev_pos = nil
+        entity.prev_x, entity.prev_y, entity.prev_z = nil, nil, nil
     end
-    pcall(function() obj:set_desired_position(target) end)
-    if dir then pcall(function() obj:set_desired_direction(dir) end) end
+    g_state_pos:set(tx, ty, tz)
+    pcall(go_set_desired_position, obj)
+    yaw_direction(entity.target_yaw)
+    pcall(go_set_desired_direction, obj)
 end
 
 -- Attack (wire 3): cosmetic only, never fire. Face the nearest player (the
@@ -167,19 +245,16 @@ end
 local function face_actor(obj)
     local actor = db and db.actor
     if not actor then return end
-    local op = nil
-    local ap = nil
-    pcall(function() op = obj:position() end)
-    pcall(function() ap = actor:position() end)
-    if not op or not ap then return end
+    local ok_op, op = pcall(go_get_position, obj)
+    local ok_ap, ap = pcall(go_get_position, actor)
+    if not ok_op or not ok_ap or not op or not ap then return end
     local dx = ap.x - op.x
     local dz = ap.z - op.z
     local len_sq = dx * dx + dz * dz
     if len_sq < 0.0001 then return end
     local inv = 1 / math.sqrt(len_sq)
-    pcall(function()
-        obj:set_desired_direction(vector():set(dx * inv, 0, dz * inv))
-    end)
+    g_steer_dir:set(dx * inv, 0, dz * inv)
+    pcall(go_set_desired_direction, obj)
 end
 
 local function release_entity(eid)
@@ -195,9 +270,8 @@ local function schedule_despawn(eid, entity)
     if entity.dying then return end
     entity.dying = true
 
-    local obj = nil
-    pcall(function() obj = level.object_by_id(entity.se_id) end)
-    if obj then
+    local ok_obj, obj = pcall(level_object, entity.se_id)
+    if ok_obj and obj then
         pcall(function()
             if obj:alive() then
                 obj:kill(obj, false)
@@ -240,13 +314,24 @@ local function try_spawn(eid, section, faction, ent_pos, name, packet_gvid)
             tonumber(eid) or 0, tonumber(gvid) or 0, GVID_FALLBACK_MAX_DIST)
     end
 
-    -- L-17: Validate section name in system_ini before alife():create
+    -- L-17: Validate section name before alife():create. system_ini() is
+    -- pcall-guarded; an unknown section is substituted with a one-time warning
+    -- (never silently) and the configured faction is kept.
     local sec = section
-    if not (system_ini() and system_ini():section_exist(sec)) then
-        printf("[zone_ai_proxy] Warning: Section '%s' does not exist in system_ini! Falling back to sim_default_stalker_0", tostring(sec))
-        sec = "sim_default_stalker_0"
-        if not (system_ini() and system_ini():section_exist(sec)) then
-            printf("[zone_ai_proxy] Error: Fallback section '%s' does not exist in system_ini!", sec)
+    local ok_sec, sec_valid = pcall(ini_has_section, sec)
+    if not ok_sec or not sec_valid then
+        if not section_fallback_warned[sec] then
+            section_fallback_warned[sec] = true
+            printf("[zone_ai_proxy] Warning: section '%s' not found in system_ini; using '%s' (faction '%s' kept)",
+                tostring(sec), AI_FALLBACK_SECTION, tostring(faction))
+        end
+        sec = AI_FALLBACK_SECTION
+        local ok_fb, fb_valid = pcall(ini_has_section, sec)
+        if not ok_fb or not fb_valid then
+            if not section_fallback_warned["__no_fallback"] then
+                section_fallback_warned["__no_fallback"] = true
+                printf("[zone_ai_proxy] Error: fallback section '%s' not found in system_ini; spawn deferred", sec)
+            end
             return nil, "section"
         end
     end
@@ -264,27 +349,28 @@ local function try_spawn(eid, section, faction, ent_pos, name, packet_gvid)
         pos = ent_pos,
         faction = faction,
         name = name,
-        action = 0,
-        target_id = 0,
         anim = 0,
-        target_pos = nil,
-        target_yaw = 0,
+        target_x = nil,
+        target_y = nil,
+        target_z = nil,
+        target_yaw = 0, -- raw wire u16 (0..65535)
         last_state_tg = nil,
-        prev_pos = nil,
+        prev_x = nil,
+        prev_y = nil,
+        prev_z = nil,
         stall = 0,
         dying = false,
     }
     ai_entities[eid] = entity
-    pcall(function() se_obj.is_zone_ai_proxy = true end)
     return entity, nil
 end
 
 local function try_pending_spawn(eid, tg)
     local p = pending_spawns[eid]
     if not p then return nil end
-    local pos = nil
-    pcall(function() pos = vector():set(p.x, p.y, p.z) end)
-    local entity = try_spawn(eid, p.section, p.faction, pos, p.name, p.packet_gvid)
+    ensure_vectors()
+    g_spawn_pos:set(p.x, p.y, p.z)
+    local entity = try_spawn(eid, p.section, p.faction, g_spawn_pos, p.name, p.packet_gvid)
     if entity then
         pending_spawns[eid] = nil
         printf("[zone_ai_proxy] deferred entity %u spawned on state update", tonumber(eid) or 0)
@@ -298,26 +384,62 @@ local function prune_pending(tg)
     for eid, p in pairs(pending_spawns) do
         if (tg - (p.t or 0)) > PENDING_SPAWN_TTL_MS then
             pending_spawns[eid] = nil
-            printf("[zone_ai_proxy] pending spawn for entity %u expired", tonumber(eid) or 0)
+            printf("[zone_ai_proxy] pending spawn for entity %u expired (kept ENTITY_ENTER data for recovery)", tonumber(eid) or 0)
+        end
+    end
+    -- known_entities is only a recovery cache: keep it longer than the pending
+    -- entry so a state stream can always re-create the pending spawn.
+    for eid, k in pairs(known_entities) do
+        if (tg - (k.t or 0)) > KNOWN_ENTER_TTL_MS then
+            known_entities[eid] = nil
         end
     end
 end
 
+-- A 0x007C state update for an entity that has no local puppet and no pending
+-- entry is not a dead end: re-create the pending entry from the cached
+-- ENTITY_ENTER data and retry the spawn with the current position/gvid
+-- resolution. Without this the 60 s pending TTL could permanently strand a
+-- squad that is still streaming states.
+local function recover_pending_from_state(eid, x, y, z, tg)
+    if pending_spawns[eid] or ai_entities[eid] then return false end
+    local known = known_entities[eid]
+    if not known or not known.section then return false end
+    pending_spawns[eid] = {
+        section = known.section,
+        faction = known.faction,
+        name = known.name,
+        x = x, y = y, z = z,
+        packet_gvid = known.packet_gvid or 0,
+        t = tg,
+    }
+    printf("[zone_ai_proxy] entity %u state update with no local puppet; pending spawn re-created", tonumber(eid) or 0)
+    return true
+end
+
 local function process_state(eid, x, y, z, yaw_raw, anim, tg)
+    -- Refresh a pending entry with the newest state and retry. Refreshing the
+    -- timestamp keeps a continuously-streaming entity from hitting the TTL.
     if pending_spawns[eid] then
         local p = pending_spawns[eid]
         p.x, p.y, p.z = x, y, z
+        p.t = tg
         if not try_pending_spawn(eid, tg) then return end
     end
 
     local entity = ai_entities[eid]
+    if not entity and recover_pending_from_state(eid, x, y, z, tg) then
+        try_pending_spawn(eid, tg)
+        entity = ai_entities[eid]
+    end
     if not entity then return end
 
-    local target = nil
-    pcall(function() target = vector():set(x, y, z) end)
-    if not target then return end
-    entity.target_pos = target
-    entity.target_yaw = (tonumber(yaw_raw) or 0) * 360.0 / 65536.0
+    -- Keep the recovery cache alive for as long as the entity streams states.
+    local known = known_entities[eid]
+    if known then known.t = tg end
+
+    entity.target_x, entity.target_y, entity.target_z = x, y, z
+    entity.target_yaw = tonumber(yaw_raw) or 0 -- raw wire u16
     entity.anim = anim
 
     if anim == 4 then
@@ -325,9 +447,8 @@ local function process_state(eid, x, y, z, yaw_raw, anim, tg)
         return
     end
 
-    local obj = nil
-    pcall(function() obj = level.object_by_id(entity.se_id) end)
-    if not obj then return end
+    local ok_obj, obj = pcall(level_object, entity.se_id)
+    if not ok_obj or not obj then return end
 
     -- Freeze cap: after more than 4 s without state, the first packet back is
     -- treated as a resync (body state only, no movement calls); steering
@@ -338,20 +459,22 @@ local function process_state(eid, x, y, z, yaw_raw, anim, tg)
     apply_anim_state(obj, anim)
 
     if stale then
-        pcall(function() obj:set_desired_direction(yaw_direction(yaw_raw)) end)
+        yaw_direction(entity.target_yaw)
+        pcall(go_set_desired_direction, obj)
         return
     end
 
     if anim == 3 then
         face_actor(obj)
     else
-        steer_puppet(entity, obj, target, yaw_direction(yaw_raw))
+        steer_puppet(entity, obj)
     end
 end
 
 function on_ai_state(pkt, offset)
     if xrr_active() then return end
     if not pkt or not offset then return end
+    ensure_vectors()
 
     local len = string.len(pkt)
     if len < offset then return end
@@ -408,6 +531,17 @@ function on_entity_enter(pkt, offset)
 
     -- typ 0 = AI squad (wire EntityType), 2/3 = legacy NPC/Mutant values.
     if typ == 0 or typ == 2 or typ == 3 then
+        -- Recovery cache: last ENTITY_ENTER data for this entity. Survives the
+        -- pending-spawn TTL so a later state update can re-create the pending
+        -- entry (recover_pending_from_state).
+        known_entities[eid] = {
+            section = section,
+            faction = faction,
+            name = name,
+            packet_gvid = gvid or 0,
+            t = time_global(),
+        }
+
         local existing = ai_entities[eid]
         if existing then
             existing.faction = faction
@@ -423,9 +557,9 @@ function on_entity_enter(pkt, offset)
             return
         end
 
-        local ent_pos = nil
-        pcall(function() ent_pos = vector():set(x, y, z) end)
-        if not ent_pos then return end
+        ensure_vectors()
+        g_spawn_pos:set(x, y, z)
+        local ent_pos = g_spawn_pos
 
         local entity, reason = try_spawn(eid, section, faction, ent_pos, name, gvid)
         if not entity and reason == "gvid" then
@@ -446,53 +580,13 @@ function on_entity_enter(pkt, offset)
     end
 end
 
-function on_ai_action(pkt, offset)
-    if xrr_active() then return end
-    if not pkt or not offset then return end
-    if string.len(pkt) < offset + 9 - 1 then return end
-    local eid, pos = zone_net.read_uint32_le(pkt, offset)
-    local action, pos = zone_net.read_uint8(pkt, pos)
-    local target_id, pos = zone_net.read_uint32_le(pkt, pos)
-
-    local entity = ai_entities[eid]
-    if not entity then return end
-
-    entity.action = action
-    entity.target_id = target_id
-
-    local obj = nil
-    pcall(function() obj = level.object_by_id(entity.se_id) end)
-    if not obj then return end
-
-    if action == 4 then -- DEATH
-        schedule_despawn(eid, entity)
-    elseif action == 2 then -- ATTACK
-        -- Face target if known. Target facing logic requires target position;
-        -- simplified by facing the actor when target is the actor.
-        -- L-16: Check db.actor ~= nil before checking target_id == db.actor:id()
-        if db.actor and (target_id == 0 or target_id == db.actor:id()) then
-            local op = nil
-            local ap = nil
-            pcall(function() op = obj:position() end)
-            pcall(function() ap = db.actor:position() end)
-            if op and ap then
-                local dir = vector():set(ap.x - op.x, ap.y - op.y, ap.z - op.z)
-                local len = math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z)
-                if len > 0.0001 then
-                    dir.x, dir.y, dir.z = dir.x / len, dir.y / len, dir.z / len
-                    pcall(function() obj:set_desired_direction(dir) end)
-                end
-            end
-        end
-    end
-end
-
 function on_entity_leave(pkt, offset)
     if not pkt or not offset then return end
     local eid = nil
     pcall(function() eid = zone_net.read_uint32_le(pkt, offset) end)
     if not eid then return end
     pending_spawns[eid] = nil
+    known_entities[eid] = nil
     local entity = ai_entities[eid]
     if entity then
         -- Guarded: alife() is nil during level change (CTD today without this).
@@ -512,6 +606,7 @@ local function release_all_puppets()
     end)
     ai_entities = {}
     pending_spawns = {}
+    known_entities = {}
     gvid_fallback_logged = {}
 end
 

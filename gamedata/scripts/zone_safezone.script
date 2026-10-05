@@ -45,9 +45,7 @@ local last_poll = 0
 -- HARD SAFEGUARD: only names in WEAPON_ONLY may ever enter BLOCKED. The
 -- engine dispatches on_before_key_press BEFORE UI input (level_input.script:
 -- 17-19; Level_input.cpp:187-192 then 285), so eating a UI-relevant key would
--- make vendor/trade/inventory windows unresponsive. Legacy/modded grenade
--- names (kGRENADE, kTHROW_GRENADE) are NOT in this engine's key_bindings
--- (key_binding_registrator_script.cpp:29-127) and are therefore removed.
+-- make vendor/trade/inventory windows unresponsive.
 local BLOCKED = {}
 local WEAPON_ONLY = {
     "kWPN_FIRE",    -- fire
@@ -587,13 +585,15 @@ end
 -- no registered custom GUI). While it is false (inventory/trade/loot/PDA/
 -- custom UI), NEVER consume a key: the engine dispatches on_before_key_press
 -- before UI input, so an eaten key would also be dead for the open window.
+-- FAIL-SAFE: if the probe is missing or throws, treat the UI as open and do
+-- NOT block keys (an unknown state must never eat input; a missed weapon-block
+-- is recovered by the fire veto and the 1 Hz reconcile).
 local function ui_input_open()
-    local open = false
-    pcall(function()
-        if actor_menu and type(actor_menu.is_hud_free) == "function" then
-            open = (actor_menu.is_hud_free() ~= true)
-        end
-    end)
+    local open = true
+    if actor_menu and type(actor_menu.is_hud_free) == "function" then
+        local ok, free = pcall(actor_menu.is_hud_free)
+        if ok then open = (free ~= true) end
+    end
     return open
 end
 
@@ -649,18 +649,6 @@ function reset()
     wipe_zone_cache()
     enemy_cb_installed = {}
     enemy_cb_count = 0
-end
-
-function on_disconnect()
-    reset()
-end
-
-function is_in_safe_zone()
-    return enforced == true
-end
-
-function get_safe_zone_id()
-    return safe_zone_id or ""
 end
 
 function on_game_start()

@@ -17,11 +17,25 @@ import (
 )
 
 // newAIPuppetServer builds a DB-less, AI-enabled server with a recording sink
-// so tests control the exact puppet set.
+// so tests control the exact puppet set. The single radius pins both
+// hysteresis radii (no hysteresis), preserving the exact boundary semantics.
 func newAIPuppetServer(t *testing.T, onlineRadiusM float64) (*Server, *fakeSink) {
 	t.Helper()
+	return newAIPuppetServerRadii(t, onlineRadiusM, onlineRadiusM, 0)
+}
+
+// newAIPuppetServerRadii builds an AI-enabled server with explicit enter/leave
+// hysteresis radii and an optional entity cap (0 = default).
+func newAIPuppetServerRadii(t *testing.T, enterM, leaveM float64, maxEntities int) (*Server, *fakeSink) {
+	t.Helper()
 	enabled := true
-	cfg := &config.Config{AIEnabled: &enabled, AIOnlineRadiusM: onlineRadiusM}
+	cfg := &config.Config{
+		AIEnabled:       &enabled,
+		AIOnlineRadiusM: enterM,
+		AIEnterRadiusM:  enterM,
+		AILeaveRadiusM:  leaveM,
+		AIMaxEntities:   maxEntities,
+	}
 	sink := &fakeSink{}
 	activeSink = sink
 	s := NewServer(cfg, nil, zap.NewNop())
@@ -131,10 +145,14 @@ func TestAI_AoIBoundariesExactlyOnce(t *testing.T) {
 		t.Fatalf("state entries after enter = %d, want 1", got)
 	}
 
-	// Second tick at the same timestamp must not re-enter but must keep
-	// streaming state.
+	// A later tick (past the state decimation interval) must not re-enter but
+	// must keep streaming state. The puppet is reset just inside the boundary
+	// so its 50 ms patrol step cannot drift it outside the radius.
+	if !s.squads.SetPuppetPosition(sq.ID, 99.9, 0, 0) {
+		t.Fatal("SetPuppetPosition failed")
+	}
 	sink.Reset()
-	s.tickAIReplication(now)
+	s.tickAIReplication(now.Add(50 * time.Millisecond))
 	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 0 {
 		t.Fatalf("duplicate enter packets = %d, want 0", got)
 	}
@@ -147,7 +165,7 @@ func TestAI_AoIBoundariesExactlyOnce(t *testing.T) {
 		t.Fatal("SetPuppetPosition failed")
 	}
 	sink.Reset()
-	s.tickAIReplication(now)
+	s.tickAIReplication(now.Add(100 * time.Millisecond))
 	leaves := packetsByOpcode(sink, protocol.OpEntityLeaveAoI)
 	if len(leaves) != 1 {
 		t.Fatalf("leave packets = %d, want 1", len(leaves))
@@ -160,9 +178,200 @@ func TestAI_AoIBoundariesExactlyOnce(t *testing.T) {
 	}
 
 	sink.Reset()
-	s.tickAIReplication(now)
+	s.tickAIReplication(now.Add(150 * time.Millisecond))
 	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 0 {
 		t.Fatalf("duplicate leave packets = %d, want 0", got)
+	}
+}
+
+// A puppet oscillating around the enter radius must not thrash ENTITY_ENTER:
+// it enters inside 180 m, stays visible out to 220 m, and only leaves past
+// 220 m.
+func TestAI_HysteresisExactlyOnce(t *testing.T) {
+	s, sink := newAIPuppetServerRadii(t, 180, 220, 0)
+	addAIPlayer(t, s, 9051, 46051, "l01_escape", [3]float32{0, 0, 0})
+	sq := s.registerAIPuppet(ai.PuppetDef{
+		Label: "Hysteresis", Section: "sim_default_stalker_0", Faction: "stalker",
+		Level: "l01_escape", Spawn: [3]float32{200, 0, 0}, PatrolRadius: 5, WalkSpeed: 1.5,
+	})
+	if sq == nil {
+		t.Fatal("registerAIPuppet failed")
+	}
+
+	base := time.Unix(1_700_000_000, 0)
+	sink.Reset()
+	s.tickAIReplication(base) // 200 m: outside enter radius -> nothing
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 0 {
+		t.Fatalf("enter at 200 m = %d, want 0", got)
+	}
+	if got := len(readAIStates(t, sink)); got != 0 {
+		t.Fatalf("state at 200 m = %d, want 0", got)
+	}
+
+	s.squads.SetPuppetPosition(sq.ID, 170, 0, 0)
+	sink.Reset()
+	s.tickAIReplication(base.Add(50 * time.Millisecond)) // inside enter radius
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 1 {
+		t.Fatalf("enter at 170 m = %d, want exactly 1", got)
+	}
+	if got := len(readAIStates(t, sink)); got != 1 {
+		t.Fatalf("state at 170 m = %d, want 1", got)
+	}
+
+	// Between enter and leave radius: still visible, no new enter, no leave.
+	s.squads.SetPuppetPosition(sq.ID, 210, 0, 0)
+	sink.Reset()
+	s.tickAIReplication(base.Add(100 * time.Millisecond))
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 0 {
+		t.Fatalf("re-enter at 210 m = %d, want 0", got)
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 0 {
+		t.Fatalf("leave at 210 m = %d, want 0 (inside leave radius)", got)
+	}
+	if got := len(readAIStates(t, sink)); got != 1 {
+		t.Fatalf("state at 210 m = %d, want 1", got)
+	}
+
+	// Past the leave radius: exactly one leave, no state.
+	s.squads.SetPuppetPosition(sq.ID, 230, 0, 0)
+	sink.Reset()
+	s.tickAIReplication(base.Add(150 * time.Millisecond))
+	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 1 {
+		t.Fatalf("leave at 230 m = %d, want exactly 1", got)
+	}
+	if got := len(readAIStates(t, sink)); got != 0 {
+		t.Fatalf("state at 230 m = %d, want 0", got)
+	}
+
+	// And it must not leave again.
+	sink.Reset()
+	s.tickAIReplication(base.Add(200 * time.Millisecond))
+	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 0 {
+		t.Fatalf("duplicate leave = %d, want 0", got)
+	}
+}
+
+// OpAIState must be decimated to ~30 Hz even when the server ticks faster:
+// two ticks 10 ms apart produce one state packet, not two.
+func TestAI_StateDecimatedAt30Hz(t *testing.T) {
+	s, sink := newAIPuppetServer(t, 220)
+	addAIPlayer(t, s, 9061, 46061, "l01_escape", [3]float32{0, 0, 0})
+	s.registerAIPuppet(ai.PuppetDef{
+		Label: "Decimated", Section: "sim_default_stalker_0", Faction: "stalker",
+		Level: "l01_escape", Spawn: [3]float32{10, 0, 0}, PatrolRadius: 5, WalkSpeed: 1.5,
+	})
+
+	base := time.Unix(1_700_000_000, 0)
+	sink.Reset()
+	s.tickAIReplication(base)
+	if got := len(packetsByOpcode(sink, protocol.OpAIState)); got != 1 {
+		t.Fatalf("first tick state packets = %d, want 1", got)
+	}
+
+	sink.Reset()
+	s.tickAIReplication(base.Add(10 * time.Millisecond)) // 100 Hz-ish tick
+	if got := len(packetsByOpcode(sink, protocol.OpAIState)); got != 0 {
+		t.Fatalf("state packets 10 ms later = %d, want 0 (decimated)", got)
+	}
+
+	sink.Reset()
+	s.tickAIReplication(base.Add(40 * time.Millisecond)) // > 33 ms since send
+	if got := len(packetsByOpcode(sink, protocol.OpAIState)); got != 1 {
+		t.Fatalf("state packets 40 ms later = %d, want 1", got)
+	}
+}
+
+// ai_max_entities caps registrations: excess puppets are logged, skipped and
+// despawned, and never appear in enter/state traffic.
+func TestAI_EntityCap(t *testing.T) {
+	s, sink := newAIPuppetServerRadii(t, 220, 220, 2)
+	addAIPlayer(t, s, 9071, 46071, "l01_escape", [3]float32{0, 0, 0})
+
+	for i := 0; i < 2; i++ {
+		if s.registerAIPuppet(ai.PuppetDef{
+			Label: "Capped", Section: "sim_default_stalker_0", Faction: "stalker",
+			Level: "l01_escape", Spawn: [3]float32{float32(10 + i), 0, 0}, PatrolRadius: 5, WalkSpeed: 1.5,
+		}) == nil {
+			t.Fatalf("puppet %d within cap was rejected", i)
+		}
+	}
+	if got := s.registerAIPuppet(ai.PuppetDef{
+		Label: "Over Cap", Section: "sim_default_stalker_0", Faction: "stalker",
+		Level: "l01_escape", Spawn: [3]float32{20, 0, 0}, PatrolRadius: 5, WalkSpeed: 1.5,
+	}); got != nil {
+		t.Fatalf("puppet beyond cap was registered: %v", got)
+	}
+	if got := s.squads.PuppetCount(); got != 2 {
+		t.Fatalf("PuppetCount = %d, want 2 (cap)", got)
+	}
+
+	sink.Reset()
+	s.tickAIReplication(time.Now())
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 2 {
+		t.Fatalf("enter packets = %d, want 2 (cap)", got)
+	}
+	if got := len(readAIStates(t, sink)); got != 2 {
+		t.Fatalf("state entries = %d, want 2 (cap)", got)
+	}
+}
+
+// A visible puppet that dies must broadcast AnimDeath and then be despawned
+// and released: ENTITY_LEAVE is delivered before the entity ID disappears.
+func TestAI_DeadSquadLifecycle(t *testing.T) {
+	s, sink := newAIPuppetServer(t, 220)
+	addAIPlayer(t, s, 9081, 46081, "l01_escape", [3]float32{0, 0, 0})
+	sq := s.registerAIPuppet(ai.PuppetDef{
+		Label: "Doomed", Section: "sim_default_stalker_0", Faction: "stalker",
+		Level: "l01_escape", Spawn: [3]float32{10, 0, 0}, PatrolRadius: 5, WalkSpeed: 1.5,
+	})
+	entityID, _ := s.AIEntityIDOf(sq.ID)
+
+	base := time.Unix(1_700_000_000, 0)
+	s.tickAIReplication(base) // visible
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 1 {
+		t.Fatalf("enter packets = %d, want 1", got)
+	}
+
+	// Kill the squad; the next tick must stream the death animation.
+	s.squads.SetSquadState(sq.ID, ai.AIStateDead)
+	sink.Reset()
+	s.tickAIReplication(base.Add(50 * time.Millisecond))
+	states := readAIStates(t, sink)
+	if len(states) != 1 {
+		t.Fatalf("death state entries = %d, want 1", len(states))
+	}
+	if states[0].Anim != protocol.AIAnimDeath {
+		t.Fatalf("death anim = %d, want %d", states[0].Anim, protocol.AIAnimDeath)
+	}
+
+	// Still within the despawn delay: the squad exists and no leave was sent.
+	sink.Reset()
+	s.tickAIReplication(base.Add(3 * time.Second))
+	if s.squads.PuppetCount() != 1 {
+		t.Fatalf("dead squad despawned before the delay")
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 0 {
+		t.Fatalf("leave before despawn delay = %d, want 0", got)
+	}
+
+	// Past the delay: leave delivered, squad and entity ID released.
+	sink.Reset()
+	s.tickAIReplication(base.Add(6 * time.Second))
+	if s.squads.PuppetCount() != 0 {
+		t.Fatalf("dead squad not despawned after the delay")
+	}
+	leaves := packetsByOpcode(sink, protocol.OpEntityLeaveAoI)
+	if len(leaves) != 1 {
+		t.Fatalf("leave after despawn = %d, want 1", len(leaves))
+	}
+	if leave := readEntityLeave(t, leaves[0]); leave.EntityID != entityID {
+		t.Fatalf("despawn leave EntityID = %d, want %d", leave.EntityID, entityID)
+	}
+	if _, ok := s.AIEntityIDOf(sq.ID); ok {
+		t.Fatalf("entity ID for despawned squad %d still registered", sq.ID)
+	}
+	if s.aiRepl.count() != 0 {
+		t.Fatalf("replication registry still holds %d squads", s.aiRepl.count())
 	}
 }
 

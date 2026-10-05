@@ -42,10 +42,19 @@ type EntityInfo struct {
 	Name    string
 }
 
-// SnapshotSender is the minimal send surface the AoI broadcaster needs.
-// *network.UDPListener satisfies it; tests substitute a capturing sender.
+// SnapshotSender is the minimal send surface the AoI broadcaster needs for
+// unreliable per-tick snapshots. *network.UDPListener satisfies it; tests
+// substitute a capturing sender.
 type SnapshotSender interface {
 	Send(addr *net.UDPAddr, data []byte) error
+}
+
+// ReliableSender is the reliable send surface ENTITY_ENTER/LEAVE_AOI need.
+// *Server satisfies it via SendToSession, which enqueues the packet into the
+// retransmit queue; a lost ENTITY_ENTER therefore cannot leave a ghost peer
+// invisible for the whole AoI stay.
+type ReliableSender interface {
+	SendToSession(sess *network.PlayerSession, opcode uint16, flags uint8, payload interface{})
 }
 
 // neighborRef is one AoI candidate with its payload pre-copied under the peer
@@ -209,16 +218,20 @@ func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *
 	}
 }
 
-func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info EntityInfo, udp *network.UDPListener, seq *atomic.Uint32) {
-	if session == nil {
+// NotifyEntityEnter records the session<->entity visibility edge and delivers
+// ENTITY_ENTER_AOI through the reliable send path. Reliable delivery matters:
+// a dropped enter packet would leave the peer invisible for the entire AoI
+// stay because no later tick re-sends the transition.
+func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info EntityInfo, sender ReliableSender) {
+	if session == nil || sender == nil {
 		return
 	}
 	session.Lock()
 	sessID := session.SessionID
-	udpAddr := session.UDPAddr
+	hasAddr := session.UDPAddr != nil
 	session.Unlock()
 
-	if udpAddr == nil {
+	if !hasAddr {
 		return
 	}
 
@@ -253,27 +266,21 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 		Name:       name,
 	}
 
-	var buf bytes.Buffer
-	seqID := seq.Add(1)
-	if err := protocol.WritePacket(&buf, protocol.OpEntityEnterAoI, seqID, protocol.FlagReliable, pkt); err == nil {
-		// activeSink is the test/telemetry recorder hook; nil in production.
-		if activeSink != nil {
-			activeSink.Record(buf.Bytes())
-		}
-		_ = udp.Send(udpAddr, buf.Bytes())
-	}
+	sender.SendToSession(session, protocol.OpEntityEnterAoI, protocol.FlagReliable, pkt)
 }
 
-func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID uint32, udp *network.UDPListener, seq *atomic.Uint32) {
-	if session == nil {
+// NotifyEntityLeave clears the visibility edge and delivers ENTITY_LEAVE_AOI
+// through the reliable send path (see NotifyEntityEnter).
+func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID uint32, sender ReliableSender) {
+	if session == nil || sender == nil {
 		return
 	}
 	session.Lock()
 	sessID := session.SessionID
-	udpAddr := session.UDPAddr
+	hasAddr := session.UDPAddr != nil
 	session.Unlock()
 
-	if udpAddr == nil {
+	if !hasAddr {
 		return
 	}
 
@@ -283,15 +290,8 @@ func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID 
 	}
 	a.mu.Unlock()
 
-	var buf bytes.Buffer
 	pkt := protocol.EntityLeaveAoI{EntityID: entityID}
-	seqID := seq.Add(1)
-	if err := protocol.WritePacket(&buf, protocol.OpEntityLeaveAoI, seqID, protocol.FlagReliable, pkt); err == nil {
-		if activeSink != nil {
-			activeSink.Record(buf.Bytes())
-		}
-		_ = udp.Send(udpAddr, buf.Bytes())
-	}
+	sender.SendToSession(session, protocol.OpEntityLeaveAoI, protocol.FlagReliable, pkt)
 }
 
 func (a *AoIManager) RemoveSession(sessID uint32) {

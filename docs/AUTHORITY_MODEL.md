@@ -1,68 +1,92 @@
-# Authority Model — Movement, Damage, Items
+# Authority Model — Movement, Hits, Items
 
 How Zone Online decides what is true, what is validated, and what the client is
-allowed to say. Written for the v0.5 authority wave.
+allowed to say. Written for the v0.5 authority wave with the movement guard
+removed and hit registration added.
 
 ---
 
 ## Principles
 
 1. **The server owns persistent state.** Characters, faction, money, inventory,
-   world items, stashes, groups, safe zone membership, and positions are decided
+   world items, stashes, groups, safe zone membership and death are decided
    server-side and persisted in SQLite (WAL).
-2. **The client is a presenter and an input device.** It renders, plays sounds,
-   and reports intent (movement, item actions, damage events) which the server
-   validates before applying.
-3. **Fast-paced gunplay stays client-side for latency reasons.** See "Damage"
-   below for what the server can and cannot verify without world geometry.
-4. **Every client claim is rate-limited, bounded, and auditable.**
+2. **The client is a presenter, an input device, and the source of truth for its
+   own position.** It renders, plays sounds, reports movement, and reports hits
+   for the server to validate.
+3. **Movement is deliberately unpoliced; combat claims are validated.** The owner
+   removed the movement guard and anti-cheat strike system entirely. Hit
+   registration is the trust boundary: the server validates what it can without
+   world geometry.
+4. **Every accepted or rejected combat/item claim is bounded and auditable.**
 
 ---
 
 ## Movement
 
 - Clients send `ClientTransform` (0x0010, 29 B) at 30 Hz: position, yaw/pitch,
-  velocity placeholder, anim flags, graph vertex.
-- The server keeps a bounded per-session **transform history ring** (~2 s, zero
-  alloc). The server position is authoritative and persisted via periodic
-  checkpoints.
-- **Displacement guard**: displacement since the last accepted transform must be
-  ≤ `max_speed_mps` × elapsed + `correction_tolerance_m` (defaults 25 m/s, 2 m).
-  Violations are rejected and answered with `OpPositionCorrection` (0x007B,
-  x/y/z, unreliable). The client snaps at >8 m deviation, otherwise blends over
-  ~0.5 s. Corrections below 1 m are ignored to avoid fighting normal movement.
-- **Lag-switch detection**: a transform gap > `lagswitch_gap_ms` (1500) while
-  the session is otherwise alive (heartbeats/ACKs keep arriving) counts as a
-  strike; `lagswitch_strikes` (3) within 60 s kicks with an audit entry
-  ("network abuse suspected"). Plain packet loss — where heartbeats also stop —
-  never strikes. Deliberate tradeoff: a lag switch that blocks *all* traffic
-  escapes the strike but also freezes the player out of the world, so it cannot
-  be used to gain position.
-- **Client smoothing**: remote proxies are Hermite-interpolated off a 100 ms
+  velocity, anim flags, graph vertex.
+- The server keeps the latest transform per session, updates the spatial grid,
+  drives AoI, recomputes safe-zone membership and checkpoints position to SQLite.
+  It accepts any finite, in-bounds position. It does **not** validate
+  displacement, speed, teleports or vertical movement.
+- **No movement guard.** `movement_guard.go`, `anticheat.go` and
+  `transform_history.go` were deleted. Opcode `OpPositionCorrection` (0x007B) is
+  removed from the protocol, and the config keys `max_speed_mps`,
+  `movement_grace`, `fall_allowance_m`, `lagswitch_gap_ms`, `lagswitch_strikes`,
+  `anticheat_violation_window_s`, `anticheat_violation_kick_count` and
+  `spawn_grace_s` are removed. No transform is rejected for distance, no
+  correction is sent, no kick is issued and no lag-switch strike exists.
+- **Trust model (accepted trade-off).** A modified client can move arbitrarily
+  fast, teleport or hover; the server does not dispute it. This is an explicit
+  owner decision, not an oversight.
+- **Client smoothing only.** Remote proxies are Hermite-interpolated off a 100 ms
   jitter buffer with velocity extrapolation up to 250 ms / 1.5 m when packets
-  lapse, blending back over 150 ms when data resumes.
+  lapse, blending back over 150 ms when data resumes. Smoothing is presentation;
+  it never changes server state.
 
-## Damage
+## Hit registration
 
-- Hit detection stays **client-side** because 30 Hz server-side rewind+raycast
-  is both heavy and impossible without server-side world geometry (the server
-  holds no collision mesh). This is the honest limit; the mitigation stack makes
-  abuse expensive rather than pretending it is solved.
-- Server validation per damage event (`OpDamageNotify` 0x0050):
-  - Either party in a safe zone → rejected.
-  - Same faction or same group → rejected (friendly fire off).
-  - Range ≤ 300 m.
-  - Attacker inside a **lag-switch kill window** (strike within the last 5 s) →
-    rejected.
-  - Attacker displacement over the last 1 s exceeding the speed budget
-    (stall-then-burst) → rejected.
-  - Rolling 1 s **damage budget** `damage_budget_per_s` (default 400) clamps
-    sustained output; single-hit cap still applies.
-- Melee stays viable: budgets are generous and no fire event is required.
-- **Roadmap**: extract level collision/heightfield data to enable server-side
-  line-of-sight and rewind verification (this is the real fix; tracked in
-  ROADMAP.md). Optional `OpActionFire` telemetry (origin/direction per shot)
-  would enable post-hoc audit once geometry exists.
+- **Client hit path.** A hit on a spawned player proxy triggers
+  `npc_on_before_hit`. The script verifies the hit came from the local actor,
+  maps the proxy object to its session id, builds a 13-byte `OpDamageNotify`
+  (0x0050: TargetID, AttackerID, Damage, BoneID) and sends it reliably. The
+  client rate-limits sends to one per 50 ms (≤ 20/s). The local engine hit is
+  then cancelled (`s_hit.power = 0`, `flags.ret_value = false`) because proxy HP
+  is server-authoritative.
+- **Server validation** (`damage.go`) per hit, in order:
+  1. attacker and target sessions exist; the attacker session is resolved from
+     the UDP source address, and the packet's AttackerID/TargetID must match
+     both sessions (session mismatch rejected);
+  2. attacker and target on the same level (cross-level rejected);
+  3. self-damage rejected;
+  4. safe-zone immunity: either party protected → rejected;
+  5. same group or same faction → rejected (friendly fire off);
+  6. 3D range ≤ 300 m, computed from the last known server positions;
+  7. damage sanity: finite, > 0 and ≤ 250 (ceiling); larger values rejected;
+  8. single-hit clamp: applied damage is clamped to 150;
+  9. rolling 1 s damage budget `damage_budget_per_s` (default 400): the hit is
+     clamped to the remaining budget and rejected once exhausted.
+- **Relay.** An accepted hit is applied to the target session's server-side
+  health, then `OpDamageNotify` is relayed reliably to the victim only, carrying
+  the attacker's real session id and the clamped amount actually applied. The
+  server persists `characters.dead = 1` when health reaches 0. Sleeper (offline
+  player) damage is routed through the same validator, so safe-zone, friendly
+  fire, range and sanity gates cannot be bypassed.
+- **Victim apply.** The victim's client accepts a relay only when the wire target
+  is its own session id (the engine actor id is also accepted). It refuses to
+  apply damage inside a safe zone, clamps the hit to current health, applies it
+  with `db.actor:change_health(-damage)` and shows a throttled HUD notice
+  ("<attacker> hit you"). Death itself is left to the engine's condition update.
+- **Audit.** Accepted hits write `damage_applied` rows with both session ids and
+  the clamped amount; rejected hits write `damage_rejected` rows with the reason,
+  throttled to one per 5 s per attacker so a forged-packet flood cannot fill
+  `audit_log`.
+- **Limits.** Hit detection is still the client's. The server has no collision
+  mesh and does not raycast, so wall-shooting is unverifiable until LOS is
+  enabled; bone id is carried on the wire but not used in validation; damage is
+  applied 1:1 from the client-reported power with no armor or hit-location
+  scaling server-side.
 
 ## Items (authoritative ledger, duplication-proof)
 
@@ -93,22 +117,22 @@ allowed to say. Written for the v0.5 authority wave.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_speed_mps` | 25 | movement budget |
-| `correction_tolerance_m` | 2.0 | allowed slack before correction |
-| `lagswitch_gap_ms` | 1500 | transform-gap signature threshold |
-| `lagswitch_strikes` | 3 | strikes before kick (60 s window) |
-| `damage_budget_per_s` | 400 | sustained damage clamp per attacker |
+| `damage_budget_per_s` | 400 | sustained hit-registration clamp per attacker (1 s window) |
 | `item_rate_per_s` | 5 | item action rate limit |
+
+The movement and lag-switch keys were removed together with the guard; see
+Movement above.
 
 ## Still client-side (and why)
 
-- Local movement prediction and hit detection (latency).
+- Local movement prediction and hit detection (latency; the server validates the
+  hit claim but cannot raycast it).
 - Animations/FX (cosmetic; wrong values never affect state).
 - Safe zone *presentation* (banner), while enforcement is server+client double
   sided (client hooks are defence-in-depth; the server gate is the authority).
 
 ## Audit
 
-Item accept/reject and lag-switch kicks write to `audit_log` with account,
-action, section, count, world item id, or kick reason — the foundation for
-rollback tooling and moderation.
+Accepted/rejected hits and item accept/reject write to `audit_log` with account,
+action, section, count, world item id, damage amount or rejection reason — the
+foundation for rollback tooling and moderation.

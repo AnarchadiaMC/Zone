@@ -244,31 +244,6 @@ func NewChatText(senderID uint32, msg string) ChatText {
 	return ct
 }
 
-// StashInteractPayload — client sends when opening/taking/storing at a stash box.
-// Action: 1=Open, 2=Take, 3=Store
-type StashInteractPayload struct {
-	StashID     uint32
-	Action      uint8    // 1=Open, 2=Take, 3=Store
-	ItemSection [32]byte // null-terminated item section string
-	Count       uint16
-}
-
-// StashResponsePayload — server reply to a stash interaction.
-// Status: 0=OK, 1=NotFound, 2=Error
-type StashResponsePayload struct {
-	StashID uint32
-	Status  uint8 // 0=OK, 1=NotFound, 2=Error
-	Count   uint16
-	Data    [256]byte // JSON-serialised stash contents on Action=1 (Open)
-}
-
-// AIActionPayload carries an AI squad state update broadcast to nearby clients.
-type AIActionPayload struct {
-	EntityID uint32
-	Action   uint8
-	TargetID uint32
-}
-
 // GroupInviteNotify is the OpGroupInviteNotify (0x0078) server->client
 // payload: 52 bytes. Sent to the invite target after a successful /invite.
 type GroupInviteNotify struct {
@@ -310,16 +285,6 @@ type EntityAoIPayload struct {
 	PosX       float32
 	PosY       float32
 	PosZ       float32
-}
-
-// PositionCorrection is the OpPositionCorrection (0x007B) server->client
-// payload, sent unreliable: 12 bytes (x f32, y f32, z f32). It carries the
-// last server-validated position so a client that failed movement validation
-// snaps back instead of keeping a rejected position.
-type PositionCorrection struct {
-	X float32
-	Y float32
-	Z float32
 }
 
 // Item action identifiers for OpItemAction/OpItemUpdate.

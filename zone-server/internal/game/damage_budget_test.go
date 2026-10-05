@@ -1,11 +1,8 @@
 package game
 
 import (
-	"strings"
 	"testing"
-	"time"
 
-	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
 )
 
@@ -56,56 +53,6 @@ func TestDamage_NormalSustainedDPSPasses(t *testing.T) {
 	}
 	if target.Health != 640 {
 		t.Fatalf("target health = %v, want 640", target.Health)
-	}
-}
-
-func TestDamage_LagSwitchWindowRejects(t *testing.T) {
-	dh := NewDamageHandler()
-	ac := NewAntiCheatManager()
-	dh.SetAntiCheatManager(ac)
-	attacker, target := createTestSessions()
-	attacker.Position = [3]float32{0, 0, 0}
-	target.Position = [3]float32{5, 0, 0}
-
-	ac.RecordLagswitchStrike(attacker.SessionID, time.Now())
-	applied, valid, reason := dh.ValidateAndApplyDamage(attacker, target, &protocol.DamageNotify{
-		AttackerID: 1, TargetID: 2, Damage: 25,
-	})
-	if valid || applied != 0 {
-		t.Fatalf("lag-switch attacker dealt damage: valid=%v applied=%v", valid, applied)
-	}
-	if reason != "attacker lag-switch window" {
-		t.Fatalf("reason = %q, want attacker lag-switch window", reason)
-	}
-	if target.Health != 100 {
-		t.Fatalf("target took damage during lag-switch window: %v", target.Health)
-	}
-}
-
-func TestDamage_MovementBurstRejects(t *testing.T) {
-	dh := NewDamageHandler()
-	dh.SetMovementGuard(NewMovementGuard(nil))
-	attacker, target := createTestSessions()
-	target.Position = [3]float32{110, 0, 0}
-
-	// Accepted history says the attacker was at the origin 500 ms ago, but the
-	// server position is now 100 m away: burst-after-stall.
-	attacker.Lock()
-	attacker.TransformHistory.Push(network.TransformSample{
-		At: time.Now().Add(-500 * time.Millisecond),
-		X:  0, Y: 0, Z: 0,
-	})
-	attacker.Position = [3]float32{100, 0, 0}
-	attacker.Unlock()
-
-	applied, valid, reason := dh.ValidateAndApplyDamage(attacker, target, &protocol.DamageNotify{
-		AttackerID: 1, TargetID: 2, Damage: 40,
-	})
-	if valid || applied != 0 {
-		t.Fatalf("burst movement dealt damage: valid=%v applied=%v", valid, applied)
-	}
-	if !strings.Contains(reason, "movement burst") {
-		t.Fatalf("reason = %q, want movement burst", reason)
 	}
 }
 

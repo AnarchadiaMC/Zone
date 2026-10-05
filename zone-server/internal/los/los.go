@@ -54,17 +54,21 @@ func Build(mesh *Mesh, opts Options) (*Occluders, error) {
 	}
 	nv := len(mesh.Vertices)
 	nt := len(mesh.Triangles)
-	if nv == 0 || nt == 0 {
-		return nil, errors.New("los: empty mesh")
+	if nv == 0 && nt > 0 {
+		return nil, errors.New("los: mesh has triangles but no vertices")
 	}
 
 	cellSize := opts.CellSize
-	if cellSize <= 0 {
+	if cellSize <= 0 || !isFinite32(cellSize) {
 		cellSize = DefaultCellSize
 	}
 	minArea := float64(opts.MinArea)
-	if minArea < 0 {
+	if math.IsNaN(minArea) || math.IsInf(minArea, 0) || minArea < 0 {
 		minArea = 0
+	}
+
+	if nv == 0 || nt == 0 {
+		return emptyOccluders(cellSize), nil
 	}
 
 	keep := make([]bool, nt)
@@ -86,7 +90,7 @@ func Build(mesh *Mesh, opts Options) (*Occluders, error) {
 		kept++
 	}
 	if kept == 0 {
-		return nil, errors.New("los: no usable triangles")
+		return emptyOccluders(cellSize), nil
 	}
 
 	min := [3]float64{math.Inf(1), math.Inf(1), math.Inf(1)}
@@ -381,7 +385,8 @@ func (o *Occluders) SegmentBlocked(from, to [3]float32) bool {
 	}
 
 	limit := o.gridX + o.gridZ + 4
-	for i := 0; i < limit; i++ {
+	steps := 0
+	for {
 		if o.cellBlocked(cx, cz, from, dx, dy, dz) {
 			return true
 		}
@@ -398,8 +403,27 @@ func (o *Occluders) SegmentBlocked(from, to [3]float32) bool {
 		if cx < 0 || cx >= o.gridX || cz < 0 || cz >= o.gridZ {
 			return false
 		}
+		steps++
+		if steps >= limit {
+			ddaStepGuard(steps, from, to)
+			return false
+		}
 	}
-	return false
+}
+
+var ddaStepGuard = func(steps int, from, to [3]float32) {
+	panic(fmt.Sprintf("los: DDA step bound exceeded after %d steps from %v to %v; occluder grid inconsistent", steps, from, to))
+}
+
+func emptyOccluders(cellSize float32) *Occluders {
+	o := &Occluders{
+		cellSize:  cellSize,
+		gridX:     1,
+		gridZ:     1,
+		cellStart: make([]uint32, 2),
+	}
+	o.fileBytes = int64(o.encodedSize())
+	return o
 }
 
 func (o *Occluders) Visible(from, to [3]float32) bool {
@@ -510,11 +534,4 @@ func (o *Occluders) Bounds() (min, max [3]float32) {
 		return
 	}
 	return o.boundsMin, o.boundsMax
-}
-
-func (o *Occluders) CellSize() float32 {
-	if o == nil {
-		return 0
-	}
-	return o.cellSize
 }

@@ -40,9 +40,12 @@ func loadCform(path string) (*cform, error) {
 	}
 	vc := int(le.Uint32(data[4:]))
 	fc := int(le.Uint32(data[8:]))
-	need := cformHeader + vc*12 + fc*16
-	if vc <= 0 || fc <= 0 || len(data) != need {
+	need := int64(cformHeader) + int64(vc)*12 + int64(fc)*16
+	if int64(len(data)) != need {
 		return nil, fmt.Errorf("cform: size mismatch: got %d bytes, header wants %d (verts=%d faces=%d)", len(data), need, vc, fc)
+	}
+	if vc == 0 && fc > 0 {
+		return nil, errors.New("cform: faces reference a missing vertex table")
 	}
 	c := &cform{Version: version}
 	for a := 0; a < 3; a++ {
@@ -71,11 +74,12 @@ func main() {
 	in := flag.String("in", "", "input level.cform path")
 	out := flag.String("out", "", "output .occl path")
 	cell := flag.Float64("cell", float64(los.DefaultCellSize), "occluder grid cell size in meters")
-	minArea := flag.Float64("min-area", 0.1, "drop triangles smaller than this area in m^2 (0 keeps all)")
+	minArea := flag.Float64("min-area", 0, "drop triangles smaller than this area in m^2 (0 = exact, keeps all; >0 can create anti-cheat LOS gaps)")
 	check := flag.Bool("check", true, "reload the written occluder and verify stats")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "levelgeom converts X-Ray level.cform collision geometry into a server occluder file.\n\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: levelgeom -in <level.cform> -out <level.occl> [-cell 3.0] [-min-area 0.1]\n\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: levelgeom -in <level.cform> -out <level.occl> [-cell 3.0] [-min-area 0]\n\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "Any -min-area value above 0 drops collision faces and can create server-side\nshoot-through gaps. Default is 0 (exact).\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -83,6 +87,12 @@ func main() {
 	if *in == "" || *out == "" {
 		flag.Usage()
 		os.Exit(2)
+	}
+	if math.IsNaN(*minArea) || math.IsInf(*minArea, 0) || *minArea < 0 {
+		fatal(fmt.Errorf("invalid -min-area %v: must be finite and >= 0", *minArea))
+	}
+	if *minArea > 0 {
+		fmt.Fprintf(os.Stderr, "warning : -min-area=%g > 0 drops collision faces; server-side LOS can be shot through where faces were dropped (anti-cheat gap). Use -min-area 0 for exact geometry.\n", *minArea)
 	}
 
 	start := time.Now()
@@ -104,6 +114,11 @@ func main() {
 		fatal(err)
 	}
 	st := o.Stats()
+	dropped := len(c.Tris) - st.Triangles
+	fmt.Printf("faces   : input=%d kept=%d dropped=%d\n", len(c.Tris), st.Triangles, dropped)
+	if dropped > 0 {
+		fmt.Fprintf(os.Stderr, "warning : %d faces dropped (degenerate or below -min-area=%g); dropped faces can create shoot-through gaps. Re-run with -min-area 0 for exact geometry.\n", dropped, *minArea)
+	}
 	var inBytes int64
 	if info != nil {
 		inBytes = info.Size()

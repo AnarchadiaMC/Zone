@@ -150,6 +150,49 @@ func TestEconomyManager(t *testing.T) {
 		}
 	})
 
+	t.Run("SellItemRemovesOneFromStack", func(t *testing.T) {
+		db, testUUID := setupTestDB(t)
+		mgr := NewEconomyManager(db)
+
+		if _, err := db.RawDB().Exec(
+			"INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, 'bandage', 3, 1.0)",
+			testUUID); err != nil {
+			t.Fatalf("seed stack: %v", err)
+		}
+
+		// One sale pays one price and leaves the rest of the stack intact.
+		ok, err := mgr.SellItem(testUUID, "bandage", 150)
+		if err != nil || !ok {
+			t.Fatalf("SellItem = %v/%v, want true/nil", ok, err)
+		}
+		bal, _ := mgr.GetBalance(testUUID)
+		if bal != 5150 {
+			t.Fatalf("balance after one sale = %d, want 5150 (one unit's price)", bal)
+		}
+		inv, err := db.GetCharacterInventory(testUUID)
+		if err != nil {
+			t.Fatalf("GetCharacterInventory: %v", err)
+		}
+		if len(inv) != 1 || inv[0].ItemCount != 2 {
+			t.Fatalf("inventory after one sale = %+v, want one row with count 2", inv)
+		}
+
+		// Draining the remaining stack deletes the row and pays each unit.
+		for i := 0; i < 2; i++ {
+			if ok, err := mgr.SellItem(testUUID, "bandage", 150); err != nil || !ok {
+				t.Fatalf("SellItem drain %d = %v/%v, want true/nil", i, ok, err)
+			}
+		}
+		inv, _ = db.GetCharacterInventory(testUUID)
+		if len(inv) != 0 {
+			t.Fatalf("inventory after drain = %+v, want empty", inv)
+		}
+		bal, _ = mgr.GetBalance(testUUID)
+		if bal != 5450 {
+			t.Fatalf("balance after drain = %d, want 5450", bal)
+		}
+	})
+
 	t.Run("Tier Progression", func(t *testing.T) {
 		db, testUUID := setupTestDB(t)
 		mgr := NewEconomyManager(db)

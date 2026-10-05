@@ -21,6 +21,10 @@ packets as any other actor (`ENTITY_ENTER_AOI`, `ENTITY_LEAVE_AOI`,
 |---|---|---|---|---|
 | `OpAIState` | `0x007C` | S->C | unreliable | `count u8`, then per entity 19 B: `EntityID u32`, `X f32`, `Y f32`, `Z f32`, `Yaw u16` (0..65535, 0 = facing +Z, counter-clockwise), `Anim u8` (0=idle, 1=walk, 2=run, 3=attack, 4=death) |
 
+The legacy `OpAIActionEvent` (`0x0070`) squad-state broadcast and the
+non-puppet `SquadManager.SpawnSquad`/`Tick` patrol simulation were removed;
+`OpAIState` is the only AI replication packet.
+
 - Max 32 entries per packet; larger sets are chunked nearest-first exactly like
   `OpServerSnapshot`. The struct's `binary.Size` is `1 + 32*19 = 609`; the
   writer emits only `count` entries (`1 + 19*count` bytes on the wire).
@@ -57,7 +61,7 @@ deterministic):
 Seeding is idempotent: a non-empty table (operator-managed rows included) is
 never modified. `patrol_path` is reserved for explicit waypoint JSON
 (`[[x,y,z], ...]`); NULL/invalid paths generate a 12-point circular circuit at
-registration time. The legacy `is_online` column is not written in wave A.
+registration time. The `is_online` column is not written in wave A.
 
 ## Simulation tiers
 

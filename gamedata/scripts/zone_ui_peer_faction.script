@@ -112,7 +112,6 @@ function UIZonePeerFaction:InitUI()
 
   self.box_faction  = xml:InitStatic("main_dialog:box_faction", self.dialog)
   self.box_item     = xml:InitStatic("main_dialog:box_item", self.dialog)
-  self.box_item_temp = xml:InitStatic("main_dialog:box_item", self.dialog)
 
   self.main_frame = xml:InitStatic("main_dialog:frame_front", self.dialog)
 
@@ -715,12 +714,4 @@ end
 
 function get_peer_faction_dialog()
   return _peer_dlg
-end
-
-function close_peer_faction()
-  if _peer_dlg then
-    _peer_dlg.submitted = nil
-    if _peer_dlg:IsShown() then _peer_dlg:HideDialog() end
-    CUIScriptWnd.Show(_peer_dlg, false)
-  end
 end

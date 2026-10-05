@@ -34,7 +34,6 @@ func TestPacketByteLengths(t *testing.T) {
 		{"ServerSnapshot", ServerSnapshot{}, 705},            // 1 + 32 * 22 = 705
 		{"SafezoneStatePayload", SafezoneStatePayload{}, 33}, // 1 + 32 = 33
 		{"WorldEventPayload", WorldEventPayload{}, 6},        // 1 + 1 + 4 = 6
-		{"AIActionPayload", AIActionPayload{}, 9},            // 4 + 1 + 4 = 9
 		{"ClientTransform", ClientTransform{}, 29},           // 4 + 12 + 6 + 1 + 2 = 29 (v2 gvid)
 		{"EntityEnterAoI", EntityEnterAoI{}, 132},            // 4 + 1 + 64 + 12 + 16 + 1 + 2 + 32 = 132 (v3)
 		{"GroupInviteNotify", GroupInviteNotify{}, 52},       // 4 + 32 + 16 = 52
@@ -697,110 +696,6 @@ func TestPackets(t *testing.T) {
 		ctLong := NewChatText(1, longMsg)
 		if ctLong.Len != 255 {
 			t.Errorf("Expected truncated length 255, got %d", ctLong.Len)
-		}
-	})
-
-	t.Run("OpAiAction Roundtrip and Layout (9 bytes)", func(t *testing.T) {
-		var buf bytes.Buffer
-		ai := AIActionPayload{
-			EntityID: 501,
-			Action:   2,
-			TargetID: 1002,
-		}
-
-		const expectedLen = 4 + 1 + 4 // 9 bytes
-		if size := binary.Size(ai); size != expectedLen {
-			t.Fatalf("AIActionPayload binary.Size mismatch: got %d, want %d", size, expectedLen)
-		}
-
-		if err := WritePacket(&buf, OpAIActionEvent, 25, FlagUnreliable, ai); err != nil {
-			t.Fatalf("WritePacket failed: %v", err)
-		}
-
-		hdr, err := ReadHeader(&buf)
-		if err != nil {
-			t.Fatalf("ReadHeader failed: %v", err)
-		}
-		if hdr.Opcode != OpAIActionEvent {
-			t.Errorf("Opcode mismatch: got %d, want %d", hdr.Opcode, OpAIActionEvent)
-		}
-		if hdr.PayloadLength != expectedLen {
-			t.Fatalf("Payload length mismatch: got %d, want %d", hdr.PayloadLength, expectedLen)
-		}
-
-		var decoded AIActionPayload
-		if err := binary.Read(&buf, binary.LittleEndian, &decoded); err != nil {
-			t.Fatalf("Payload read failed: %v", err)
-		}
-		if decoded != ai {
-			t.Errorf("Decoded mismatch: got %+v, want %+v", decoded, ai)
-		}
-	})
-
-	t.Run("OpStashInteract and OpStashResponse Roundtrip and Layout", func(t *testing.T) {
-		interact := StashInteractPayload{
-			StashID: 10,
-			Action:  2, // Take
-			Count:   5,
-		}
-		copy(interact.ItemSection[:], "medkit_scientic")
-
-		const expectedInteractLen = 4 + 1 + 32 + 2 // 39 bytes
-		var buf bytes.Buffer
-		if err := WritePacket(&buf, OpStashInteract, 26, FlagReliable, interact); err != nil {
-			t.Fatalf("WritePacket OpStashInteract failed: %v", err)
-		}
-
-		hdr, err := ReadHeader(&buf)
-		if err != nil {
-			t.Fatalf("ReadHeader failed: %v", err)
-		}
-		if hdr.Opcode != OpStashInteract {
-			t.Errorf("Opcode mismatch: got %d, want %d", hdr.Opcode, OpStashInteract)
-		}
-		if hdr.PayloadLength != expectedInteractLen {
-			t.Fatalf("Payload length mismatch: got %d, want %d", hdr.PayloadLength, expectedInteractLen)
-		}
-
-		var decodedInteract StashInteractPayload
-		if err := binary.Read(&buf, binary.LittleEndian, &decodedInteract); err != nil {
-			t.Fatalf("Payload read failed: %v", err)
-		}
-		if decodedInteract != interact {
-			t.Errorf("Decoded interact mismatch: got %+v, want %+v", decodedInteract, interact)
-		}
-
-		// Response
-		response := StashResponsePayload{
-			StashID: 10,
-			Status:  0, // OK
-			Count:   3,
-		}
-		copy(response.Data[:], `[{"sec":"medkit", "cnt":3}]`)
-
-		const expectedResponseLen = 4 + 1 + 2 + 256 // 263 bytes
-		buf.Reset()
-		if err := WritePacket(&buf, OpStashResponse, 27, FlagReliable, response); err != nil {
-			t.Fatalf("WritePacket OpStashResponse failed: %v", err)
-		}
-
-		hdr, err = ReadHeader(&buf)
-		if err != nil {
-			t.Fatalf("ReadHeader failed: %v", err)
-		}
-		if hdr.Opcode != OpStashResponse {
-			t.Errorf("Opcode mismatch: got %d, want %d", hdr.Opcode, OpStashResponse)
-		}
-		if hdr.PayloadLength != expectedResponseLen {
-			t.Fatalf("Payload length mismatch: got %d, want %d", hdr.PayloadLength, expectedResponseLen)
-		}
-
-		var decodedResponse StashResponsePayload
-		if err := binary.Read(&buf, binary.LittleEndian, &decodedResponse); err != nil {
-			t.Fatalf("Payload read failed: %v", err)
-		}
-		if decodedResponse != response {
-			t.Errorf("Decoded response mismatch: got %+v, want %+v", decodedResponse, response)
 		}
 	})
 

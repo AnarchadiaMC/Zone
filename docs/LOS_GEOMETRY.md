@@ -15,7 +15,8 @@ The live install keeps each level in a packed archive:
 ```
 D:\Anomaly\db\levels\level_l01_escape.db0   295,730,493 bytes
 D:\Anomaly\db\levels\level_zaton.db0        415,301,142 bytes
-... (34 level packages, 43 MB - 509 MB each)
+D:\Anomaly\db\levels\level_pripyat.db0      508,998,195 bytes
+... (33 level packages on this install, 26,563,606 - 508,998,195 bytes each)
 ```
 
 `D:\Anomaly\tools\converter.exe` (xray_re tools, "X-Ray game asset converter
@@ -77,7 +78,9 @@ itself raycasts against.
 
 ## 4. cform format (verified)
 
-Little-endian, `#pragma pack(4)`:
+Little-endian, `#pragma pack(push,8)` (`src/xrEngine/xrLevel.h:87` in
+xray-monolith; the fields below are naturally aligned, so the on-disk layout
+is identical to a tighter packing):
 
 | Offset | Type | Field |
 |--------|------|-------|
@@ -148,21 +151,33 @@ go build -o levelgeom.exe ./tools/levelgeom
 .\levelgeom.exe -in .\extract\levels\l01_escape\level.cform -out .\l01_escape.occl
 ```
 
-Default `-cell 3.0 -min-area 0.1` result for `l01_escape`:
+Default `-cell 3.0 -min-area 0` (exact) result for `l01_escape`:
 
 ```
 cform   : version=4 verts=1574279 tris=2949775 bounds=(-833.45,-38.40,-633.75)..(766.55,92.51,966.38)
-occluder: tris=774120 verts=515350 grid=534x534 refs=2754430 file=19463186 bytes (18.56 MiB, 29.5% of cform)
+faces   : input=2949775 kept=2949773 dropped=2
+occluder: tris=2949773 verts=1574279 grid=534x534 refs=5277829 file=52967834 bytes (50.51 MiB, 80.1% of cform)
 check   : reload ok
-time    : 261ms
+time    : 585ms
 ```
 
-Compression stats: 2,949,775 triangles in, 774,120 kept (26.2%), 515,350
-vertices, 534x534 grid, 2,754,430 cell references, **18.56 MiB** output
-(29.5% of the 63 MB cform, 6.6% of the original 295 MB `.db0`).
+The default is exact: 2,949,773 of 2,949,775 triangles are kept; the 2 dropped
+faces are zero-area degenerates (warning printed because `dropped > 0`). The
+534x534 grid holds 5,277,829 cell references in **50.51 MiB** (80.1% of the
+63 MB cform, 17.9% of the original 295 MB `.db0`).
+
+Artifact note: the generated `l01_escape.occl` is 52,967,834 bytes with
+SHA-256 `705d987281888bfb322994fa625bbae8b0813a07aed9fd493855e77353957263`.
+The `.occl` is a build artifact derived from game data and is not committed.
+
+`-min-area > 0` is an approximation and is **not** the default: any positive
+value drops collision faces and can create server-side shoot-through gaps
+(anti-cheat). For comparison, the earlier `-min-area 0.1` run kept 774,120
+triangles (26.2%) and produced 18.56 MiB, but the 2.17M dropped faces made it
+unsuitable for authoritative LOS.
 
 Flags: `-cell` (grid cell size; default 3.0 m), `-min-area` (drop faces below
-this area; default 0.1 m²; `0` keeps all and yields ~48 MiB for l01_escape),
+this area; default `0` = exact; values above 0 print an anti-cheat warning),
 `-check` (reload and verify, default true). See `tools/levelgeom/README.md`.
 
 ## 7. Runtime API (`internal/los`)
@@ -188,16 +203,46 @@ visible := occ.Visible(from, to) // == !SegmentBlocked
   those cells.
 - Extra helpers: `Build(mesh, Options)`, `(*Occluders).Save(path)`,
   `Stats()`, `Bounds()`, `CellSize()`.
+- `Load` is hardened: 256 MB file cap (stat check plus a limit reader),
+  aggregate element-count caps before allocation, finite non-negative scale,
+  finite positive cell size, `min <= max` bounds, consistent zero/positive
+  vertex+triangle counts, monotonic cell table and in-range triangle/cell
+  indices. Malformed input returns a descriptive error and never panics;
+  empty occluders (0 vertices / 0 triangles) load and never block.
 
-Load memory for `l01_escape.occl` is roughly 40 MB
-(verts 6 B + triangle indices 12 B + refs 4 B in RAM).
+Memory: `Load` keeps an immutable in-RAM form, not the file. On 64-bit,
+`verts` is `[]int16` (6 B/vertex), while `tris`, `cellTris` and `cellStart`
+are `[]uint32` (12 B/triangle, 4 B/ref, 4 B/cell). For the default exact
+`l01_escape.occl` (2,949,773 triangles, 1,574,279 vertices, 5,277,829 refs,
+534x534 cells) that is about **64 MiB resident** once `Load` returns. During
+`Load` the raw file buffer is still alive while `parse` allocates, so the
+transient peak is file + resident, about **115 MiB**; both buffers are
+independent and the file buffer is freed after return. The older
+`-min-area 0.1` artifact was about 24.5 MB resident with a ~44 MB transient
+peak (measured 23.4 MiB / 42.0 MiB), which the exact default supersedes.
 
 ## 8. Integration into `damage.go` (future, example only)
 
 `ValidateAndApplyDamage` already reads `attackerPos`/`targetPos` (damage.go:121,
 damage.go:130) and today has **no LOS check** (see the comment at
 damage.go:218). The future flag-gated integration would look like this; this
-snippet is documentation, `damage.go` is intentionally untouched:
+snippet is documentation, `damage.go` is intentionally untouched.
+
+> **Integration warning — read before enabling the flag.** The single
+> eye/torso offset below is not sufficient for authoritative LOS. Without
+> stance and time alignment it produces **false "blocked" rejects**: a
+> crouched or prone target whose shot line clears geometry gets rejected when
+> queried at standing torso height, and transforms from different ticks make
+> the query test a stale line. Before `los_enabled` is turned on:
+>
+> 1. sample multiple body points (head, chest, pelvis) and apply the game's
+>    clear/blocked rule to the set, instead of one eye and one torso point;
+> 2. read stance (stand/crouch/prone) from `AnimFlags` so those sample heights
+>    follow the animation state;
+> 3. optionally time-align attacker and target transforms through the
+>    transform ring so both ends of the query come from one consistent tick.
+>
+> The snippet below is the minimal shape of the call, not a shippable check.
 
 ```go
 // DamageHandler fields (future):
@@ -229,10 +274,14 @@ Wiring notes:
   `los.Load` the matching file on level load and call `SetOccluders`.
 - `los_enabled` must default to `false`; v0.5.0 behaviour is unchanged until the
   flag is deliberately turned on and the geometry is validated against live
-  play.
-- The existing range gate is 300 m; a 300 m clear query costs a few
-  microseconds (see benchmarks), well within a damage budget that already
-  allows 400 damage/s.
+  play. Do not enable it before the multi-sample/stance/time-alignment work in
+  the integration warning above is implemented; the single-offset example
+  alone will cause false LOS rejects.
+- The existing range gate is 300 m. A synthetic 500 m clear query costs
+  ~4.5 µs, but random full-level pairs benchmark at ~172 µs each (see section
+  9); a multi-sample body check multiplies that. This is still small against
+  the damage budget (400 damage/s), but the multi-sample work should budget
+  ~3 queries per LOS check rather than assume the synthetic clear number.
 
 ## 9. Tests and benchmarks
 
@@ -241,18 +290,32 @@ go test ./internal/los -count=1
 ok  zone-online/zone-server/internal/los
 
 go test ./internal/los -bench Segment -benchmem -run "^$"
-BenchmarkSegmentBlocked-16        110-122 ns/op   0 B/op   0 allocs/op
-BenchmarkSegmentBlockedClear-16   4525-4661 ns/op 0 B/op   0 allocs/op
+BenchmarkSegmentBlocked-16        99.9-120.8 ns/op   0 B/op   0 allocs/op
+BenchmarkSegmentBlockedClear-16    4.51-4.71 us/op   0 B/op   0 allocs/op
+BenchmarkSegmentBlockedReal-16    171729-176675 ns/op  64.2 %blocked  0 B/op  0 allocs/op
 ```
 
 Tests cover: wall blocks, open space clear, thin diagonal wall, segments
 starting/ending inside wall cells, zero-length segments, vertical ray through a
-floor, `-min-area` filtering, save/load round-trip, corrupt-file rejection,
-concurrent reads, and a zero-allocation assertion via `testing.AllocsPerRun`.
+floor, exact grid-corner traversals and grazing/boundary rays, `-min-area`
+filtering, empty occluders (zero and degenerate meshes), option sanitization,
+save/load round-trip, a table-driven corrupt-file suite (bad version, flags,
+index width, counts, grid, scale/cell size, bounds, non-monotonic cell table,
+out-of-range triangle and cell indices), oversized-file rejection, concurrent
+reads, and a zero-allocation assertion via `testing.AllocsPerRun`. A
+`FuzzLoad` target exercises `Load`/`parse` on arbitrary bytes; `go test` runs
+its seeds and `go test -fuzz=FuzzLoad` can search further.
 
 `BenchmarkSegmentBlocked` is the typical case (a wall close to the segment);
-`BenchmarkSegmentBlockedClear` is the worst case measured - a 500 m clear
-segment crossing 167 grid cells (~27 ns/cell).
+`BenchmarkSegmentBlockedClear` is a 500 m clear synthetic segment crossing 167
+grid cells (~27 ns/cell). `BenchmarkSegmentBlockedReal` is the real-level
+number: it loads the default exact `l01_escape.occl` (`LOS_OCCL_PATH`), draws
+4096 random point pairs uniformly from the level bounds, shuffles them (cold
+cache, no repeated hot cell path), and reports 171,729-176,675 ns/op with
+64.2% blocked on an AMD Ryzen 9 6900HX, 0 allocs/op. That is the worst-case
+shape: many random pairs span hundreds of metres of open level. Typical
+in-combat queries are much shorter and cost far less; the level's 300 m range
+gate still bounds a single query by a few hundred microseconds.
 
 ## 10. Limitations and blockers
 
@@ -260,10 +323,12 @@ segment crossing 167 grid cells (~27 ns/cell).
   objects. Movable/breakable objects and dynamic entities are not occluders;
   the game handles those with per-object collision models the server does not
   have. This is a wall/terrain LOS, not a full physics raycast.
-- **`-min-area 0.1` default is an approximation.** Faces smaller than 0.1 m²
-  are dropped to meet the ~20 MB/level target (2.17M of 2.95M faces on
-  l01_escape are sub-0.1 m², mostly small detail). Use `-min-area 0` for an
-  exact but ~48 MiB occluder, or tune per level.
+- **`-min-area > 0` is an approximation and an anti-cheat risk.** The default
+  is `0` (exact); any positive value drops collision faces, and a dropped face
+  is a line the server considers clear that the engine may not, i.e. a
+  shoot-through gap. The earlier `0.1` default dropped 2.17M of 2.95M faces on
+  l01_escape and must not be used for authoritative LOS. The exact default
+  costs 50.51 MiB per large level (l01_escape).
 - **int16 quantization** moves vertices by at most half a quantization step
   (~1.2 cm on l01_escape). Grazing rays can disagree with the engine.
 - **No heightfield compression.** Terrain triangles are stored as triangles;

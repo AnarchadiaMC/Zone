@@ -11,11 +11,11 @@ mode: 0
 locked: false
 group_max_players: 4
 invite_ttl_sec: 60
-max_speed_mps: 25
-correction_tolerance_m: 2.0
-lagswitch_gap_ms: 1500
-lagswitch_strikes: 3
 damage_budget_per_s: 400
 item_rate_per_s: 5
 ai_enabled: true
 ai_online_radius_m: 220
+# World item lifecycle. world_item_ttl_min: omitted = 60, 0 disables expiry.
+# world_item_max_per_level caps rows per level; drops beyond the cap reject.
+world_item_ttl_min: 60
+world_item_max_per_level: 500

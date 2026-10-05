@@ -22,7 +22,7 @@ func twoQuads(v0, v1, v2, v3, w0, w1, w2, w3 [3]float32) *Mesh {
 	}
 }
 
-func mustBuild(t *testing.T, mesh *Mesh, opts Options) *Occluders {
+func mustBuild(t testing.TB, mesh *Mesh, opts Options) *Occluders {
 	t.Helper()
 	o, err := Build(mesh, opts)
 	if err != nil {

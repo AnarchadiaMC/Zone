@@ -22,7 +22,9 @@ import (
 // handleContainerAction is the OpContainerAction (0x007F) path. It shares the
 // item ledger's ActionID idempotency cache, monotonic replay floor and
 // per-session rate limit with OpItemAction, so a retransmitted 0x007F packet
-// echoes its cached OpContainerUpdate and never re-applies.
+// echoes its cached OpContainerUpdate and never re-applies. Every action runs
+// the full ValidateAccess pass (level, distance, owner, passcode), so no
+// separate open-stash session state is required.
 func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 	var pkt protocol.ContainerActionPacket
 	if err := binary.Read(buf, binary.LittleEndian, &pkt); err != nil {
@@ -93,10 +95,10 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 		reject(protocol.ItemResultRejected, 0)
 		return
 	}
-	// Same level, <= 5 m from the player's last server position, and the same
-	// fail-closed passcode semantics as OpStashInteract (the wire carries no
-	// passcode, so protected stashes reject).
-	if verr := s.stashMgr.ValidateAccess(rec, playerPos, level, ""); verr != nil {
+	// Same level, <= 5 m from the player's last server position, owner match
+	// and the fail-closed passcode semantics (the wire carries no passcode, so
+	// protected stashes reject).
+	if verr := s.stashMgr.ValidateAccess(rec, playerPos, level, "", uuid); verr != nil {
 		s.audit(uuid, "item_container_rejected",
 			fmt.Sprintf("action_id=%d container=%d section=%s count=%d err=%v", pkt.ActionID, pkt.ContainerID, section, pkt.Count, verr))
 		reject(protocol.ItemResultRejected, 0)
@@ -105,7 +107,8 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 
 	switch pkt.Action {
 	case protocol.ContainerActionDeposit:
-		if err := s.stashMgr.DepositItem(pkt.ContainerID, uuid, level, section, int(pkt.Count), pkt.Condition); err != nil {
+		bucket, err := s.stashMgr.DepositItem(pkt.ContainerID, uuid, level, section, int(pkt.Count), int(pkt.Condition))
+		if err != nil {
 			result := protocol.ItemResultRejected
 			var corr int16
 			if errors.Is(err, database.ErrInsufficientItems) {
@@ -125,9 +128,9 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			}
 			s.itemLedger.RecordContainer(sess.SessionID, pkt.ActionID, update)
 			s.replyContainerUpdate(sess, update)
-			if result == protocol.ItemResultCorrected {
-				s.forceInventorySync(sess)
-			}
+			// A rejected deposit may have been applied locally by the client;
+			// force a full resync so no ghost stack survives.
+			s.forceInventorySync(sess)
 			s.audit(uuid, "item_deposit_rejected",
 				fmt.Sprintf("action_id=%d container=%d section=%s count=%d err=%v", pkt.ActionID, pkt.ContainerID, section, pkt.Count, err))
 			return
@@ -139,7 +142,7 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			ContainerID: pkt.ContainerID,
 			Count:       clampCountToInt16(-int(pkt.Count)),
 			Section:     pkt.Section,
-			Condition:   pkt.Condition,
+			Condition:   bucket,
 		}
 		s.itemLedger.RecordContainer(sess.SessionID, pkt.ActionID, update)
 		s.replyContainerUpdate(sess, update)
@@ -147,7 +150,8 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			fmt.Sprintf("action_id=%d container=%d section=%s count=%d", pkt.ActionID, pkt.ContainerID, section, pkt.Count))
 
 	case protocol.ContainerActionWithdraw:
-		if err := s.stashMgr.WithdrawItem(pkt.ContainerID, uuid, level, section, int(pkt.Count), pkt.Condition); err != nil {
+		bucket, err := s.stashMgr.WithdrawItem(pkt.ContainerID, uuid, level, section, int(pkt.Count), int(pkt.Condition))
+		if err != nil {
 			s.audit(uuid, "item_withdraw_rejected",
 				fmt.Sprintf("action_id=%d container=%d section=%s count=%d err=%v", pkt.ActionID, pkt.ContainerID, section, pkt.Count, err))
 			reject(protocol.ItemResultRejected, 0)
@@ -160,7 +164,7 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			ContainerID: pkt.ContainerID,
 			Count:       clampCountToInt16(int(pkt.Count)),
 			Section:     pkt.Section,
-			Condition:   pkt.Condition,
+			Condition:   bucket,
 		}
 		s.itemLedger.RecordContainer(sess.SessionID, pkt.ActionID, update)
 		s.replyContainerUpdate(sess, update)
@@ -190,6 +194,7 @@ func (s *Server) handleItemConsume(sess *network.PlayerSession, uuid, section st
 		}
 		s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 		s.replyItemUpdate(sess, update)
+		s.forceInventorySync(sess)
 		return
 	}
 
@@ -209,9 +214,9 @@ func (s *Server) handleItemConsume(sess *network.PlayerSession, uuid, section st
 		}
 		s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 		s.replyItemUpdate(sess, update)
-		if update.Result == protocol.ItemResultCorrected {
-			s.forceInventorySync(sess)
-		}
+		// Rejected/corrected consumes are always client-local mutations: resync
+		// so the authoritative stack is restored and no ghost effect survives.
+		s.forceInventorySync(sess)
 		s.audit(uuid, "item_consume_rejected",
 			fmt.Sprintf("action_id=%d section=%s count=%d err=%v", pkt.ActionID, section, pkt.Count, err))
 		return

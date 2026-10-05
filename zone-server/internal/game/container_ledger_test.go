@@ -69,7 +69,7 @@ func TestContainerDepositWithdrawRoundTrip(t *testing.T) {
 		ContainerID: 300,
 		Action:      protocol.ContainerActionDeposit,
 		Count:       2,
-		Condition:   80,
+		Condition:   100,
 	}
 	assembleSection(&deposit.Section, "bandage")
 	sendContainerAction(t, s, sess, 1, deposit)
@@ -82,11 +82,15 @@ func TestContainerDepositWithdrawRoundTrip(t *testing.T) {
 	if ok[0].Count != -2 || ok[0].Action != protocol.ContainerActionDeposit || ok[0].ContainerID != 300 {
 		t.Fatalf("deposit update = %+v, want count=-2 action=deposit container=300", ok[0])
 	}
+	// The response echoes the condition actually derived from the inventory row.
+	if ok[0].Condition != 100 {
+		t.Fatalf("deposit condition = %d, want 100 from the inventory row", ok[0].Condition)
+	}
 	if avail, _ := db.AvailableItemCount("uuid-container", "bandage"); avail != 3 {
 		t.Fatalf("inventory after deposit = %d, want 3", avail)
 	}
 	items := stashItems(t, s, 300)
-	if len(items) != 1 || items[0].Section != "bandage" || items[0].Count != 2 || items[0].Condition != 80 {
+	if len(items) != 1 || items[0].Section != "bandage" || items[0].Count != 2 || items[0].Condition != 100 {
 		t.Fatalf("stash after deposit = %+v", items)
 	}
 
@@ -96,7 +100,7 @@ func TestContainerDepositWithdrawRoundTrip(t *testing.T) {
 		ContainerID: 300,
 		Action:      protocol.ContainerActionWithdraw,
 		Count:       1,
-		Condition:   80,
+		Condition:   100,
 	}
 	assembleSection(&withdraw.Section, "bandage")
 	sendContainerAction(t, s, sess, 2, withdraw)
@@ -125,7 +129,8 @@ func TestContainerDepositWithdrawRoundTrip(t *testing.T) {
 	}
 }
 
-// Deposit merges by section + condition bucket, keeping separate stacks per
+// Deposit consumes the inventory stack matching the requested condition and
+// stores under that stack's own condition bucket, keeping separate stacks per
 // condition.
 func TestContainerDepositConditionBuckets(t *testing.T) {
 	s, sink, db := setupTestServerWithDB(t)
@@ -133,7 +138,11 @@ func TestContainerDepositConditionBuckets(t *testing.T) {
 		t.Fatalf("AutoProvision: %v", err)
 	}
 	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
-		"uuid-buckets", "bandage", 6, 1.0)
+		"uuid-buckets", "bandage", 1, 0.8)
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-buckets", "bandage", 2, 0.2)
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-buckets", "bandage", 3, 0.8)
 	if err := db.SaveStash(301, "l01_escape", 0, 0, 0, "[]"); err != nil {
 		t.Fatalf("SaveStash: %v", err)
 	}
@@ -159,6 +168,11 @@ func TestContainerDepositConditionBuckets(t *testing.T) {
 	}
 	if len(items) != 2 || byCond[80] != 4 || byCond[20] != 2 {
 		t.Fatalf("bucket merge = %+v, want 80:4 20:2", items)
+	}
+	// The 20% stack was consumed with the claimed 20 condition, and the 80%
+	// stacks with 80; no stack was repaired by a mismatched claim.
+	if got := countAuditEvents(t, s, "item_deposit"); got != 3 {
+		t.Errorf("item_deposit audit rows = %d, want 3", got)
 	}
 }
 

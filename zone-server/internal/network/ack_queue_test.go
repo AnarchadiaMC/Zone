@@ -336,3 +336,32 @@ func TestAckQueue_BackwardsCompatibility(t *testing.T) {
 		t.Errorf("Expected len(aq.pending)==0 after AckReceived, got %d", len(aq.pending))
 	}
 }
+
+func TestAckQueue_AcknowledgeFromRejectsForeignAddr(t *testing.T) {
+	owner := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}
+	foreign := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+	sameIPOtherPort := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5001}
+
+	aq := NewAckQueue()
+	aq.Enqueue(42, owner, []byte("retransmit-me"))
+
+	if aq.AcknowledgeFrom(42, foreign) {
+		t.Fatal("foreign IP cleared the entry")
+	}
+	if aq.AcknowledgeFrom(42, sameIPOtherPort) {
+		t.Fatal("foreign port cleared the entry")
+	}
+	if aq.AcknowledgeFrom(42, nil) {
+		t.Fatal("nil address cleared the entry")
+	}
+	if aq.Len() != 1 {
+		t.Fatalf("entry removed by foreign ACK: len=%d, want 1", aq.Len())
+	}
+
+	if !aq.AcknowledgeFrom(42, owner) {
+		t.Fatal("owner ACK did not clear the entry")
+	}
+	if aq.Len() != 0 {
+		t.Fatalf("len=%d after owner ACK, want 0", aq.Len())
+	}
+}

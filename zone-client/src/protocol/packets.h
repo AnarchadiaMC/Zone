@@ -26,11 +26,8 @@ enum class Opcode : uint16_t {
     ENTITY_LEAVE_AOI = 0x0013,
     SAFEZONE_STATE = 0x0020,
     WORLD_EVENT = 0x0030,
-    STASH_INTERACT = 0x0040, 
-    STASH_RESPONSE = 0x0041,
     DAMAGE_NOTIFY = 0x0050,
     CHAT_TEXT = 0x0060,
-    AI_ACTION_EVENT = 0x0070,
     SHOW_START = 0x0071,
     CHARACTER_SELECT = 0x0072,
     LOAD_LEVEL = 0x0073,
@@ -38,7 +35,11 @@ enum class Opcode : uint16_t {
     PLAYER_VISUAL = 0x0075,
     GROUP_INVITE_NOTIFY = 0x0078,
     GROUP_RESPONSE = 0x0079,
-    GROUP_STATE = 0x007A
+    GROUP_STATE = 0x007A,
+    ITEM_ACTION = 0x007D,
+    ITEM_UPDATE = 0x007E,
+    CONTAINER_ACTION = 0x007F,
+    CONTAINER_UPDATE = 0x0080
 };
 
 struct HeartbeatPayload {
@@ -182,12 +183,6 @@ struct PlayerVisual {
     char visual[64];
 };
 static_assert(sizeof(PlayerVisual) == 64, "PlayerVisual size must be exactly 64 bytes");
-
-struct AIActionEvent {
-    uint32_t entityID;
-    uint8_t action;
-    uint32_t targetID;
-};
 
 struct DamageNotify {
     uint32_t targetID;

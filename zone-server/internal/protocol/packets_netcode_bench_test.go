@@ -6,23 +6,6 @@ import (
 	"testing"
 )
 
-func BenchmarkNetcode_PositionCorrectionRoundTrip(b *testing.B) {
-	in := PositionCorrection{X: 1.5, Y: -2.5, Z: 300.25}
-	var buf bytes.Buffer
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buf.Reset()
-		if err := WritePacket(&buf, OpPositionCorrection, uint32(i), FlagUnreliable, in); err != nil {
-			b.Fatalf("WritePacket: %v", err)
-		}
-		var out PositionCorrection
-		if err := binary.Read(bytes.NewReader(buf.Bytes()[12:]), binary.LittleEndian, &out); err != nil {
-			b.Fatalf("decode: %v", err)
-		}
-	}
-}
-
 func BenchmarkNetcode_ItemActionRoundTrip(b *testing.B) {
 	in := ItemActionPacket{
 		ActionID:  1,

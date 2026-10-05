@@ -1,11 +1,8 @@
 #include "../net/udp_client.h"
 #include "../protocol/packets.h"
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <cmath>
 

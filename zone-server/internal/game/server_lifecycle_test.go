@@ -241,11 +241,8 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	sink.Reset()
 
 	// 2. Transform into Cordon Rookie Village: (-211.3, -20.2, -145.8, "l01_escape")
-	// Stage just inside the zone edge so the move is physically plausible
-	// (anticheat clamps dt > 2s to 2.0s: ~10m in ~1s ≈ 10 m/s).
 	sess.Lock()
-	sess.Position = [3]float32{-201.3, -20.2, -145.8}
-	sess.LastTransformTime = time.Now().Add(-1 * time.Second)
+	sess.Position = [3]float32{-211.0, -20.2, -145.8}
 	sess.Unlock()
 	ctIn := protocol.ClientTransform{
 		PosX: -211.3,
@@ -297,11 +294,7 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 	sink.Reset()
 
 	// 3. Move back outside Rookie Village (rise above the cylinder: the zone
-	// is 20m tall around y=-20.2, so y=-6 is outside; dy=14.2m passes the
-	// 15m vertical ceiling and ~14 m/s passes the speed check).
-	sess.Lock()
-	sess.LastTransformTime = time.Now().Add(-1 * time.Second)
-	sess.Unlock()
+	// is 20m tall around y=-20.2, so y=-6 is outside).
 	ctOut2 := protocol.ClientTransform{
 		PosX: -211.3,
 		PosY: -6.0,
@@ -606,68 +599,6 @@ func TestLifecycle_CombatDisconnectSleeper(t *testing.T) {
 	// Sleeper must now be removed from SleeperManager
 	if s.Sleepers().GetSleeperByAccount(uuid) != nil {
 		t.Errorf("Expected sleeper to be removed upon player reconnection")
-	}
-}
-
-func TestLifecycle_SpeedhackRubberband(t *testing.T) {
-	s, _, _ := setupTestServerWithDB(t)
-
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30071}
-	sessID := uint32(901)
-	sess := &network.PlayerSession{
-		SessionID:         sessID,
-		AccountID:         "uuid-speedhack-test",
-		UDPAddr:           addr,
-		CurrentLevel:      "l01_escape",
-		Position:          [3]float32{0.0, 0.0, 0.0},
-		LastSeen:          time.Now().Add(-1 * time.Second),
-		LastTransformTime: time.Now().Add(-1 * time.Second),
-	}
-	s.sessions.AddSession(sess)
-	s.grid.Insert(sessID, 0.0, 0.0)
-
-	// Valid initial move
-	ct1 := protocol.ClientTransform{
-		PosX: 5.0,
-		PosY: 0.0,
-		PosZ: 5.0,
-	}
-	binary.LittleEndian.PutUint32(ct1.SessionID[:], sessID)
-	raw1 := buildTestPacket(t, protocol.OpClientTransform, 1, protocol.FlagUnreliable, ct1)
-	s.HandlePacket(raw1, addr)
-
-	sess.Lock()
-	p1 := sess.Position
-	sess.Unlock()
-	if p1[0] != 5.0 || p1[2] != 5.0 {
-		t.Fatalf("Expected valid transform position (5, 5), got (%f, %f)", p1[0], p1[2])
-	}
-
-	// Speedhack move: jump 500m in 0.01s (50,000 m/s > 25 m/s)
-	sess.Lock()
-	sess.LastTransformTime = time.Now().Add(-10 * time.Millisecond)
-	sess.Unlock()
-
-	ctHack := protocol.ClientTransform{
-		PosX: 500.0,
-		PosY: 0.0,
-		PosZ: 500.0,
-	}
-	binary.LittleEndian.PutUint32(ctHack.SessionID[:], sessID)
-	rawHack := buildTestPacket(t, protocol.OpClientTransform, 2, protocol.FlagUnreliable, ctHack)
-	s.HandlePacket(rawHack, addr)
-
-	// Position must be rubberbanded (kept at 5, 5, NOT 500, 500)
-	sess.Lock()
-	pHack := sess.Position
-	sess.Unlock()
-	if pHack[0] != 5.0 || pHack[2] != 5.0 {
-		t.Errorf("Speedhack packet was not rubberbanded! Position: (%f, %f)", pHack[0], pHack[2])
-	}
-
-	// Anticheat violation should be recorded
-	if s.anticheat.ViolationCount(sessID) == 0 {
-		t.Errorf("Expected violation recorded for speedhack")
 	}
 }
 

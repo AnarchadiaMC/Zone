@@ -330,6 +330,26 @@ func (gm *GroupManager) Tick(now time.Time) {
 	}
 }
 
+// ForgetSession removes every pending invitation involving sessionID, whether
+// as target or inviter, so a departed session leaves no invite behind for its
+// full TTL. Group membership itself is handled by Leave.
+func (gm *GroupManager) ForgetSession(sessionID uint32) {
+	if gm == nil || sessionID == 0 {
+		return
+	}
+	gm.mu.Lock()
+	defer gm.mu.Unlock()
+	for id, inv := range gm.invites {
+		if inv == nil {
+			delete(gm.invites, id)
+			continue
+		}
+		if id == sessionID || inv.InviterID == sessionID {
+			delete(gm.invites, id)
+		}
+	}
+}
+
 // sessionName reads a session nickname under its lock.
 func sessionName(sess *network.PlayerSession) string {
 	if sess == nil {

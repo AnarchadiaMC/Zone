@@ -326,14 +326,13 @@ func TestProtocolV2_EntityEnterWaitsForGvidAndVisual(t *testing.T) {
 		LastSeen:     time.Now(),
 	}
 	mover := &network.PlayerSession{
-		SessionID:         7502,
-		AccountID:         "uuid-enter-mover",
-		UDPAddr:           moverAddr,
-		CurrentLevel:      "l01_escape",
-		Position:          [3]float32{0, 0, 0},
-		Health:            100,
-		LastTransformTime: time.Now(),
-		LastSeen:          time.Now(),
+		SessionID:    7502,
+		AccountID:    "uuid-enter-mover",
+		UDPAddr:      moverAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{0, 0, 0},
+		Health:       100,
+		LastSeen:     time.Now(),
 	}
 	s.sessions.AddSession(peer)
 	s.sessions.AddSession(mover)
@@ -401,16 +400,15 @@ func TestProtocolV2_LevelChangeResetsAndRebroadcastsEntityEnter(t *testing.T) {
 		LastSeen:     time.Now(),
 	}
 	mover := &network.PlayerSession{
-		SessionID:         7603,
-		AccountID:         "uuid-lvl-mover",
-		UDPAddr:           moverAddr,
-		CurrentLevel:      "l01_escape",
-		Position:          [3]float32{0, 0, 0},
-		Health:            100,
-		HasVisual:         true,
-		Gvid:              0x1111,
-		LastTransformTime: time.Now(),
-		LastSeen:          time.Now(),
+		SessionID:    7603,
+		AccountID:    "uuid-lvl-mover",
+		UDPAddr:      moverAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{0, 0, 0},
+		Health:       100,
+		HasVisual:    true,
+		Gvid:         0x1111,
+		LastSeen:     time.Now(),
 	}
 	s.sessions.AddSession(peerOld)
 	s.sessions.AddSession(peerNew)
@@ -435,7 +433,12 @@ func TestProtocolV2_LevelChangeResetsAndRebroadcastsEntityEnter(t *testing.T) {
 		t.Fatalf("expected 1 ENTITY_LEAVE for the old level, got %d", got)
 	}
 
-	ctNew := protocol.ClientTransform{PosX: 0, PosY: 0, PosZ: 0, Gvid: 0x2222}
+	// The level change reset Position to the server-known spawn; the client's
+	// first post-load transform arrives at that spawn.
+	ctNew := protocol.ClientTransform{
+		PosX: defaultLevelSpawn[0], PosY: defaultLevelSpawn[1], PosZ: defaultLevelSpawn[2],
+		Gvid: 0x2222,
+	}
 	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 300, protocol.FlagUnreliable, ctNew), moverAddr)
 	enters := entityEnterPacketsFor(t, sink, mover.SessionID)
 	if len(enters) != 1 {

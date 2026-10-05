@@ -50,10 +50,6 @@ func NewAdminServer(s *Server, pipeName ...string) *AdminServer {
 	}
 }
 
-func (a *AdminServer) PipeName() string {
-	return a.pipeName
-}
-
 func (a *AdminServer) IsRunning() bool {
 	return a.running.Load()
 }
@@ -76,10 +72,6 @@ func (a *AdminServer) Authenticate(token string) bool {
 // never unlocks other connections.
 func (a *AdminServer) checkToken(token string) bool {
 	return a.authToken == "" || a.authToken == token
-}
-
-func (a *AdminServer) IsAuthenticated() bool {
-	return a.authToken == "" || a.authenticated.Load()
 }
 
 func (a *AdminServer) ExecuteCommand(cmdLine string) string {

@@ -33,9 +33,6 @@
     <string id="ui_zone_col_mode">
         <text>Mode</text>
     </string>
-    <string id="ui_zone_scan">
-        <text>Scan</text>
-    </string>
     <string id="ui_zone_scanning">
         <text>Scanning...</text>
     </string>
@@ -80,9 +77,6 @@
     </string>
     <string id="ui_zone_status_ready">
         <text>Ready</text>
-    </string>
-    <string id="ui_zone_status_offline">
-        <text>Network module unavailable</text>
     </string>
     <string id="ui_zone_details">
         <text>Details</text>
@@ -131,12 +125,6 @@
     </string>
     <string id="ui_zone_nearby_title">
         <text>Nearby</text>
-    </string>
-    <string id="ui_zone_no_group">
-        <text>No group</text>
-    </string>
-    <string id="ui_zone_chat_help">
-        <text>Chat commands: /invite &lt;nick&gt;, /accept, /decline, /leave, /group</text>
     </string>
     <string id="ui_zone_sort_hint">
         <text>Click a column header to sort</text>
@@ -275,5 +263,8 @@
     </string>
     <string id="ui_zone_item_action_rejected">
         <text>Server rejected item action: %s</text>
+    </string>
+    <string id="ui_zone_item_action_timeout">
+        <text>Server did not confirm an item action; inventory will be reconciled on the next sync</text>
     </string>
 </string_table>

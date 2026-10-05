@@ -26,9 +26,6 @@ namespace NetClient
     void SendLevelChange(const std::string& level);
     void SendPlayerVisual(const std::string& visual);
     bool PollEvent(char* outBuf, size_t maxLen, size_t& outLen);
-    bool PollEvent(char* outBuf, size_t& outLen);
-    bool PollEvent(int a, int& b);
-    uint64_t GetDroppedPackets();
     
     bool IsConnected();
     bool IsInSafeZone();

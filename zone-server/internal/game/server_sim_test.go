@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"zone-online/zone-server/internal/ai"
 	"zone-online/zone-server/internal/config"
 	"zone-online/zone-server/internal/database"
 	"zone-online/zone-server/internal/network"
@@ -114,62 +113,6 @@ func TestSim_EmissionOrchestratorTicked(t *testing.T) {
 	}
 }
 
-func TestSim_AISquadTickedAndActionBroadcast(t *testing.T) {
-	s, sink, _ := setupTestServerWithDB(t)
-	sink.Reset()
-
-	// Register a connected player session
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 40002}
-	sess := &network.PlayerSession{
-		SessionID:    201,
-		AccountID:    "uuid-sim-ai-1",
-		UDPAddr:      addr,
-		CurrentLevel: "l01_escape",
-		Health:       100.0,
-		LastSeen:     time.Now(),
-	}
-	s.sessions.AddSession(sess)
-
-	// Spawn an AI squad
-	startX, startY, startZ := float32(100.0), float32(5.0), float32(200.0)
-	sq := s.squads.SpawnSquad("l01_escape", startX, startY, startZ, "stalker")
-	if sq == nil {
-		t.Fatal("failed to spawn AI squad")
-	}
-	if sq.State != ai.AIStatePatrol {
-		t.Fatalf("expected initial squad state AIStatePatrol, got %v", sq.State)
-	}
-
-	sink.Reset()
-
-	// Ticking server must tick squads and broadcast OpAiAction (OpAIActionEvent 0x0070)
-	s.Tick(time.Now())
-
-	if sink.PacketCount() == 0 {
-		t.Fatal("expected OpAiAction packet in sink after server.Tick")
-	}
-
-	r := bytes.NewReader(sink.LastPacket())
-	hdr, err := protocol.ReadHeader(r)
-	if err != nil {
-		t.Fatalf("failed to read packet header: %v", err)
-	}
-	if hdr.Opcode != OpAiAction {
-		t.Fatalf("expected Opcode OpAiAction (0x0070), got 0x%04X", hdr.Opcode)
-	}
-
-	var action protocol.AIActionPayload
-	if err := binary.Read(r, binary.LittleEndian, &action); err != nil {
-		t.Fatalf("failed to decode AIActionPayload: %v", err)
-	}
-	if action.EntityID != sq.ID {
-		t.Errorf("expected EntityID %d, got %d", sq.ID, action.EntityID)
-	}
-	if action.Action != uint8(ai.AIStatePatrol) {
-		t.Errorf("expected Action %d (Patrol), got %d", ai.AIStatePatrol, action.Action)
-	}
-}
-
 func TestSim_AckQueueTicked(t *testing.T) {
 	s, sink, _ := setupTestServerWithDB(t)
 	sink.Reset()
@@ -221,7 +164,7 @@ func TestSim_AckQueueTicked(t *testing.T) {
 	// Header seq must be the CLIENT's own seq (distinct); the acked server seq
 	// travels in the payload. The old test reused seq as the header seq with a
 	// nil payload, which only passed via the removed double-ack bug.
-	ackPkt := buildTestPacket(t, OpAck, seq+1000000, protocol.FlagReliable, seq)
+	ackPkt := buildTestPacket(t, protocol.OpAck, seq+1000000, protocol.FlagReliable, seq)
 	s.HandlePacket(ackPkt, addr)
 
 	// Verify packet acknowledged and removed from ackQueue
@@ -245,7 +188,7 @@ func TestSim_AckQueueTicked(t *testing.T) {
 	hdr2, _ := protocol.ReadHeader(r2)
 	seq2 := hdr2.SequenceNum
 
-	ackPayloadPkt := buildTestPacket(t, OpAck, 0, protocol.FlagReliable, seq2)
+	ackPayloadPkt := buildTestPacket(t, protocol.OpAck, 0, protocol.FlagReliable, seq2)
 	s.HandlePacket(ackPayloadPkt, addr)
 	if s.ackQueue.Len() != 0 {
 		t.Fatalf("expected ackQueue to be empty after payload seq ACK, got %d entries", s.ackQueue.Len())
