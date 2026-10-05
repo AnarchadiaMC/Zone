@@ -2,10 +2,13 @@
 -- Handles the behavior of the "Zone" button injected by modxml_zone_main_menu.script.
 
 local mm_class = nil
+local _prev_global_on_main_menu_init = rawget(_G, "on_main_menu_init")
 local function install_methods()
     if mm_class then return end
     local cls = ui_main_menu.main_menu
     mm_class = cls
+    local orig_show_faction_ui = cls.ShowFactionUI
+    if type(orig_show_faction_ui) ~= "function" then orig_show_faction_ui = function() end end
     cls.OnButton_zone_online_clicked = function(self)
         if self.zone_server_browser_dlg == nil then
             if zone_ui_server_list and zone_ui_server_list.UIZoneServerList then
@@ -30,12 +33,50 @@ local function install_methods()
             pcall(function() dlg:Show(true) end)
         end
     end
+    cls.ShowFactionUI = function(self, ...)
+        local ok_zone, zone_connected = pcall(function() return ZoneNet and ZoneNet:IsConnected() end)
+        if ok_zone and zone_connected then
+            if self.zone_peer_faction_dlg == nil then
+                local ok_ui, dlg = pcall(function() return zone_ui_peer_faction.open_peer_faction(self) end)
+                if not (ok_ui and dlg) then
+                    return orig_show_faction_ui(self, ...)
+                end
+                self.zone_peer_faction_dlg = dlg
+            end
+            local ok_show = pcall(function() self.zone_peer_faction_dlg:ShowDialog(true) self.zone_peer_faction_dlg:Show(true) end)
+            if not ok_show then
+                return orig_show_faction_ui(self, ...)
+            end
+            pcall(function() self:HideDialog() end)
+            pcall(function() self:Show(false) end)
+            return
+        end
+        local ok_xrr, xrr_connected = pcall(function() return _G.XrrNet and _G.XrrNet():IsConnected() end)
+        if ok_xrr and xrr_connected then
+            return orig_show_faction_ui(self, ...)
+        end
+        return orig_show_faction_ui(self, ...)
+    end
 end
 
 function on_main_menu_init(menu)
     if not menu then return end
     install_methods()
     menu:AddCallback("btn_zone_online", ui_events.BUTTON_CLICKED, mm_class.OnButton_zone_online_clicked, menu)
+    if menu.shniaga then
+        local ok_zone, zone_connected = pcall(function() return ZoneNet and ZoneNet:IsConnected() end)
+        local in_game = false
+        pcall(function() in_game = level.present() end)
+        if ok_zone and zone_connected and in_game then
+            pcall(function() menu.shniaga:SetButtonDisabled("btn_save", true) end)
+            pcall(function() menu.shniaga:SetButtonDisabled("btn_load", true) end)
+        end
+        pcall(function() return _G.XrrNet and _G.XrrNet():IsConnected() end)
+        pcall(function() return _G.XrrIsClient and _G.XrrIsClient() end)
+    end
+    if type(_prev_global_on_main_menu_init) == "function" and _prev_global_on_main_menu_init ~= on_main_menu_init then
+        pcall(_prev_global_on_main_menu_init, menu)
+    end
 end
 
 function on_game_start()

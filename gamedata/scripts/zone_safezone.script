@@ -1,10 +1,8 @@
 -- zone_safezone.script
--- Safe zone damage gate. Weapons always function, keys never blocked.
--- Hits deal no damage to PROTECTED victims inside safe zones.
-
-local in_safe_zone = false
-local safe_zone_active = false
-local safe_zone_id = ""
+-- Safe zone enforcement. The server owns the authoritative locked state
+-- (SAFEZONE_STATE 0x0020 plus the ZoneNet:IsInSafeZone() client atomic);
+-- this script reconciles both, holsters the weapon, blocks offensive input
+-- and hard-cancels damage involving protected actors.
 
 local SAFE_ZONES = {
     { id = "sz_cordon_rookie", level = "l01_escape", x = -211.3, y = -20.2, z = -145.8, r = 65.0, h = 20.0 },
@@ -20,6 +18,34 @@ local SAFE_ZONES = {
     { id = "sz_zaton_skadovsk", level = "zaton", x = 112.5, y = -4.5, z = 182.3, r = 65.0, h = 20.0 },
     { id = "sz_jupiter_yanov", level = "jupiter", x = -40.0, y = 3.5, z = 220.0, r = 75.0, h = 20.0 },
 }
+
+-- State sources: packet (0x0020), client atomic (polled 1 Hz), enforced (OR).
+local packet_locked = false
+local auth_locked = false
+local enforced = false
+local safe_zone_id = ""
+local weapon_hidden = false
+
+local POLL_INTERVAL_MS = 1000
+local last_poll = 0
+
+-- Offensive binds are discovered lazily; key_bindings may not exist yet when
+-- on_game_start fires. Rebuild on the first key event if still empty.
+local BLOCKED = {}
+local BIND_NAMES = {
+    "kWPN_FIRE",    -- fire
+    "kWPN_FUNC",    -- under-barrel / grenade launcher fire
+    "kGRENADE",     -- grenade throw (modded/legacy bind names)
+    "kTHROW_GRENADE",
+    "kQUICK_USE_1", -- quick slots (grenades/bolts)
+    "kQUICK_USE_2",
+    "kQUICK_USE_3",
+    "kQUICK_USE_4",
+}
+
+local registered = false
+local fire_hook_installed = false
+local prev_CActor_Fire = nil
 
 local function pos_in_safezone(pos, cur_level)
     if not pos then return false end
@@ -42,107 +68,223 @@ local function pos_in_safezone(pos, cur_level)
     return false
 end
 
-local BLOCKED = {}
+local function same_object(a, b)
+    if a == b then return true end
+    local same = false
+    pcall(function() same = (a:id() == b:id()) end)
+    return same
+end
+
+local function object_in_safezone(obj)
+    if not obj then return false end
+    if enforced and db and db.actor and same_object(obj, db.actor) then return true end
+    local ok_pos, pos = pcall(function() return obj:position() end)
+    if not ok_pos or not pos then return false end
+    local cur_level = nil
+    pcall(function() cur_level = level.name() end)
+    if type(cur_level) ~= "string" or cur_level == "" then return false end
+    local ok_geo, inside = pcall(pos_in_safezone, pos, cur_level)
+    return ok_geo and inside == true
+end
 
 local function build_blocklist()
-    local names = { "kWPN_FIRE" }
-    for _, n in ipairs(names) do
-        if key_bindings then
-            local bind = key_bindings[n]
-            if bind then BLOCKED[bind] = true end
-        end
+    if not key_bindings then return end
+    local rebuilt = {}
+    for i = 1, #BIND_NAMES do
+        local bind = key_bindings[BIND_NAMES[i]]
+        if bind ~= nil then rebuilt[bind] = true end
+    end
+    if next(rebuilt) ~= nil then
+        BLOCKED = rebuilt
     end
 end
 
-local function actor_in_zone()
-    if not db or not db.actor then return false end
-    local ok_pos, apos = pcall(function() return db.actor:position() end)
-    if not ok_pos or not apos then return false end
-    if not tonumber(apos.x) or not tonumber(apos.y) or not tonumber(apos.z) then return false end
-    local ok_lvl, lvl = pcall(function() return level.name() end)
-    if not ok_lvl or type(lvl) ~= "string" or lvl == "" then return false end
-    local ok_geo, inside = pcall(function() return pos_in_safezone(apos, lvl) end)
-    if not ok_geo then return false end
-    return inside == true
+local function ensure_blocklist()
+    if next(BLOCKED) == nil then
+        pcall(build_blocklist)
+    end
+end
+
+local function fire_hook(...)
+    if enforced then return false end
+    if prev_CActor_Fire then return prev_CActor_Fire(...) end
+    return true
+end
+
+local function install_fire_hook()
+    if fire_hook_installed then return end
+    local prev = rawget(_G, "CActor_Fire")
+    prev_CActor_Fire = (type(prev) == "function") and prev or nil
+    _G.CActor_Fire = fire_hook
+    fire_hook_installed = true
+end
+
+local function set_weapon_locked(locked)
+    -- Never touch Actor() when no actor exists (menu / net_destroy / level
+    -- change): the engine binding dereferences Actor() without a null check.
+    if not (db and db.actor) then
+        if not locked then weapon_hidden = false end
+        return
+    end
+    -- level.actor_set_safemode is the Anomaly scripting alias; the engine
+    -- binding is game.actor_lower_weapon (same C function). Call both
+    -- defensively so whichever table exists does the work.
+    pcall(function() if level and level.actor_set_safemode then level.actor_set_safemode(locked) end end)
+    pcall(function() if game and game.actor_lower_weapon then game.actor_lower_weapon(locked) end end)
+
+    if locked then
+        local lowered = false
+        pcall(function()
+            if game and game.actor_weapon_lowered then
+                lowered = game.actor_weapon_lowered() and true or false
+            end
+        end)
+        if not lowered then
+            pcall(function() db.actor:hide_weapon() end)
+            weapon_hidden = true
+        end
+    elseif weapon_hidden then
+        pcall(function() db.actor:restore_weapon() end)
+        weapon_hidden = false
+    end
+end
+
+local function notify_hud(locked)
+    if zone_hud and zone_hud.notify_safezone then
+        pcall(function()
+            zone_hud.notify_safezone(locked and true or false, locked and (safe_zone_id or "") or "")
+        end)
+    end
+end
+
+local function apply_enter()
+    pcall(install_fire_hook)
+    pcall(function() set_weapon_locked(true) end)
+    notify_hud(true)
+end
+
+local function apply_exit()
+    pcall(function() set_weapon_locked(false) end)
+    notify_hud(false)
+end
+
+local function refresh_enforcement()
+    local locked = packet_locked or auth_locked
+    if locked == enforced then return end
+    enforced = locked
+    if locked then
+        apply_enter()
+    else
+        apply_exit()
+    end
+end
+
+-- SAFEZONE_STATE (0x0020): locked u8 + zoneID[32]. Packet state drives the
+-- banner/zone id; the atomic poll below only reconciles enforcement.
+function on_safezone_state(pkt, offset)
+    pcall(function()
+        local locked, pos = zone_net.read_uint8(pkt, offset)
+        if locked == nil then return end
+        local zid = ""
+        pcall(function()
+            local raw = zone_net.read_string(pkt, pos, 32)
+            if type(raw) == "string" then zid = raw:gsub("%z+", "") end
+        end)
+        packet_locked = (locked == 1)
+        if packet_locked and zid ~= "" then safe_zone_id = zid end
+        refresh_enforcement()
+    end)
+end
+
+local function poll_authoritative()
+    if not (ZoneNet and ZoneNet.IsInSafeZone) then
+        auth_locked = false
+        refresh_enforcement()
+        return
+    end
+    local connected = true
+    pcall(function()
+        if ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+    if not connected then
+        -- Never leave local enforcement sticky on a dead session; the
+        -- explicit disconnect path also calls reset().
+        auth_locked = false
+        refresh_enforcement()
+        return
+    end
+    local ok, res = pcall(function() return ZoneNet:IsInSafeZone() end)
+    auth_locked = (ok and res == true)
+    refresh_enforcement()
+end
+
+local function on_actor_update()
+    local tg = 0
+    pcall(function() tg = time_global() end)
+    if type(tg) ~= "number" then return end
+    if tg - last_poll < POLL_INTERVAL_MS then return end
+    last_poll = tg
+    pcall(poll_authoritative)
+end
+
+-- Hard damage cancel when either the victim or (for direct hits) the
+-- draftsman is inside a safe zone, in addition to zeroing the power.
+local function on_before_hit(victim, s_hit, bone_id, flags)
+    if not victim or not s_hit then return end
+    pcall(function()
+        local draftsman = nil
+        pcall(function() draftsman = s_hit.draftsman end)
+
+        local block = object_in_safezone(victim)
+        if not block and draftsman ~= nil then
+            block = object_in_safezone(draftsman)
+        end
+        if not block then return end
+
+        pcall(function() s_hit.power = 0 end)
+        if type(flags) == "table" then
+            flags.ret_value = false
+            flags.result = false
+            flags.override = true
+        end
+    end)
 end
 
 local function on_before_key_press(dik, bind, dis, flags)
     pcall(function()
-        if actor_in_zone() and flags and BLOCKED[bind] then flags.ret_value = false end
+        if not enforced then return end
+        ensure_blocklist()
+        if flags and BLOCKED[bind] then flags.ret_value = false end
     end)
 end
 
 local function on_before_key_hold(dik, bind, dis, flags)
     pcall(function()
-        if actor_in_zone() and flags and BLOCKED[bind] then flags.ret_value = false end
+        if not enforced then return end
+        ensure_blocklist()
+        if flags and BLOCKED[bind] then flags.ret_value = false end
     end)
-end
-
-function on_safezone_state(pkt, offset)
-    local ok_r, locked, pos = pcall(function() return zone_net.read_uint8(pkt, offset) end)
-    if not ok_r then return end
-    local ok_s, zone_id_raw, _ = pcall(function() return zone_net.read_string(pkt, pos, 32) end)
-    if not ok_s then return end
-    local zid = zone_id_raw and zone_id_raw:gsub("%z+", "") or ""
-
-    local is_locked = (locked == 1)
-
-    safe_zone_active = is_locked
-    in_safe_zone = is_locked
-
-    if is_locked then
-        safe_zone_id = zid
-        if zone_hud and zone_hud.notify_safezone then
-            pcall(function() zone_hud.notify_safezone(true, zid) end)
-        end
-    else
-        safe_zone_id = ""
-        if zone_hud and zone_hud.notify_safezone then
-            pcall(function() zone_hud.notify_safezone(false, "") end)
-        end
-    end
-end
-
-function on_before_hit(victim, s_hit, bone_id)
-    if not victim or not s_hit then return end
-    pcall(function()
-        local ok_pos, vpos = pcall(function() return victim:position() end)
-        if not ok_pos or not vpos then return end
-
-        local cur_level = nil
-        local ok_lvl, lvl = pcall(function() return level.name() end)
-        if ok_lvl and type(lvl) == "string" and lvl ~= "" then
-            cur_level = lvl
-        else
-            cur_level = nil
-        end
-
-        local ok_geo, inside = pcall(function() return pos_in_safezone(vpos, cur_level) end)
-        if not ok_geo or inside ~= true then return end
-
-        pcall(function() s_hit.power = 0 end)
-    end)
-end
-
-function reset()
-    safe_zone_active = false
-    in_safe_zone = false
-    safe_zone_id = ""
-    if zone_hud and zone_hud.notify_safezone then
-        pcall(function() zone_hud.notify_safezone(false, "") end)
-    end
-end
-
-function on_disconnect()
-    reset()
 end
 
 local function on_level_changing()
     reset()
 end
 
+function reset()
+    packet_locked = false
+    auth_locked = false
+    enforced = false
+    safe_zone_id = ""
+    pcall(function() set_weapon_locked(false) end)
+    notify_hud(false)
+end
+
+function on_disconnect()
+    reset()
+end
+
 function is_in_safe_zone()
-    return safe_zone_active == true or in_safe_zone == true
+    return enforced == true
 end
 
 function get_safe_zone_id()
@@ -150,14 +292,25 @@ function get_safe_zone_id()
 end
 
 function on_game_start()
-    build_blocklist()
-    if RegisterScriptCallback then
-        pcall(function() RegisterScriptCallback("actor_on_before_hit", on_before_hit) end)
-        pcall(function() RegisterScriptCallback("npc_on_before_hit", on_before_hit) end)
-        pcall(function() RegisterScriptCallback("monster_on_before_hit", on_before_hit) end)
-        pcall(function() RegisterScriptCallback("on_level_changing", on_level_changing) end)
-        pcall(function() RegisterScriptCallback("actor_on_net_destroy", reset) end)
-        pcall(function() RegisterScriptCallback("on_before_key_press", on_before_key_press) end)
-        pcall(function() RegisterScriptCallback("on_before_key_hold", on_before_key_hold) end)
+    if registered then return end
+    registered = true
+    pcall(build_blocklist)
+    pcall(install_fire_hook)
+
+    local function reg(name, fn)
+        pcall(function()
+            if RegisterScriptCallback then
+                RegisterScriptCallback(name, fn)
+            end
+        end)
     end
+
+    reg("actor_on_before_hit", on_before_hit)
+    reg("npc_on_before_hit", on_before_hit)
+    reg("monster_on_before_hit", on_before_hit)
+    reg("on_level_changing", on_level_changing)
+    reg("actor_on_net_destroy", reset)
+    reg("on_before_key_press", on_before_key_press)
+    reg("on_before_key_hold", on_before_key_hold)
+    reg("actor_on_update", on_actor_update)
 end

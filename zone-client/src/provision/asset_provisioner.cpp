@@ -211,21 +211,25 @@ namespace AssetProvisioner
         }
 
         // 1. Iterate through compile-time embedded assets.
-        //    Script files and UI XML files are always overwritten (mod code and UI layout must match DLL).
-        //    Config files are written only if missing (preserve user customizations).
+        //    Script files, UI XML files, and zone localization text are always
+        //    overwritten (mod code, UI layout, and localization must match DLL).
+        //    Other config files are written only if missing (preserve user
+        //    customizations).
         for (size_t i = 0; i < g_EmbeddedAssetsCount; ++i)
         {
             const auto& asset = g_EmbeddedAssets[i];
             std::wstring fullPath = root + L"\\" + asset.relativePath;
             std::string content(asset.data, asset.size);
 
-            // Detect script files and UI XML files — always overwrite
+            // Detect script files, UI XML files, and configs/text/*/ui_zone.xml — always overwrite
             std::wstring rel(asset.relativePath);
             bool isScript = (rel.size() >= 7 && rel.compare(rel.size() - 7, 7, L".script") == 0);
             bool isUiXml  = (rel.find(L"zone_ui_server_list.xml") != std::wstring::npos) ||
                             (rel.find(L"configs\\ui\\") != std::wstring::npos);
+            bool isZoneText = (rel.find(L"configs\\text\\") != std::wstring::npos) &&
+                              (rel.size() >= 11 && rel.compare(rel.size() - 11, 11, L"ui_zone.xml") == 0);
 
-            if (isScript || isUiXml)
+            if (isScript || isUiXml || isZoneText)
                 OverwriteFile(fullPath, content);
             else
                 WriteFileIfMissing(fullPath, content);

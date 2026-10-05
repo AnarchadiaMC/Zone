@@ -27,6 +27,14 @@ namespace
     std::atomic<uint32_t> g_SessionID = 0;
     std::atomic<uint32_t> g_Ping = 0;
     std::atomic<bool> g_InSafeZone = false;
+    std::atomic<bool> g_PendingCreate = false;
+    std::atomic<bool> g_HasCharacter = false;
+    float g_SpawnX = 0.0f;
+    float g_SpawnY = 0.0f;
+    float g_SpawnZ = 0.0f;
+    uint8_t g_StartLevel = 0;
+    uint8_t g_EcoTierCache = 0;
+    char g_Faction[16] = {};
     
     std::string g_LastError;
     
@@ -63,6 +71,7 @@ namespace
         int16_t yaw = 0, pitch = 0;
         int16_t vx = 0, vy = 0, vz = 0;
         uint16_t animflags = 0;
+        uint16_t gvid = 0;
         bool updated = false;
     } g_Transform;
     std::mutex g_TransformMutex;
@@ -196,7 +205,14 @@ namespace
                         std::lock_guard<std::mutex> lock(g_StateMutex);
                         g_State = DISCONNECTED;
                         g_LastError = "Server connection timed out";
+                        g_SessionID = 0;
+                        g_SpawnX = 0.0f; g_SpawnY = 0.0f; g_SpawnZ = 0.0f;
+                        g_StartLevel = 0; g_EcoTierCache = 0;
+                        memset(g_Faction, 0, sizeof(g_Faction));
                     }
+                    g_PendingCreate.store(false);
+                    g_HasCharacter.store(false);
+                    g_InSafeZone.store(false, std::memory_order_release);
                     g_StateCV.notify_all();
                     continue;
                 }
@@ -225,6 +241,7 @@ namespace
                             ct.yaw = g_Transform.yaw; ct.pitch = g_Transform.pitch;
                             ct.velX = g_Transform.vx; ct.velY = g_Transform.vy; ct.velZ = g_Transform.vz;
                             ct.animFlags = g_Transform.animflags;
+                            ct.gvid = g_Transform.gvid;
                             send = true;
                         }
                     }
@@ -275,7 +292,7 @@ namespace
 
                         if (hdr->opcode == (uint16_t)Opcode::HANDSHAKE_RES)
                         {
-                            if (res >= (int)(sizeof(ZO_Header) + sizeof(HandshakeRes)))
+                            if (res >= (int)(sizeof(ZO_Header) + sizeof(HandshakeRes) - 17))
                             {
                                 HandshakeRes* hr = (HandshakeRes*)(recvBuf + sizeof(ZO_Header));
                                 // PRODUCTION FIX: honor status (0=ok, 1=full,
@@ -293,6 +310,11 @@ namespace
                                     default: g_LastError = "Handshake rejected: status " + std::to_string(hr->status); break;
                                     }
                                     g_SessionID = 0;
+                                    g_PendingCreate.store(false);
+                                    g_HasCharacter.store(false);
+                                    g_SpawnX = 0.0f; g_SpawnY = 0.0f; g_SpawnZ = 0.0f;
+                                    g_StartLevel = 0; g_EcoTierCache = 0;
+                                    memset(g_Faction, 0, sizeof(g_Faction));
                                     g_State = DISCONNECTED;
                                     g_StateCV.notify_all();
                                 }
@@ -301,9 +323,63 @@ namespace
                                     g_SessionID = hr->sessionID;
                                     {
                                         std::lock_guard<std::mutex> lock(g_StateMutex);
+                                        g_SpawnX = hr->spawnX; g_SpawnY = hr->spawnY; g_SpawnZ = hr->spawnZ;
+                                        g_EcoTierCache = hr->ecoTier;
+                                        size_t payloadLen = (size_t)res - sizeof(ZO_Header);
+                                        if (payloadLen >= sizeof(HandshakeRes) - 16)
+                                        {
+                                            uint8_t hasChar = *(uint8_t*)((char*)hr + sizeof(HandshakeRes) - 17);
+                                            g_HasCharacter.store(hasChar != 0);
+                                            g_PendingCreate.store(hasChar == 0);
+                                            if (payloadLen >= sizeof(HandshakeRes))
+                                            {
+                                                memcpy(g_Faction, (char*)hr + sizeof(HandshakeRes) - 16, 16);
+                                            }
+                                            else
+                                            {
+                                                memset(g_Faction, 0, sizeof(g_Faction));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            g_HasCharacter.store(true);
+                                            g_PendingCreate.store(false);
+                                            memset(g_Faction, 0, sizeof(g_Faction));
+                                        }
                                         g_State = CONNECTED;
                                     }
                                     g_StateCV.notify_all();
+                                }
+                            }
+                        }
+                        else if (hdr->opcode == (uint16_t)Opcode::SHOW_START)
+                        {
+                            size_t payloadLen = (size_t)res - sizeof(ZO_Header);
+                            if (payloadLen >= 15)
+                            {
+                                char* p = recvBuf + sizeof(ZO_Header);
+                                uint8_t lvl = *(uint8_t*)(p + 0);
+                                float sx, sy, sz;
+                                memcpy(&sx, p + 1, 4); memcpy(&sy, p + 5, 4); memcpy(&sz, p + 9, 4);
+                                uint8_t eco = *(uint8_t*)(p + 14);
+                                {
+                                    std::lock_guard<std::mutex> lock(g_StateMutex);
+                                    g_StartLevel = lvl;
+                                    g_SpawnX = sx; g_SpawnY = sy; g_SpawnZ = sz;
+                                    g_EcoTierCache = eco;
+                                }
+                                g_PendingCreate.store(true);
+                                uint32_t head = g_RingHead.load(std::memory_order_relaxed);
+                                uint32_t nextHead = (head + 1) % 256;
+                                if (nextHead != g_RingTail.load(std::memory_order_acquire))
+                                {
+                                    g_Ring[head].len = (size_t)res;
+                                    memcpy(g_Ring[head].data, recvBuf, res);
+                                    g_RingHead.store(nextHead, std::memory_order_release);
+                                }
+                                else
+                                {
+                                    g_DroppedPackets.fetch_add(1, std::memory_order_relaxed);
                                 }
                             }
                         }
@@ -317,8 +393,13 @@ namespace
                                 std::lock_guard<std::mutex> lock(g_StateMutex);
                                 g_LastError = "Disconnected by server (kick)";
                                 g_SessionID = 0;
+                                g_SpawnX = 0.0f; g_SpawnY = 0.0f; g_SpawnZ = 0.0f;
+                                g_StartLevel = 0; g_EcoTierCache = 0;
+                                memset(g_Faction, 0, sizeof(g_Faction));
                                 g_State = DISCONNECTED;
                             }
+                            g_PendingCreate.store(false);
+                            g_HasCharacter.store(false);
                             g_InSafeZone.store(false, std::memory_order_release);
                             g_StateCV.notify_all();
                         }
@@ -441,7 +522,12 @@ namespace NetClient
             }
             g_State = DISCONNECTED;
             g_SessionID = 0;
+            g_SpawnX = 0.0f; g_SpawnY = 0.0f; g_SpawnZ = 0.0f;
+            g_StartLevel = 0; g_EcoTierCache = 0;
+            memset(g_Faction, 0, sizeof(g_Faction));
         }
+        g_PendingCreate.store(false);
+        g_HasCharacter.store(false);
         g_InSafeZone.store(false, std::memory_order_release);
         g_StateCV.notify_all();
 
@@ -499,6 +585,11 @@ namespace NetClient
         g_LastConnectTime = g_ConnectStartTime - std::chrono::milliseconds(g_ConnectBackoffMs + 1);
         g_LastPacketReceivedTime = g_ConnectStartTime;
         g_SessionID = 0;
+        g_PendingCreate.store(false);
+        g_HasCharacter.store(false);
+        g_SpawnX = 0.0f; g_SpawnY = 0.0f; g_SpawnZ = 0.0f;
+        g_StartLevel = 0; g_EcoTierCache = 0;
+        memset(g_Faction, 0, sizeof(g_Faction));
         g_InSafeZone.store(false, std::memory_order_release);
         g_LastError.clear();
 
@@ -506,14 +597,41 @@ namespace NetClient
         g_StateCV.notify_all();
     }
 
-    void SendTransform(const Transform& transform)
+    void SendTransform(const Transform& transform, uint16_t gvid)
     {
         std::lock_guard<std::mutex> lock(g_TransformMutex);
         g_Transform.x = transform.x; g_Transform.y = transform.y; g_Transform.z = transform.z;
         g_Transform.yaw = transform.yaw; g_Transform.pitch = transform.pitch;
         g_Transform.vx = transform.vx; g_Transform.vy = transform.vy; g_Transform.vz = transform.vz;
         g_Transform.animflags = transform.animflags;
+        g_Transform.gvid = gvid;
         g_Transform.updated = true;
+    }
+
+    void SendLevelChange(const std::string& level)
+    {
+        if (g_State != CONNECTED) return;
+        LevelChange lc = {};
+        size_t n = std::min(level.length(), sizeof(lc.level) - 1);
+        memcpy(lc.level, level.c_str(), n);
+        ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::LEVEL_CHANGE, sizeof(lc) };
+        char buf[sizeof(hdr) + sizeof(lc)];
+        memcpy(buf, &hdr, sizeof(hdr));
+        memcpy(buf + sizeof(hdr), &lc, sizeof(lc));
+        SendPacket(buf, sizeof(buf));
+    }
+
+    void SendPlayerVisual(const std::string& visual)
+    {
+        if (g_State != CONNECTED) return;
+        PlayerVisual pv = {};
+        size_t n = std::min(visual.length(), sizeof(pv.visual) - 1);
+        memcpy(pv.visual, visual.c_str(), n);
+        ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::PLAYER_VISUAL, sizeof(pv) };
+        char buf[sizeof(hdr) + sizeof(pv)];
+        memcpy(buf, &hdr, sizeof(hdr));
+        memcpy(buf + sizeof(hdr), &pv, sizeof(pv));
+        SendPacket(buf, sizeof(buf));
     }
 
     bool PollEvent(char* outBuf, size_t maxLen, size_t& outLen)
@@ -572,6 +690,23 @@ namespace NetClient
     
     bool IsConnected() { return g_State == CONNECTED; }
     bool IsInSafeZone() { return g_InSafeZone.load(std::memory_order_acquire); }
+    bool IsPendingCreate() { return g_PendingCreate.load(std::memory_order_acquire); }
+    bool HasCharacter() { return g_HasCharacter.load(std::memory_order_acquire); }
+    NetClient::Spawn GetSpawn()
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        NetClient::Spawn s;
+        s.x = g_SpawnX; s.y = g_SpawnY; s.z = g_SpawnZ;
+        s.level = g_StartLevel; s.ecoTier = g_EcoTierCache;
+        return s;
+    }
+    std::string GetFaction()
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        size_t n = 0;
+        while (n < sizeof(g_Faction) && g_Faction[n] != '\0') n++;
+        return std::string(g_Faction, n);
+    }
     
     void GetSessionInfo(uint32_t& outSessionID, uint32_t& outPing)
     {
@@ -603,5 +738,109 @@ namespace NetClient
         memcpy(buf, &hdr, sizeof(hdr));
         memcpy(buf + sizeof(hdr), &ct, sizeof(ct));
         SendPacket(buf, sizeof(hdr) + sizeof(ct));
+    }
+
+    bool SendCharacterSelect(const std::string& faction, uint32_t money, const std::string& items)
+    {
+        if (g_State != CONNECTED) return false;
+        CharacterSelect cs = {};
+        size_t flen = std::min(faction.length(), sizeof(cs.faction) - 1);
+        memcpy(cs.faction, faction.c_str(), flen);
+        cs.money = money;
+        size_t ilen = std::min(items.length(), sizeof(cs.items) - 1);
+        memcpy(cs.items, items.c_str(), ilen);
+        ZO_Header hdr = { 0x5A4F, 1, 1, ++g_Sequence, (uint16_t)Opcode::CHARACTER_SELECT, sizeof(cs) };
+        char buf[sizeof(hdr) + sizeof(cs)];
+        memcpy(buf, &hdr, sizeof(hdr));
+        memcpy(buf + sizeof(hdr), &cs, sizeof(cs));
+        SendPacket(buf, sizeof(buf));
+        return true;
+    }
+
+    int QueryServer(const std::string& ip, uint16_t port, char* outBuf, int outBufLen, int timeoutMs)
+    {
+        if (ip.empty() || !outBuf || outBufLen <= 0 || port == 0)
+            return -1;
+
+        // Dedicated temporary socket + local sequence: never touches the
+        // session socket, the send mutex, or the event ring, so this is safe
+        // to call from any thread while the net thread is running.
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+            return -1;
+
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET)
+        {
+            WSACleanup();
+            return -1;
+        }
+
+        int result = -1;
+        sockaddr_in target = {};
+        target.sin_family = AF_INET;
+        target.sin_port = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &target.sin_addr) != 1)
+        {
+            closesocket(sock);
+            WSACleanup();
+            return result;
+        }
+
+        uint32_t seq = 1;
+        ZO_Header hdr = { 0x5A4F, 1, 1, seq, (uint16_t)Opcode::SERVER_QUERY, 0 };
+        int sent = sendto(sock, (const char*)&hdr, sizeof(hdr), 0, (sockaddr*)&target, sizeof(target));
+        if (sent == SOCKET_ERROR)
+        {
+            closesocket(sock);
+            WSACleanup();
+            return -2;
+        }
+
+        result = -3;
+        auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 0);
+        for (;;)
+        {
+            auto now = std::chrono::steady_clock::now();
+            long long remainingMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            if (remainingMs < 0) remainingMs = 0;
+
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(sock, &readfds);
+            timeval tv;
+            tv.tv_sec = (long)(remainingMs / 1000);
+            tv.tv_usec = (long)((remainingMs % 1000) * 1000);
+            int sel = select(0, &readfds, nullptr, nullptr, &tv);
+            if (sel <= 0)
+                break;
+
+            char recvBuf[1500];
+            sockaddr_in from;
+            int fromLen = sizeof(from);
+            int res = recvfrom(sock, recvBuf, sizeof(recvBuf), 0, (sockaddr*)&from, &fromLen);
+            if (res < (int)sizeof(ZO_Header))
+                continue;
+
+            ZO_Header* rhdr = (ZO_Header*)recvBuf;
+            if (rhdr->magic != 0x5A4F || rhdr->opcode != (uint16_t)Opcode::SERVER_QUERY_RES)
+                continue;
+
+            int payloadLen = res - (int)sizeof(ZO_Header);
+            if (payloadLen > outBufLen)
+            {
+                result = -4;
+                break;
+            }
+            memcpy(outBuf, recvBuf + sizeof(ZO_Header), payloadLen);
+            result = payloadLen;
+            break;
+        }
+
+        closesocket(sock);
+        WSACleanup();
+        return result;
     }
 }

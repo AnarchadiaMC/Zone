@@ -92,6 +92,14 @@ local function load_config()
 end
 
 function on_game_start()
+    -- Ensure safezone enforcement is registered even if the engine's
+    -- per-script on_game_start ordering changes (idempotent there).
+    pcall(function()
+        if zone_safezone and zone_safezone.on_game_start then
+            zone_safezone.on_game_start()
+        end
+    end)
+
     if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) then
         printf("Zone: ZoneClient.dll native library not loaded! Inject the DLL first.")
         return
@@ -144,4 +152,46 @@ end
 
 function get_config()
     return config
+end
+-- on_show_start is owned by zone_net (ZoneNet polyfill already exists).
+-- Delegate here instead of opening the peer-faction UI a second time.
+function on_show_start()
+    pcall(function()
+        if zone_net and zone_net.on_show_start then zone_net.on_show_start() end
+    end)
+end
+function on_before_save_input()
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+    if connected then return true end
+    return false
+end
+function on_before_load_input()
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+    if connected then
+        pcall(function()
+            if db and db.actor then db.actor:give_game_news("Zone", "Disconnect before loading.", "ui_inGame2_PDA_icon", 0, 3000, 0) end
+        end)
+        return true
+    end
+    return false
+end
+function get_server_spawn()
+    local x, y, z = 0, 0, 0
+    pcall(function()
+        if ZoneNet and ZoneNet.GetSpawn then x, y, z = ZoneNet:GetSpawn() end
+    end)
+    return x, y, z
+end
+function has_server_character()
+    local has = false
+    pcall(function()
+        if ZoneNet and ZoneNet.HasCharacter then has = ZoneNet:HasCharacter() and true or false end
+    end)
+    return has
 end

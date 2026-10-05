@@ -5,7 +5,15 @@ local ffi = require("ffi")
 
 local last_tick = 0
 local TICK_RATE_MS = 33 -- ~30Hz
-local last_pos = nil
+local faction_ui_opened = false
+local faction_ui = nil
+local was_connected = false
+local last_level_sent = nil
+local last_visual_sent = nil
+local last_visual_check = 0
+local VISUAL_CHECK_MS = 1000
+local DEFAULT_VISUAL = "actors\\stalker_neutral\\stalker_neutral_1"
+local zone_callbacks_registered = false
 
 function read_uint8(pkt, pos)
     return string.byte(pkt, pos), pos + 1
@@ -21,23 +29,58 @@ function read_uint32_le(pkt, pos)
     return b1 + (b2 * 256) + (b3 * 65536) + (b4 * 16777216), pos + 4
 end
 
+local function clean_cstring(raw)
+    if type(raw) ~= "string" then return "" end
+    local z = string.find(raw, "%z")
+    if z then raw = string.sub(raw, 1, z - 1) end
+    return raw
+end
+
+-- OpServerQueryRes (0x0007) payload:
+-- name[32] map[32] players u8 max u8 mode u8 locked u8 proto u8 tick u8
+local function parse_server_query_response(raw)
+    local info = { name = "", map = "", players = 0, maxPlayers = 0,
+                   mode = 0, locked = 0, proto = 0, tick = 0 }
+    if type(raw) ~= "string" then return info end
+    local len = string.len(raw)
+    if len >= 32 then info.name = clean_cstring(string.sub(raw, 1, 32)) end
+    if len >= 64 then info.map = clean_cstring(string.sub(raw, 33, 64)) end
+    local fields = { "players", "maxPlayers", "mode", "locked", "proto", "tick" }
+    local pos = 65
+    for i = 1, #fields do
+        if pos <= len then info[fields[i]] = string.byte(raw, pos) or 0 end
+        pos = pos + 1
+    end
+    return info
+end
+
 ffi.cdef[[
     typedef union { float f; uint8_t b[4]; } znet_float_cast;
     void ZN_Connect(const char* ip, double port, const char* uuid, double hwid, const char* nick);
     void ZN_Disconnect();
-    void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint8_t animflags);
+    void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, uint8_t flags, uint16_t gvid);
     bool ZN_PollEvent(char* buf, size_t* len);
     bool ZN_IsInSafeZone();
     bool ZN_IsConnected();
     void ZN_GetSessionInfo(uint32_t* sessionID, uint32_t* ping);
     void ZN_SendChatText(const char* text);
     const char* ZN_GetLastError();
+    bool ZN_IsPendingCreate();
+    bool ZN_HasCharacter();
+    void ZN_GetSpawn(float* x, float* y, float* z, uint8_t* level, uint8_t* ecoTier);
+    const char* ZN_GetFaction();
+    bool ZN_SendCharacterSelect(const char* faction, double money, const char* items_str);
+    void ZN_SendLevelChange(const char* level);
+    void ZN_SendPlayerVisual(const char* visual);
+    int ZN_QueryServer(const char* ip, int port, char* out, int outLen, int timeoutMs);
 ]]
 
 -- L-31: Pre-allocated FFI buffers at file/module scope
 local g_poll_buf = ffi.new("char[1500]")
 local g_poll_len = ffi.new("size_t[1]")
 local g_float_cast = ffi.new("znet_float_cast")
+local QUERY_BUF_LEN = 1024
+local g_query_buf = ffi.new("char[1024]")
 
 local zone_client = nil
 pcall(function()
@@ -55,8 +98,11 @@ local xrr_was_active = false
 -- L-06: Exported reset_state for reconnecting
 function reset_state()
     last_tick = 0
-    last_pos = nil
     xrr_was_active = false
+    was_connected = false
+    last_level_sent = nil
+    last_visual_sent = nil
+    last_visual_check = 0
 end
 
 -- Polyfill ZoneNet global object for compatibility
@@ -67,10 +113,60 @@ function ZoneNet:Connect(ip, port, uuid, hwid, nick)
 end
 function ZoneNet:Disconnect()
     reset_state()
-    if zone_client then zone_client.ZN_Disconnect() end
+    if zone_client then pcall(function() zone_client.ZN_Disconnect() end) end
+    pcall(function()
+        if zone_safezone and zone_safezone.reset then zone_safezone.reset() end
+    end)
 end
-function ZoneNet:SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags)
-    if zone_client then zone_client.ZN_SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags) end
+function ZoneNet:SendTransform(x, y, z, yaw, pitch, flags, gvid)
+    if zone_client then
+        zone_client.ZN_SendTransform(x, y, z, yaw or 0, pitch or 0, flags or 0, gvid or 0)
+    end
+end
+function ZoneNet:SendLevelChange(level_name)
+    if not zone_client then return false end
+    local ok = pcall(function()
+        zone_client.ZN_SendLevelChange(level_name or "")
+    end)
+    return ok
+end
+function ZoneNet:SendPlayerVisual(visual)
+    if not zone_client then return false end
+    local ok = pcall(function()
+        zone_client.ZN_SendPlayerVisual(visual or "")
+    end)
+    return ok
+end
+-- Synchronous server query (server browser). Returns the parsed
+-- OpServerQueryRes payload table plus measured ping, or nil, error.
+function ZoneNet:QueryServer(ip, port, timeout_ms)
+    if not zone_client then return nil, "client not loaded" end
+    local ip_s = ip
+    if type(ip_s) ~= "string" or ip_s == "" then ip_s = "127.0.0.1" end
+    local port_n = tonumber(port) or 27015
+    port_n = math.floor(port_n)
+    if port_n < 1 or port_n > 65535 then return nil, "invalid port" end
+    local timeout = tonumber(timeout_ms) or 1500
+    timeout = math.floor(timeout)
+    if timeout < 1 then timeout = 1 end
+    if timeout > 10000 then timeout = 10000 end
+
+    local started = os.clock()
+    local ok, res = pcall(function()
+        return zone_client.ZN_QueryServer(ip_s, port_n, g_query_buf, QUERY_BUF_LEN, timeout)
+    end)
+    if not ok then return nil, "query call failed" end
+    if type(res) ~= "number" or res <= 0 then
+        return nil, string.format("no response (%s)", tostring(res))
+    end
+    if res > QUERY_BUF_LEN then res = QUERY_BUF_LEN end
+
+    local elapsed_ms = math.floor(((os.clock() - started) * 1000) + 0.5)
+    if elapsed_ms < 0 then elapsed_ms = 0 end
+
+    local info = parse_server_query_response(ffi.string(g_query_buf, res))
+    info.ping_ms = elapsed_ms
+    return info
 end
 function ZoneNet:PollEvent()
     if not zone_client then return nil end
@@ -107,6 +203,76 @@ end
 function ZoneNet:IsClientLoaded()
     return is_client_loaded()
 end
+function ZoneNet:IsPendingCreate()
+    return zone_client and zone_client.ZN_IsPendingCreate() or false
+end
+function ZoneNet:HasCharacter()
+    return zone_client and zone_client.ZN_HasCharacter() or false
+end
+function ZoneNet:GetSpawn()
+    if not zone_client then return 0, 0, 0 end
+    local x = ffi.new("float[1]")
+    local y = ffi.new("float[1]")
+    local z = ffi.new("float[1]")
+    -- Real C signature is 5 pointers (level/ecoTier out params) - pass
+    -- throwaway buffers instead of calling the old 3-arg ABI bug.
+    local lvl = ffi.new("uint8_t[1]")
+    local eco = ffi.new("uint8_t[1]")
+    local ok = pcall(function() zone_client.ZN_GetSpawn(x, y, z, lvl, eco) end)
+    if not ok then return 0, 0, 0 end
+    return x[0], y[0], z[0], lvl[0], eco[0]
+end
+function ZoneNet:GetFaction()
+    if not zone_client then return "" end
+    local ok, ptr = pcall(function() return zone_client.ZN_GetFaction() end)
+    if ok and ptr then
+        local ok2, s = pcall(function() return ffi.string(ptr) end)
+        if ok2 and s then return s end
+    end
+    return ""
+end
+function ZoneNet:SendCharacterSelect(faction, money, items_str)
+    if not zone_client then return false end
+    local ok, res = pcall(function() return zone_client.ZN_SendCharacterSelect(faction or "", money or 0, items_str or "") end)
+    if ok then return res end
+    return false
+end
+local function close_faction_ui()
+    pcall(function()
+        if faction_ui and faction_ui.Show then faction_ui:Show(false) end
+    end)
+    pcall(function()
+        if faction_ui and faction_ui.HideDialog then faction_ui:HideDialog() end
+    end)
+    faction_ui = nil
+end
+local function open_faction_ui_once(owner)
+    if faction_ui_opened then return end
+    faction_ui_opened = true
+    pcall(function()
+        -- Sole owner of the pending-create UI: prefer the shared global, then
+        -- the script table (per-file env isolation), then the raw UI class.
+        local open_fn = _G.open_peer_faction
+        if type(open_fn) ~= "function" and zone_ui_peer_faction then
+            open_fn = zone_ui_peer_faction.open_peer_faction
+        end
+        if type(open_fn) == "function" then
+            faction_ui = open_fn(owner)
+        elseif _G.UIZonePeerFaction then
+            local ui = _G.UIZonePeerFaction(owner)
+            if ui and ui.ShowDialog then ui:ShowDialog(true) end
+            if ui and ui.Show then ui:Show(true) end
+            faction_ui = ui
+        end
+    end)
+end
+function on_show_start(pkt, offset)
+    local pending = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsPendingCreate then pending = ZoneNet:IsPendingCreate() and true or false end
+    end)
+    if pending then open_faction_ui_once() end
+end
 
 function read_float_le(pkt, pos)
     local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
@@ -120,6 +286,10 @@ end
 function read_string(pkt, pos, len)
     return string.sub(pkt, pos, pos + len - 1), pos + len
 end
+
+-- ENTITY_ENTER_AOI v2 carries section[64] + trailing gvid u16
+-- (entityID u32, type u8, section[64], x/y/z f32, faction[16], health u8,
+-- gvid u16). Consumers (zone_dummy/zone_ai_proxy) parse the v2 layout natively.
 
 function dispatch_packet(pkt)
     if not pkt or string.len(pkt) < 12 then return end
@@ -146,16 +316,22 @@ function dispatch_packet(pkt)
     local offset = 13 -- 1-based index after 12 bytes
     
     if opcode == 0x0011 then
-        zone_dummy.on_snapshot(pkt, offset)
+        if zone_dummy and zone_dummy.on_snapshot then
+            pcall(zone_dummy.on_snapshot, pkt, offset)
+        end
     elseif opcode == 0x0012 then
         -- Fan out to BOTH player proxies (typ 1) and AI puppets (typ 0/2/3);
-        -- each handler filters by type. No live server sender yet (dormant).
-        zone_dummy.on_entity_enter(pkt, offset)
+        -- each handler filters by type and parses the v2 payload layout.
+        if zone_dummy and zone_dummy.on_entity_enter then
+            pcall(zone_dummy.on_entity_enter, pkt, offset)
+        end
         if zone_ai_proxy and zone_ai_proxy.on_entity_enter then
             pcall(zone_ai_proxy.on_entity_enter, pkt, offset)
         end
     elseif opcode == 0x0013 then
-        zone_dummy.on_entity_leave(pkt, offset)
+        if zone_dummy and zone_dummy.on_entity_leave then
+            pcall(zone_dummy.on_entity_leave, pkt, offset)
+        end
         if zone_ai_proxy and zone_ai_proxy.on_entity_leave then
             pcall(zone_ai_proxy.on_entity_leave, pkt, offset)
         end
@@ -163,49 +339,145 @@ function dispatch_packet(pkt)
         -- Stash responses have no consumer UI yet (no committed stash sender).
         -- Parse minimally and surface errors; never fatal. Future stash UI
         -- should hook here for full contents display.
-        if string.len(pkt) >= offset + 5 - 1 then
-            local stash_id, ppos = read_uint32_le(pkt, offset)
-            local status, _ = read_uint8(pkt, ppos)
-            if status ~= 0 and db.actor then
-                pcall(function()
+        pcall(function()
+            if string.len(pkt) >= offset + 5 - 1 then
+                local stash_id, ppos = read_uint32_le(pkt, offset)
+                local status, _ = read_uint8(pkt, ppos)
+                if status ~= 0 and db.actor then
                     db.actor:give_game_news("Zone", "Stash unavailable.", "ui_inGame2_PDA_icon", 0, 3000, 0)
-                end)
+                end
             end
-        end
+        end)
     elseif opcode == 0x0020 then
-        zone_safezone.on_safezone_state(pkt, offset)
+        if zone_safezone and zone_safezone.on_safezone_state then
+            pcall(zone_safezone.on_safezone_state, pkt, offset)
+        end
     elseif opcode == 0x0030 then
-        zone_worldevent.on_world_event(pkt, offset)
+        if zone_worldevent and zone_worldevent.on_world_event then
+            pcall(zone_worldevent.on_world_event, pkt, offset)
+        end
     elseif opcode == 0x0050 then
         -- 4+4+4+1 = 13 bytes; bounds-check before parsing (malicious server safe)
-        if string.len(pkt) < offset + 13 - 1 then return end
-        local target_id, pos = read_uint32_le(pkt, offset)
-        local attacker_id, pos = read_uint32_le(pkt, pos)
-        local damage, pos = read_float_le(pkt, pos)
-        local bone_id, pos = read_uint8(pkt, pos)
-        if zone_dummy and zone_dummy.on_damage_notify then
-            pcall(zone_dummy.on_damage_notify, target_id, attacker_id, damage, bone_id)
-        end
+        pcall(function()
+            if string.len(pkt) < offset + 13 - 1 then return end
+            local target_id, ppos = read_uint32_le(pkt, offset)
+            local attacker_id, ppos = read_uint32_le(pkt, ppos)
+            local damage, ppos = read_float_le(pkt, ppos)
+            local bone_id, ppos = read_uint8(pkt, ppos)
+            if zone_dummy and zone_dummy.on_damage_notify then
+                pcall(zone_dummy.on_damage_notify, target_id, attacker_id, damage, bone_id)
+            end
+        end)
     elseif opcode == 0x0060 then
         -- L-03: Chat text: sender ID (4 bytes) + text length (1 byte) + text
         -- Clamp text_len to actual payload to prevent overread on forged packets.
-        if string.len(pkt) < offset + 5 - 1 then return end
-        local sender_id, cpos = read_uint32_le(pkt, offset)
-        local text_len, cpos = read_uint8(pkt, cpos)
-        local avail = string.len(pkt) - cpos + 1
-        if text_len > avail then text_len = avail end
-        if text_len < 0 then text_len = 0 end
-        local txt, _ = read_string(pkt, cpos, text_len)
-        if db.actor and txt and txt ~= "" then
-            pcall(function()
+        pcall(function()
+            if string.len(pkt) < offset + 5 - 1 then return end
+            local sender_id, cpos = read_uint32_le(pkt, offset)
+            local text_len, cpos = read_uint8(pkt, cpos)
+            local avail = string.len(pkt) - cpos + 1
+            if text_len > avail then text_len = avail end
+            if text_len < 0 then text_len = 0 end
+            local txt, _ = read_string(pkt, cpos, text_len)
+            if db.actor and txt and txt ~= "" then
                 db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
-            end)
-        end
+            end
+        end)
     elseif opcode == 0x0070 then
         if zone_ai_proxy and zone_ai_proxy.on_ai_action then
             pcall(zone_ai_proxy.on_ai_action, pkt, offset)
         end
+    elseif opcode == 0x0071 then
+        pcall(on_show_start, pkt, offset)
+    elseif opcode == 0x0072 then
+        close_faction_ui()
     end
+end
+
+-- Level / visual replication helpers (OpLevelChange 0x0074, OpPlayerVisual 0x0075)
+local function current_level_name()
+    local lvl = nil
+    pcall(function()
+        if level and level.name then lvl = level.name() end
+    end)
+    if type(lvl) == "string" and lvl ~= "" then return lvl end
+    return nil
+end
+
+local function current_player_visual()
+    local visual = nil
+    pcall(function()
+        if db and db.actor and db.actor.get_visual_name then
+            visual = db.actor:get_visual_name()
+        end
+    end)
+    if type(visual) ~= "string" or visual == "" then
+        -- Fallback: outfit slot (7) section's "visual" key via system_ini.
+        pcall(function()
+            if not (db and db.actor) then return end
+            local outfit = db.actor:item_in_slot(7)
+            if not outfit then return end
+            local sec = outfit:section()
+            if type(sec) ~= "string" or sec == "" then return end
+            local ini = system_ini and system_ini()
+            if not ini then return end
+            local v = ini:r_string(sec, "visual")
+            if type(v) == "string" and v ~= "" then visual = v end
+        end)
+    end
+    if type(visual) ~= "string" or visual == "" then
+        visual = DEFAULT_VISUAL
+    end
+    return visual
+end
+
+local function send_level_change(force)
+    local lvl = current_level_name()
+    if not lvl then return end
+    if not force and lvl == last_level_sent then return end
+    last_level_sent = lvl
+    ZoneNet:SendLevelChange(lvl)
+end
+
+local function send_player_visual(force)
+    local visual = current_player_visual()
+    if not force and visual == last_visual_sent then return end
+    last_visual_sent = visual
+    ZoneNet:SendPlayerVisual(visual)
+end
+
+local function on_actor_first_update()
+    pcall(send_level_change, true)
+    pcall(send_player_visual, true)
+end
+
+local function on_level_changing()
+    -- If level.name() already reports the new level, send now; otherwise the
+    -- on_tick comparison and actor_on_first_update send it after the load.
+    pcall(send_level_change, false)
+    last_level_sent = nil
+    last_visual_sent = nil
+    last_visual_check = 0
+end
+
+local function on_actor_net_destroy()
+    last_level_sent = nil
+    last_visual_sent = nil
+    last_visual_check = 0
+end
+
+function on_game_start()
+    if zone_callbacks_registered then return end
+    zone_callbacks_registered = true
+    pcall(function()
+        if RegisterScriptCallback then
+            RegisterScriptCallback("actor_on_first_update", on_actor_first_update)
+            RegisterScriptCallback("on_level_changing", on_level_changing)
+            RegisterScriptCallback("actor_on_net_destroy", on_actor_net_destroy)
+        end
+    end)
+    pcall(send_level_change, true)
+    pcall(send_player_visual, true)
 end
 
 -- xrRazom guard: when co-op is live, Zone stays dormant so the two proxy
@@ -235,26 +507,28 @@ function on_tick()
     if tg - last_tick < TICK_RATE_MS then
         return
     end
-    local dt = (tg - last_tick) / 1000.0
-    if dt <= 0 or dt > 1.0 then
-        -- Clamp degenerate dt (load hitch / pause menu).
-        last_tick = tg
-        last_pos = nil
-        return
-    end
     last_tick = tg
 
-    if type(ZoneNet) == "nil" or not ZoneNet:IsConnected() then
-        last_pos = nil
+    if not ZoneNet or not ZoneNet.IsConnected or not ZoneNet:IsConnected() then
+        faction_ui_opened = false
+        pcall(close_faction_ui)
+        if was_connected then
+            was_connected = false
+            -- Server-side drop (no explicit Disconnect call): release local
+            -- safezone enforcement so weapons/input are never left locked.
+            pcall(function()
+                if zone_safezone and zone_safezone.reset then zone_safezone.reset() end
+            end)
+        end
         return
     end
+    was_connected = true
 
     -- Mutual exclusion with xrRazom: do not send Zone telemetry or consume
     -- Zone snapshots while co-op owns the world. On the transition tick,
     -- release Zone-side enforcement/proxies once so no sticky safezone
     -- holstering or ghost puppets leak into the co-op session.
     if xrr_session_active() then
-        last_pos = nil
         if not xrr_was_active then
             xrr_was_active = true
             pcall(function()
@@ -270,26 +544,27 @@ function on_tick()
         return
     end
     xrr_was_active = false
-
+    pcall(function()
+        local pending = false
+        local has = false
+        if ZoneNet.IsPendingCreate then pending = ZoneNet:IsPendingCreate() and true or false end
+        if ZoneNet.HasCharacter then has = ZoneNet:HasCharacter() and true or false end
+        if has then
+            if faction_ui ~= nil then
+                local sx, sy, sz = ZoneNet:GetSpawn()
+                if sx and db.actor then
+                    pcall(function() db.actor:set_npc_position(vector():set(sx, sy, sz)) end)
+                end
+            end
+            close_faction_ui()
+        elseif pending then
+            open_faction_ui_once()
+        end
+    end)
     if db.actor then
-        local ok_tick = pcall(function()
+        pcall(function()
             local pos = db.actor:position()
             local dir = db.actor:direction()
-
-            local vx, vy, vz = 0, 0, 0
-            if last_pos and dt > 0 then
-                vx = (pos.x - last_pos.x) / dt
-                vy = (pos.y - last_pos.y) / dt
-                vz = (pos.z - last_pos.z) / dt
-                -- Clamp to int16 wire range; server anti-cheat drops >25 m/s.
-                local function clamp16(v)
-                    if v > 30000 then return 30000 end
-                    if v < -30000 then return -30000 end
-                    return math.floor(v + 0.5)
-                end
-                vx, vy, vz = clamp16(vx), clamp16(vy), clamp16(vz)
-            end
-            last_pos = vector():set(pos)
 
             local yaw = math.atan2(dir.x, dir.z)
             local dir_y_clamped = math.max(-1.0, math.min(1.0, dir.y))
@@ -302,14 +577,22 @@ function on_tick()
             if bit.band(mstate, 4096) ~= 0 then animflags = bit.bor(animflags, 2) end -- Sprint (mcSprint = 0x1000)
             -- Basic aiming detection removed due to db.actor:is_zoom_aiming_mode() CTD
 
+            local gvid = 0
+            pcall(function() gvid = db.actor:game_vertex_id() or 0 end)
+            if gvid < 0 or gvid > 65535 then gvid = 0 end
+
             -- Send yaw * 100 and pitch * 100 matching server decoding float32(ct.Yaw)/100.0
             ZoneNet:SendTransform(pos.x, pos.y, pos.z,
                 math.floor(yaw * 100 + 0.5), math.floor(pitch * 100 + 0.5),
-                vx, vy, vz, animflags)
+                animflags, gvid)
         end)
-        if not ok_tick then
-            last_pos = nil
-        end
+    end
+
+    -- Level + visual replication: level on change, visual at 1 Hz or on change.
+    pcall(send_level_change, false)
+    if tg - last_visual_check >= VISUAL_CHECK_MS then
+        last_visual_check = tg
+        pcall(send_player_visual, false)
     end
 
     -- Poll all pending events (each dispatch isolated; one bad packet can't kill tick)

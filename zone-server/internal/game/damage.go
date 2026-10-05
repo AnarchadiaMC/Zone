@@ -58,6 +58,7 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 	attackerID := attacker.SessionID
 	attackerPos := attacker.Position
 	attackerLevel := attacker.CurrentLevel
+	attackerInSafe := attacker.InSafeZone
 	attacker.Unlock()
 
 	target.Lock()
@@ -78,9 +79,10 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 		return 0, false, "session mismatch"
 	}
 
-	// 3. Safe zone immunity (target-side only):
-	// If target.InSafeZone, return (0, false, "safe zone immunity").
-	if targetInSafe {
+	// 3. Safe zone immunity (both sides):
+	// A player inside a safe zone may neither deal nor receive damage there.
+	// Return (0, false, "safe zone immunity") when either side is protected.
+	if attackerInSafe || targetInSafe {
 		return 0, false, "safe zone immunity"
 	}
 

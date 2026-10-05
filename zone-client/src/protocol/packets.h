@@ -18,6 +18,8 @@ enum class Opcode : uint16_t {
     DISCONNECT = 0x0003, 
     HEARTBEAT = 0x0004,
     ACK = 0x0005,
+    SERVER_QUERY = 0x0006,
+    SERVER_QUERY_RES = 0x0007,
     CLIENT_TRANSFORM = 0x0010, 
     SERVER_SNAPSHOT = 0x0011,
     ENTITY_ENTER_AOI = 0x0012, 
@@ -28,7 +30,12 @@ enum class Opcode : uint16_t {
     STASH_RESPONSE = 0x0041,
     DAMAGE_NOTIFY = 0x0050,
     CHAT_TEXT = 0x0060,
-    AI_ACTION_EVENT = 0x0070
+    AI_ACTION_EVENT = 0x0070,
+    SHOW_START = 0x0071,
+    CHARACTER_SELECT = 0x0072,
+    LOAD_LEVEL = 0x0073,
+    LEVEL_CHANGE = 0x0074,
+    PLAYER_VISUAL = 0x0075
 };
 
 struct HeartbeatPayload {
@@ -54,7 +61,21 @@ struct HandshakeRes {
     float spawnZ;
     uint64_t worldTime;
     uint8_t ecoTier;
+    uint8_t hasCharacter;
+    char faction[16];
 };
+
+struct ServerQueryRes {
+    char name[32];
+    char map[32];
+    uint8_t players;
+    uint8_t maxPlayers;
+    uint8_t mode;
+    uint8_t locked;
+    uint8_t protoVer;
+    uint8_t tickRateHz;
+};
+static_assert(sizeof(ServerQueryRes) == 70, "ServerQueryRes size must be exactly 70 bytes");
 
 struct ClientTransform {
     uint32_t sessionID;
@@ -67,7 +88,9 @@ struct ClientTransform {
     int16_t velY;
     int16_t velZ;
     uint8_t animFlags;
+    uint16_t gvid;         // appended last (protocol v2)
 };
+static_assert(sizeof(ClientTransform) == 29, "ClientTransform size must be exactly 29 bytes");
 
 struct SnapshotEntry {
     uint32_t sessionID;
@@ -79,6 +102,7 @@ struct SnapshotEntry {
     uint8_t animFlags;
     uint8_t health;
 };
+static_assert(sizeof(SnapshotEntry) == 22, "SnapshotEntry size must be exactly 22 bytes");
 
 struct ServerSnapshot {
     uint8_t count;
@@ -106,17 +130,29 @@ struct ChatText {
 struct EntityEnterAoI {
     uint32_t entityID;
     uint8_t type;
-    char section[32];
+    char section[64];
     float posX;
     float posY;
     float posZ;
     char faction[16];
     uint8_t health;
+    uint16_t gvid;
 };
+static_assert(sizeof(EntityEnterAoI) == 100, "EntityEnterAoI size must be exactly 100 bytes");
 
 struct EntityLeaveAoI {
     uint32_t entityID;
 };
+
+struct LevelChange {
+    char level[32];
+};
+static_assert(sizeof(LevelChange) == 32, "LevelChange size must be exactly 32 bytes");
+
+struct PlayerVisual {
+    char visual[64];
+};
+static_assert(sizeof(PlayerVisual) == 64, "PlayerVisual size must be exactly 64 bytes");
 
 struct AIActionEvent {
     uint32_t entityID;
@@ -129,6 +165,21 @@ struct DamageNotify {
     uint32_t attackerID;
     float damage;
     uint8_t boneID;
+};
+
+struct ShowStart {
+    uint8_t level;
+    float posX;
+    float posY;
+    float posZ;
+    uint8_t flags;
+    uint8_t ecoTier;
+};
+
+struct CharacterSelect {
+    char faction[16];
+    uint32_t money;
+    char items[256];
 };
 
 #pragma pack(pop)

@@ -28,6 +28,16 @@ local function is_dll_loaded()
     return type(ZoneNet) == "table" or type(ZoneNet) == "userdata"
 end
 
+-- notify_safezone is the primary source; fall back to the client atomic so a
+-- missed 0x0020 packet cannot desync the banner (mirrors zone_safezone poll).
+local function in_safezone()
+    if safe_zone_active then return true end
+    local ok, res = pcall(function()
+        return ZoneNet and ZoneNet.IsInSafeZone and ZoneNet:IsInSafeZone()
+    end)
+    return ok and res == true
+end
+
 local function get_status_data()
     if not is_dll_loaded() then
         return false, 0, 0, "[ZO] DLL Offline", COLOR_DLL_MISSING
@@ -46,7 +56,7 @@ local function get_status_data()
         end
 
         local text, color
-        if safe_zone_active then
+        if in_safezone() then
             text = string.format("[ZO] Safe Zone | Ping: %d ms", ping)
             color = COLOR_SAFEZONE
         else

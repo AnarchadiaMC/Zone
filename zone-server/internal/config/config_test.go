@@ -43,4 +43,45 @@ admin_pipe: "\\\\.\\pipe\\zone_server_admin"
 	if cfg.DBPath != "test_zone_world.db" {
 		t.Errorf("Expected DBPath test_zone_world.db, got %s", cfg.DBPath)
 	}
+	if cfg.ServerName != "Zone Online" {
+		t.Errorf("Expected default ServerName 'Zone Online', got %q", cfg.ServerName)
+	}
+	if cfg.MapName != "l01_escape" {
+		t.Errorf("Expected default MapName 'l01_escape', got %q", cfg.MapName)
+	}
+}
+
+func TestConfigV2Keys(t *testing.T) {
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+server_name: "Custom Zone"
+map_name: "l05_bar_rostok"
+mode: 3
+locked: true
+`
+	tmpfile, err := os.CreateTemp("", "config_v2_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ServerName != "Custom Zone" || cfg.MapName != "l05_bar_rostok" {
+		t.Errorf("unexpected server/map: %q/%q", cfg.ServerName, cfg.MapName)
+	}
+	if cfg.Mode != 3 {
+		t.Errorf("Expected Mode 3, got %d", cfg.Mode)
+	}
+	if !cfg.Locked {
+		t.Error("Expected Locked true")
+	}
 }

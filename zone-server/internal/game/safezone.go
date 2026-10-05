@@ -3,6 +3,7 @@ package game
 import (
 	"database/sql"
 	"math"
+	"sync"
 )
 
 type SafeZone struct {
@@ -34,6 +35,14 @@ var defaultSafeZones = []SafeZone{
 	{"sz_jupiter_yanov", "jupiter", -40.0, 3.5, 220.0, 75.0, 20.0},
 }
 
+// safeZoneTable is the authoritative in-memory zone table. It starts as a
+// copy of defaultSafeZones so DB-less runs and tests work, and is replaced
+// wholesale by LoadSafeZones when a database is available.
+var safeZoneTable = struct {
+	sync.RWMutex
+	zones []SafeZone
+}{zones: append([]SafeZone(nil), defaultSafeZones...)}
+
 func SeedSafeZones(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -61,9 +70,50 @@ func SeedSafeZones(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// LoadSafeZones seeds the defaults when the safe_zones table is empty, then
+// loads the table into memory so operator edits apply after restart.
+func LoadSafeZones(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM safe_zones").Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		if err := SeedSafeZones(db); err != nil {
+			return err
+		}
+	}
+	rows, err := db.Query("SELECT zone_id, level_name, center_x, center_y, center_z, radius, height FROM safe_zones")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	zones := make([]SafeZone, 0, 16)
+	for rows.Next() {
+		var sz SafeZone
+		if err := rows.Scan(&sz.ZoneID, &sz.LevelName, &sz.CenterX, &sz.CenterY, &sz.CenterZ, &sz.Radius, &sz.Height); err != nil {
+			return err
+		}
+		zones = append(zones, sz)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	safeZoneTable.Lock()
+	safeZoneTable.zones = zones
+	safeZoneTable.Unlock()
+	return nil
+}
+
 func CheckSafeZone(x, y, z float32, level string) *SafeZone {
-	for i := range defaultSafeZones {
-		sz := &defaultSafeZones[i]
+	safeZoneTable.RLock()
+	defer safeZoneTable.RUnlock()
+	for i := range safeZoneTable.zones {
+		sz := safeZoneTable.zones[i]
 		if sz.LevelName != level {
 			continue
 		}
@@ -73,7 +123,7 @@ func CheckSafeZone(x, y, z float32, level string) *SafeZone {
 		distSq := dx*dx + dz*dz
 
 		if distSq <= sz.Radius*sz.Radius && math.Abs(float64(y-sz.CenterY)) <= float64(sz.Height)/2 {
-			return sz
+			return &sz
 		}
 	}
 	return nil

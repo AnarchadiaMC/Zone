@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS characters (
     reputation INTEGER NOT NULL DEFAULT 0,
     rubles INTEGER NOT NULL DEFAULT 5000,
     play_time_sec INTEGER NOT NULL DEFAULT 0,
+    profile_rev INTEGER NOT NULL DEFAULT 1,
+    dead INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS character_inventory (

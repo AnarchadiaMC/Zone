@@ -118,7 +118,22 @@ func TestHandlePacket_Handshake(t *testing.T) {
 		t.Fatal("expected HandshakeRes packet sent, got none")
 	}
 
-	r := bytes.NewReader(sink.LastPacket())
+	var rawRes []byte
+	sink.mu.Lock()
+	for i := len(sink.sent) - 1; i >= 0; i-- {
+		rr := bytes.NewReader(sink.sent[i])
+		h, err := protocol.ReadHeader(rr)
+		if err != nil || h.Opcode != protocol.OpHandshakeRes {
+			continue
+		}
+		rawRes = sink.sent[i]
+		break
+	}
+	sink.mu.Unlock()
+	if rawRes == nil {
+		t.Fatal("expected HandshakeRes packet sent, got none")
+	}
+	r := bytes.NewReader(rawRes)
 	hdr, err := protocol.ReadHeader(r)
 	if err != nil {
 		t.Fatalf("failed to read header: %v", err)
@@ -360,9 +375,8 @@ func TestTick_StaleSessionTimeout(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func TestKickSession_FlushesStateAndDisconnects(t *testing.T) {
-	s, sink, _ := setupTestServerWithDB(t)
-	dbQueue := make(chan *database.DBWriteJob, 100)
-	s.dbQueue = dbQueue
+	s, sink, db := setupTestServerWithDB(t)
+	_ = db.AutoProvision("uuid-kick-test", "hwid-kick", "KickStalker")
 	sink.Reset()
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10040}
@@ -386,13 +400,16 @@ func TestKickSession_FlushesStateAndDisconnects(t *testing.T) {
 		t.Errorf("expected session 400 to be removed from session manager")
 	}
 
-	// Check S-16: state flushed to dbQueue
-	if len(dbQueue) == 0 {
-		t.Fatal("S-16 violation: character state was not queued to database before kick")
+	// Check S-16: state flushed to DB
+	char, err := db.LoadCharacter("uuid-kick-test")
+	if err != nil {
+		t.Fatalf("LoadCharacter: %v", err)
 	}
-	job := <-dbQueue
-	if !bytes.Contains([]byte(job.Query), []byte("UPDATE characters SET pos_x=?")) {
-		t.Errorf("unexpected query: %s", job.Query)
+	if char.PosX != 12.5 || char.PosY != 3.0 || char.PosZ != 45.0 {
+		t.Errorf("expected DB pos [12.5,3,45], got [%f,%f,%f]", char.PosX, char.PosY, char.PosZ)
+	}
+	if char.Health != 75.0 {
+		t.Errorf("expected DB health 75, got %f", char.Health)
 	}
 
 	// Check disconnect packet sent
@@ -411,8 +428,6 @@ func TestKickSession_FlushesStateAndDisconnects(t *testing.T) {
 
 func TestBanPlayer_SavesStateKicksAndBreaksLoop(t *testing.T) {
 	s, _, db := setupTestServerWithDB(t)
-	dbQueue := make(chan *database.DBWriteJob, 100)
-	s.dbQueue = dbQueue
 
 	targetUUID := "uuid-ban-target"
 	otherUUID := "uuid-ban-other"
@@ -469,9 +484,16 @@ func TestBanPlayer_SavesStateKicksAndBreaksLoop(t *testing.T) {
 		t.Errorf("expected ban reason 'speedhack', got %q", reason)
 	}
 
-	// Verify S-16: character state queued to dbQueue
-	if len(dbQueue) == 0 {
-		t.Fatal("S-16 violation: character state was not queued to database before ban/kick")
+	// Verify S-16: character state flushed to DB
+	char, err := db.LoadCharacter(targetUUID)
+	if err != nil {
+		t.Fatalf("LoadCharacter: %v", err)
+	}
+	if char.PosX != 10 || char.PosY != 20 || char.PosZ != 30 {
+		t.Errorf("expected DB pos [10,20,30], got [%f,%f,%f]", char.PosX, char.PosY, char.PosZ)
+	}
+	if char.Health != 90.0 {
+		t.Errorf("expected DB health 90, got %f", char.Health)
 	}
 }
 

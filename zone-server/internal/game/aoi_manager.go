@@ -18,6 +18,7 @@ type EntityInfo struct {
 	Pos     [3]float32
 	Faction uint8
 	Health  uint16
+	Gvid    uint16
 }
 
 type AoIManager struct {
@@ -115,7 +116,7 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 	a.entries[sessID][info.ID] = true
 	a.mu.Unlock()
 
-	var sec [32]byte
+	var sec [64]byte
 	copy(sec[:], info.Section)
 	var fac [16]byte
 	fac[0] = info.Faction
@@ -129,6 +130,7 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 		PosZ:       info.Pos[2],
 		Faction:    fac,
 		Health:     uint8(info.Health),
+		Gvid:       info.Gvid,
 	}
 
 	var buf bytes.Buffer
@@ -173,4 +175,3 @@ func (a *AoIManager) RemoveSession(sessID uint32) {
 		delete(set, sessID)
 	}
 }
-

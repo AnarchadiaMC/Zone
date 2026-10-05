@@ -15,6 +15,10 @@ type Config struct {
 	LogLevel            string `yaml:"log_level"`
 	EmissionIntervalMin int    `yaml:"emission_interval_min"`
 	AdminPipe           string `yaml:"admin_pipe"`
+	ServerName          string `yaml:"server_name"`
+	MapName             string `yaml:"map_name"`
+	Mode                int    `yaml:"mode"`
+	Locked              bool   `yaml:"locked"`
 }
 
 // SetDefaults sets sensible defaults for optional or missing fields.
@@ -27,6 +31,12 @@ func (c *Config) SetDefaults() {
 	}
 	if c.EmissionIntervalMin <= 0 {
 		c.EmissionIntervalMin = 120
+	}
+	if c.ServerName == "" {
+		c.ServerName = "Zone Online"
+	}
+	if c.MapName == "" {
+		c.MapName = "l01_escape"
 	}
 }
 

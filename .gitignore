@@ -37,6 +37,9 @@ cmake-build-*/
 *.suo
 *.user
 
+# Packaged artifacts
+dist.rar
+
 # Databases and Local Storage
 *.db
 *.db-wal

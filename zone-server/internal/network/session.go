@@ -17,6 +17,9 @@ type PlayerSession struct {
 	Velocity          [3]float32
 	Health            float32
 	AnimFlags         uint8
+	Gvid              uint16
+	Visual            [64]byte
+	HasVisual         bool
 	InSafeZone        bool
 	SafeZoneID        string
 	LastSeen          time.Time
@@ -30,6 +33,8 @@ type PlayerSession struct {
 	LastCheckpoint    time.Time
 	InCombatUntil     time.Time
 	ChatTimestamps    []time.Time
+	PendingCreate     bool
+	Faction           string
 }
 
 // AllowChat enforces per-session chat rate limiting (max 5 msgs / 5s).

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"time"
 
 	"zone-online/zone-server/internal/database"
 )
@@ -17,6 +18,10 @@ var (
 	ErrStashWrongLevel    = errors.New("player on wrong level for stash")
 	ErrStashTooFar        = errors.New("player too far from stash")
 	ErrStashWrongPasscode = errors.New("invalid stash passcode")
+	ErrInvalidStashSection = errors.New("invalid stash item section")
+	ErrInvalidStashCount = errors.New("invalid stash count")
+	ErrInvalidItemCondition = errors.New("invalid item condition")
+	ErrStashContentsTooLarge = errors.New("stash contents too large")
 )
 
 // MaxStashInteractDistance is the maximum 3D distance (meters) allowed
@@ -234,4 +239,121 @@ func (m *StashManager) ModifyStashItem(stashID uint32, itemSection string, count
 	}
 
 	return db.UpdateStashContents(stashID, string(updatedBytes))
+}
+
+func (m *StashManager) StoreStashItem(stashID uint32, ownerUUID, itemSection string, count int) error {
+	if len(itemSection) == 0 || len(itemSection) > 32 {
+		return ErrInvalidStashSection
+	}
+	for _, r := range itemSection {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return ErrInvalidStashSection
+	}
+	if count < 1 || count > 100 {
+		return ErrInvalidStashCount
+	}
+	if ownerUUID == "" {
+		return ErrItemNotFoundStash
+	}
+	db, err := m.getDB()
+	if err != nil {
+		return err
+	}
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
+	tx, err := db.RawDB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id, condition FROM character_inventory WHERE client_uuid=? AND item_section=?`, ownerUUID, itemSection)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, 0, count)
+	for rows.Next() {
+		var id int64
+		var cond float64
+		if err := rows.Scan(&id, &cond); err != nil {
+			rows.Close()
+			return err
+		}
+		if math.IsNaN(cond) || cond < 0 || cond > 1 {
+			rows.Close()
+			return ErrInvalidItemCondition
+		}
+		ids = append(ids, id)
+		if len(ids) == count {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return ErrItemNotFoundStash
+	}
+	if len(ids) < count {
+		return ErrInsufficientCount
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`DELETE FROM character_inventory WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
+	var contentsJSON string
+	if err := tx.QueryRow(`SELECT contents_json FROM world_stashes WHERE stash_id=?`, stashID).Scan(&contentsJSON); err != nil {
+		return ErrStashNotFound
+	}
+	var items []StashItem
+	if len(contentsJSON) > 0 {
+		if err := json.Unmarshal([]byte(contentsJSON), &items); err != nil {
+			return err
+		}
+	}
+	sanitized := make([]StashItem, 0, len(items)+1)
+	for _, it := range items {
+		if len(it.Section) == 0 || len(it.Section) > 32 || it.Count <= 0 {
+			continue
+		}
+		valid := true
+		for _, r := range it.Section {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
+				continue
+			}
+			valid = false
+			break
+		}
+		if !valid {
+			continue
+		}
+		sanitized = append(sanitized, it)
+	}
+	foundIndex := -1
+	for i, it := range sanitized {
+		if it.Section == itemSection {
+			foundIndex = i
+			break
+		}
+	}
+	if foundIndex >= 0 {
+		sanitized[foundIndex].Count += count
+	} else {
+		sanitized = append(sanitized, StashItem{Section: itemSection, Count: count})
+	}
+	updatedBytes, err := json.Marshal(sanitized)
+	if err != nil {
+		return err
+	}
+	if len(updatedBytes) > 4096 || len(sanitized) > 256 {
+		return ErrStashContentsTooLarge
+	}
+	if _, err := tx.Exec(`UPDATE world_stashes SET contents_json=?, updated_at=? WHERE stash_id=?`, string(updatedBytes), time.Now().Unix(), stashID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

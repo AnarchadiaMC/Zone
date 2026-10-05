@@ -3,9 +3,11 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
-	"time"
 	_ "modernc.org/sqlite"
+	"strings"
+	"time"
 )
 
 type DB struct {
@@ -28,6 +30,9 @@ func Open(dbPath string) (*DB, error) {
 	if _, err := db.Exec(SchemaSQL); err != nil {
 		return nil, err
 	}
+	if err := migrateCharacterColumns(db); err != nil {
+		return nil, err
+	}
 
 	return &DB{db: db}, nil
 }
@@ -48,6 +53,9 @@ type Character struct {
 	Yaw        float32
 	Faction    string
 	Health     float32
+	ProfileRev int
+	Dead       int
+	CreatedAt  int64
 }
 
 type InventoryItem struct {
@@ -96,24 +104,173 @@ func (d *DB) AutoProvision(uuid, hwid, nick string) error {
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO accounts (client_uuid, hwid_hash, nickname, created_at, last_seen) VALUES (?, ?, ?, ?, ?)`, uuid, hwid, nick, now, now); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO characters (client_uuid, updated_at) VALUES (?, ?)`, uuid, now); err != nil {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO characters (client_uuid, profile_rev, created_at, updated_at) VALUES (?, 0, ?, ?)`, uuid, now, now); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (d *DB) LoadCharacter(uuid string) (*Character, error) {
-	row := d.db.QueryRow("SELECT level_name, pos_x, pos_y, pos_z, yaw, faction, health FROM characters WHERE client_uuid=?", uuid)
+	row := d.db.QueryRow("SELECT level_name, pos_x, pos_y, pos_z, yaw, faction, health, profile_rev, dead, created_at FROM characters WHERE client_uuid=?", uuid)
 	var c Character
 	c.ClientUUID = uuid
-	err := row.Scan(&c.LevelName, &c.PosX, &c.PosY, &c.PosZ, &c.Yaw, &c.Faction, &c.Health)
+	err := row.Scan(&c.LevelName, &c.PosX, &c.PosY, &c.PosZ, &c.Yaw, &c.Faction, &c.Health, &c.ProfileRev, &c.Dead, &c.CreatedAt)
 	return &c, err
 }
 
 func (d *DB) SaveCharacter(c *Character) error {
-	_, err := d.db.Exec("UPDATE characters SET level_name=?, pos_x=?, pos_y=?, pos_z=?, yaw=?, faction=?, health=?, updated_at=? WHERE client_uuid=?",
-		c.LevelName, c.PosX, c.PosY, c.PosZ, c.Yaw, c.Faction, c.Health, time.Now().Unix(), c.ClientUUID)
+	_, err := d.db.Exec("UPDATE characters SET level_name=?, pos_x=?, pos_y=?, pos_z=?, yaw=?, faction=?, health=?, profile_rev=?, dead=?, updated_at=? WHERE client_uuid=?",
+		c.LevelName, c.PosX, c.PosY, c.PosZ, c.Yaw, c.Faction, c.Health, c.ProfileRev, c.Dead, time.Now().Unix(), c.ClientUUID)
 	return err
+}
+
+var AllowedFactions = map[string]struct{}{
+	"stalker": {}, "dolg": {}, "freedom": {}, "csky": {},
+	"ecolog": {}, "killer": {}, "army": {}, "bandit": {},
+	"monolith": {}, "renegade": {}, "greh": {}, "isg": {},
+	"zombied": {},
+}
+
+var ValidateNewCharacter = func(faction, loadout string) error {
+	if _, ok := AllowedFactions[faction]; !ok {
+		return fmt.Errorf("invalid faction %q", faction)
+	}
+	if len(loadout) > 4096 {
+		return fmt.Errorf("loadout too long")
+	}
+	if loadout == "" {
+		return nil
+	}
+	count := 0
+	for _, e := range strings.Split(loadout, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		count++
+		if count > 256 {
+			return fmt.Errorf("too many loadout entries")
+		}
+		sec := e
+		if i := strings.Index(e, ":"); i >= 0 {
+			sec = e[:i]
+		}
+		if len(sec) == 0 || len(sec) > 64 {
+			return fmt.Errorf("invalid loadout section %q", sec)
+		}
+		for _, r := range sec {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
+				continue
+			}
+			return fmt.Errorf("invalid loadout section %q", sec)
+		}
+	}
+	return nil
+}
+
+func migrateCharacterColumns(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(characters)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	adds := map[string]string{
+		"profile_rev": "ALTER TABLE characters ADD COLUMN profile_rev INTEGER NOT NULL DEFAULT 1",
+		"dead":        "ALTER TABLE characters ADD COLUMN dead INTEGER NOT NULL DEFAULT 0",
+		"created_at":  "ALTER TABLE characters ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+	}
+	for col, stmt := range adds {
+		if !have[col] {
+			if _, err := db.Exec(stmt); err != nil {
+				return err
+			}
+		}
+	}
+	_, _ = db.Exec("UPDATE characters SET created_at=updated_at WHERE created_at=0")
+	// PRODUCTION FIX: promote only characters with real profile provenance.
+	// AutoProvision placeholders insert created_at == updated_at and have no
+	// inventory; the old created_at!=0 predicate promoted every half-created
+	// account on restart, making the client skip character creation.
+	_, _ = db.Exec(`UPDATE characters SET profile_rev=1
+		WHERE profile_rev=0 AND created_at!=0
+		  AND (updated_at>created_at
+		       OR EXISTS (SELECT 1 FROM character_inventory ci WHERE ci.client_uuid=characters.client_uuid))`)
+	return nil
+}
+
+func (d *DB) HasCharacter(uuid string) (bool, error) {
+	var one int
+	err := d.db.QueryRow("SELECT 1 FROM characters WHERE client_uuid=?", uuid).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (d *DB) CreateCharacter(uuid, faction, loadout string) error {
+	if err := ValidateNewCharacter(faction, loadout); err != nil {
+		return err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	var one int
+	err = tx.QueryRow("SELECT 1 FROM characters WHERE client_uuid=?", uuid).Scan(&one)
+	if err == nil {
+		if _, err := tx.Exec(`UPDATE characters SET faction=?, level_name='l01_escape', pos_x=-211.3, pos_y=-20.2, pos_z=-145.8, yaw=0, health=1.0, profile_rev=1, dead=0, updated_at=? WHERE client_uuid=?`, faction, now, uuid); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM character_inventory WHERE client_uuid=?`, uuid); err != nil {
+			return err
+		}
+	} else if err == sql.ErrNoRows {
+		if _, err := tx.Exec(`INSERT INTO characters (client_uuid, faction, profile_rev, dead, created_at, updated_at) VALUES (?, ?, 1, 0, ?, ?)`, uuid, faction, now, now); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	if loadout != "" {
+		for _, e := range strings.Split(loadout, ",") {
+			e = strings.TrimSpace(e)
+			if e == "" {
+				continue
+			}
+			sec := e
+			ammo := 0
+			if i := strings.Index(e, ":"); i >= 0 {
+				sec = strings.TrimSpace(e[:i])
+				_, _ = fmt.Sscanf(strings.TrimSpace(e[i+1:]), "%d", &ammo)
+			}
+			if sec == "" {
+				continue
+			}
+			if _, err := tx.Exec(`INSERT INTO character_inventory (client_uuid, item_section, ammo_current) VALUES (?, ?, ?)`, uuid, sec, ammo); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *DB) FlushPlayerTransform(uuid string, x, y, z, yaw float32, health float32) error {

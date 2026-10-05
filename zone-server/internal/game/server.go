@@ -39,6 +39,10 @@ const (
 	OpAck      = 0x0005
 )
 
+// DefaultActorVisual is the actor section used for player entities that have
+// not sent an OpPlayerVisual yet.
+const DefaultActorVisual = `actors\stalker_neutral\stalker_neutral_1`
+
 func boolToUint8(b bool) uint8 {
 	if b {
 		return 1
@@ -51,27 +55,28 @@ type EventManager struct{}
 func NewEventManager() *EventManager { return &EventManager{} }
 
 type Server struct {
-	cfg         *config.Config
-	db          *database.DB
-	dbQueue     chan *database.DBWriteJob
-	udp         *network.UDPListener
-	udpMu       sync.RWMutex
-	sessions    *network.SessionManager
-	grid        *SpatialGrid
-	events      *EventManager
-	economy     *EconomyManager
-	stashMgr    *StashManager
-	anticheat   *AntiCheatManager
-	aoi         *AoIManager
-	squads      *ai.SquadManager
-	logger      *zap.Logger
-	seq           atomic.Uint32
-	ackQueue      *network.AckQueue
-	emissionMgr   *EmissionOrchestrator
-	damageHandler *DamageHandler
-	sleepers      *SleeperManager
-	startTime     time.Time
-	tickCount     atomic.Uint64
+	cfg                   *config.Config
+	db                    *database.DB
+	dbQueue               chan *database.DBWriteJob
+	udp                   *network.UDPListener
+	udpMu                 sync.RWMutex
+	sessions              *network.SessionManager
+	grid                  *SpatialGrid
+	events                *EventManager
+	economy               *EconomyManager
+	stashMgr              *StashManager
+	anticheat             *AntiCheatManager
+	aoi                   *AoIManager
+	squads                *ai.SquadManager
+	logger                *zap.Logger
+	seq                   atomic.Uint32
+	ackQueue              *network.AckQueue
+	emissionMgr           *EmissionOrchestrator
+	damageHandler         *DamageHandler
+	sleepers              *SleeperManager
+	startTime             time.Time
+	tickCount             atomic.Uint64
+	lastSafezoneBroadcast time.Time
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {
@@ -80,23 +85,24 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		q = dbQueue[0]
 	}
 	s := &Server{
-		cfg:           cfg,
-		db:            db,
-		dbQueue:       q,
-		sessions:      network.NewSessionManager(),
-		grid:          NewSpatialGrid(64.0),
-		events:        NewEventManager(),
-		economy:       NewEconomyManager(db),
-		stashMgr:      NewStashManager(db),
-		anticheat:     NewAntiCheatManager(),
-		aoi:           NewAoIManager(),
-		squads:        ai.NewSquadManager(),
-		logger:        logger,
-		ackQueue:      network.NewAckQueue(),
-		emissionMgr:   NewEmissionOrchestrator(),
-		damageHandler: NewDamageHandler(logger),
-		sleepers:      NewSleeperManager(logger),
-		startTime:     time.Now(),
+		cfg:                   cfg,
+		db:                    db,
+		dbQueue:               q,
+		sessions:              network.NewSessionManager(),
+		grid:                  NewSpatialGrid(64.0),
+		events:                NewEventManager(),
+		economy:               NewEconomyManager(db),
+		stashMgr:              NewStashManager(db),
+		anticheat:             NewAntiCheatManager(),
+		aoi:                   NewAoIManager(),
+		squads:                ai.NewSquadManager(),
+		logger:                logger,
+		ackQueue:              network.NewAckQueue(),
+		emissionMgr:           NewEmissionOrchestrator(),
+		damageHandler:         NewDamageHandler(logger),
+		sleepers:              NewSleeperManager(logger),
+		startTime:             time.Now(),
+		lastSafezoneBroadcast: time.Now(),
 	}
 
 	s.ackQueue.SetSendFunc(func(addr *net.UDPAddr, data []byte) error {
@@ -117,6 +123,12 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 
 	if cfg != nil && cfg.EmissionIntervalMin > 0 {
 		s.emissionMgr.SetDormantDuration(time.Duration(cfg.EmissionIntervalMin) * time.Minute)
+	}
+
+	if db != nil {
+		if err := LoadSafeZones(db.RawDB()); err != nil && s.logger != nil {
+			s.logger.Warn("Failed to load safe zones from DB; using defaults", zap.Error(err))
+		}
 	}
 	return s
 }
@@ -145,7 +157,6 @@ func (s *Server) Squads() *ai.SquadManager {
 func (s *Server) AckQueue() *network.AckQueue {
 	return s.ackQueue
 }
-
 
 // GetUDP safely retrieves the active UDPListener.
 func (s *Server) GetUDP() *network.UDPListener {
@@ -248,6 +259,14 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 	}
 
+	// Server query is answered before replay gating and before any session
+	// lookup/creation: unknown addresses get the info response too, with no
+	// session and no DB writes.
+	if hdr.Opcode == protocol.OpServerQuery {
+		s.handleServerQuery(addr)
+		return
+	}
+
 	// Replay protection: per-session LastSequence tracking.
 	// Reliable packets with seq <= LastSequence are duplicates/replays and
 	// are dropped after the ACK above (ACK still sent, processing skipped).
@@ -312,6 +331,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				cleanUUID = string(bytes.Trim(req.UUID[:], "\x00"))
 			}
 
+			if cleanUUID == "" {
+				res := protocol.HandshakeRes{
+					Status:    1,
+					WorldTime: uint64(time.Now().Unix()),
+				}
+				tempSess := &network.PlayerSession{UDPAddr: addr}
+				s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+				return
+			}
+
 			// Ban Check (Issue 11)
 			if s.db != nil {
 				if banned, reason, err := CheckPlayerBanned(s.db, cleanUUID); err == nil && banned {
@@ -326,20 +355,22 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
-		sessID := s.seq.Add(1)
-		token, _ := GenerateSessionToken()
-		sess := &network.PlayerSession{
-			SessionID:         sessID,
-			SessionToken:      token,
-			AccountID:         cleanUUID,
-			UDPAddr:           addr,
-			LastSeen:          time.Now(),
-			LastCheckpoint:    time.Now(),
-			LastTransformTime: time.Now(),
-			Health:            100.0,
-			CurrentLevel:      "l01_escape",
-			LastSequence:      hdr.SequenceNum,
-		}
+			sessID := s.seq.Add(1)
+			token, _ := GenerateSessionToken()
+			sess := &network.PlayerSession{
+				SessionID:         sessID,
+				SessionToken:      token,
+				AccountID:         cleanUUID,
+				UDPAddr:           addr,
+				LastSeen:          time.Now(),
+				LastCheckpoint:    time.Now(),
+				LastTransformTime: time.Now(),
+				Health:            100.0,
+				CurrentLevel:      "l01_escape",
+				LastSequence:      hdr.SequenceNum,
+			}
+			isNew := false
+			charFaction := ""
 			if s.db != nil {
 				nick := nullTermString(req.Nickname[:])
 				if nick == "" {
@@ -348,11 +379,40 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				hwid := fmt.Sprintf("%x", req.HWIDHash)
 				_ = s.db.AutoProvision(cleanUUID, hwid, nick)
 				if char, err := s.db.LoadCharacter(cleanUUID); err == nil && char != nil {
-					if char.LevelName != "" {
-						sess.CurrentLevel = char.LevelName
+					charFaction = char.Faction
+					if char.ProfileRev != 1 {
+						isNew = true
 					}
-					sess.Position = [3]float32{char.PosX, char.PosY, char.PosZ}
-					sess.Health = char.Health
+					if isNew {
+						sess.PendingCreate = true
+						sess.Position = [3]float32{-211.3, -20.2, -145.8}
+						sess.CurrentLevel = "l01_escape"
+						sess.Health = 100.0
+					} else if char.Dead == 1 {
+						char.LevelName = "l01_escape"
+						char.PosX, char.PosY, char.PosZ = -211.3, -20.2, -145.8
+						char.Health = 100
+						char.Dead = 0
+						_ = s.db.SaveCharacter(char)
+						charFaction = char.Faction
+						sess.CurrentLevel = char.LevelName
+						sess.Position = [3]float32{char.PosX, char.PosY, char.PosZ}
+						sess.Health = char.Health
+						sess.Faction = char.Faction
+					} else {
+						if char.LevelName != "" {
+							sess.CurrentLevel = char.LevelName
+						}
+						sess.Position = [3]float32{char.PosX, char.PosY, char.PosZ}
+						sess.Health = char.Health
+						sess.Faction = char.Faction
+					}
+				} else {
+					isNew = true
+					sess.PendingCreate = true
+					sess.Position = [3]float32{-211.3, -20.2, -145.8}
+					sess.CurrentLevel = "l01_escape"
+					sess.Health = 100.0
 				}
 			}
 			if sess.Position == [3]float32{0, 0, 0} {
@@ -370,6 +430,8 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					sleeper.RUnlock()
 					s.sleepers.RemoveSleeper(sleeperID)
 					s.grid.Remove(sleeperID)
+					isNew = false
+					sess.PendingCreate = false
 				}
 			}
 
@@ -403,17 +465,27 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				WorldTime: uint64(time.Now().Unix()),
 				EcoTier:   1,
 			}
+			if isNew {
+				res.HasCharacter = 0
+			} else {
+				res.HasCharacter = 1
+				copy(res.Faction[:], charFaction)
+			}
 			binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
 
-			s.grid.Insert(sessID, sess.Position[0], sess.Position[2])
-			szObj := CheckSafeZone(sess.Position[0], sess.Position[1], sess.Position[2], sess.CurrentLevel)
-			inSZ := (szObj != nil)
-			sess.InSafeZone = inSZ
-			if inSZ {
-				sess.SafeZoneID = szObj.ZoneID
+			if !isNew {
+				s.grid.Insert(sessID, sess.Position[0], sess.Position[2])
 			}
 
 			s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+			// Unconditional safe-zone snapshot immediately after handshake.
+			s.sendSafezoneState(sess)
+			if isNew {
+				show := protocol.ShowStart{Level: 0, PosX: -211.3, PosY: -20.2, PosZ: -145.8, Flags: 0, EcoTier: 1}
+				s.SendToSession(sess, protocol.OpShowStart, protocol.FlagReliable, show)
+			} else {
+				s.sendExistingPeersToNewcomer(sess)
+			}
 		}
 	case protocol.OpDisconnect:
 		if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
@@ -429,7 +501,18 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			sess.Unlock()
 
 			if uuid != "" {
-				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+				s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+				if s.db != nil {
+					if health <= 0 {
+						if char, err := s.db.LoadCharacter(uuid); err == nil && char != nil {
+							char.PosX, char.PosY, char.PosZ = pos[0], pos[1], pos[2]
+							char.Yaw = yaw
+							char.Health = 0
+							char.Dead = 1
+							_ = s.db.SaveCharacter(char)
+						}
+					}
+				}
 			}
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
@@ -447,18 +530,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
-			leavePkt := protocol.EntityLeaveAoI{EntityID: sessID}
-			for _, other := range s.sessions.GetAll() {
-				if other.SessionID == sessID {
-					continue
-				}
-				other.Lock()
-				sameLevel := (other.CurrentLevel == level)
-				other.Unlock()
-				if sameLevel {
-					s.SendToSession(other, protocol.OpEntityLeaveAoI, protocol.FlagReliable, leavePkt)
-				}
-			}
+			s.broadcastEntityLeaveToPeers(sessID, level)
 
 			s.sessions.RemoveSession(sessID)
 			s.logger.Info("Client disconnected",
@@ -572,6 +644,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.Rotation = [2]float32{float32(ct.Yaw) / 100.0, float32(ct.Pitch) / 100.0}
 				sess.Velocity = [3]float32{float32(ct.VelX) / 100.0, float32(ct.VelY) / 100.0, float32(ct.VelZ) / 100.0}
 				sess.AnimFlags = ct.AnimFlags
+				sess.Gvid = ct.Gvid
 				sess.LastSeen = now
 				sess.LastTransformTime = now
 				uuid := sess.AccountID
@@ -658,13 +731,30 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			return
 		}
 
-		// Check if target is a sleeper proxy (Issue 16)
-		if s.sleepers != nil {
+		// Check if target is a sleeper proxy (Issue 16). Sleeper damage is
+		// routed through the same ValidateAndApplyDamage path as live targets
+		// so safe-zone immunity, range and sanity checks cannot be bypassed.
+		if s.sleepers != nil && s.damageHandler != nil {
 			if sleeper := s.sleepers.GetSleeper(dmg.TargetID); sleeper != nil {
-				remHealth, isDead := s.sleepers.ApplyDamage(dmg.TargetID, dmg.Damage)
+				sleeper.RLock()
+				sleeperTarget := &network.PlayerSession{
+					SessionID:    sleeper.EntityID,
+					CurrentLevel: sleeper.CurrentLevel,
+					Position:     sleeper.Position,
+					Health:       sleeper.Health,
+				}
+				sleeperTarget.InSafeZone = CheckSafeZone(sleeper.Position[0], sleeper.Position[1], sleeper.Position[2], sleeper.CurrentLevel) != nil
+				sleeper.RUnlock()
+
+				applied, valid, reason := s.damageHandler.ValidateAndApplyDamage(attackerSess, sleeperTarget, &dmg)
+				if !valid {
+					s.logger.Debug("Sleeper damage rejected", zap.String("reason", reason))
+					return
+				}
+				remHealth, isDead := s.sleepers.ApplyDamage(dmg.TargetID, applied)
 				s.logger.Info("Damage applied to sleeper",
 					zap.Uint32("sleeper", dmg.TargetID),
-					zap.Float32("damage", dmg.Damage),
+					zap.Float32("damage", applied),
 					zap.Float32("rem_health", remHealth),
 					zap.Bool("dead", isDead),
 				)
@@ -675,7 +765,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					yaw := sleeper.Rotation[0]
 					sleeper.RUnlock()
 					if uuid != "" {
-						s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+						s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+						if s.db != nil {
+							if char, err := s.db.LoadCharacter(uuid); err == nil && char != nil {
+								char.PosX, char.PosY, char.PosZ = pos[0], pos[1], pos[2]
+								char.Yaw = yaw
+								char.Health = 0
+								char.Dead = 1
+								_ = s.db.SaveCharacter(char)
+							}
+						}
 					}
 					s.sleepers.RemoveSleeper(dmg.TargetID)
 					s.grid.Remove(dmg.TargetID)
@@ -698,6 +797,24 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			dmgOut := dmg
 			dmgOut.Damage = applied
 			s.SendToSession(targetSess, protocol.OpDamageNotify, protocol.FlagReliable, dmgOut)
+			targetSess.Lock()
+			tuuid := targetSess.AccountID
+			tpos := targetSess.Position
+			tyaw := targetSess.Rotation[0]
+			thealth := targetSess.Health
+			targetSess.Unlock()
+			if thealth <= 0 && tuuid != "" {
+				s.SyncFlushPlayerTransform(tuuid, tpos[0], tpos[1], tpos[2], tyaw, 0.0)
+				if s.db != nil {
+					if char, err := s.db.LoadCharacter(tuuid); err == nil && char != nil {
+						char.PosX, char.PosY, char.PosZ = tpos[0], tpos[1], tpos[2]
+						char.Yaw = tyaw
+						char.Health = 0
+						char.Dead = 1
+						_ = s.db.SaveCharacter(char)
+					}
+				}
+			}
 		}
 	case protocol.OpStashInteract:
 		var pkt protocol.StashInteractPayload
@@ -836,7 +953,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			}
 		case 3: // Store
 			s.logger.Info("Stash store", zap.Uint32("stash_id", stashID), zap.String("section", section), zap.Int("count", count))
-			if err := s.stashMgr.ModifyStashItem(stashID, section, +count); err != nil {
+			if err := s.stashMgr.StoreStashItem(stashID, sess.AccountID, section, count); err != nil {
 				if err == ErrStashNotFound {
 					status = 1
 				} else {
@@ -857,6 +974,102 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			copy(resp.Data[:], contents)
 		}
 		s.sendStashResponse(addr, resp)
+	case protocol.OpCharacterSelect:
+		var sel protocol.CharacterSelect
+		if err := binary.Read(buf, binary.LittleEndian, &sel); err != nil {
+			return
+		}
+		sess := s.sessions.GetByAddr(addr.String())
+		if sess == nil {
+			return
+		}
+		sess.Lock()
+		pending := sess.PendingCreate
+		sess.Unlock()
+		if !pending {
+			return
+		}
+		faction := nullTermString(sel.Faction[:])
+		loadout := nullTermString(sel.Items[:])
+		sess.Lock()
+		uuid := sess.AccountID
+		sess.Unlock()
+		if s.db != nil {
+			if err := database.ValidateNewCharacter(faction, loadout); err != nil {
+				return
+			}
+			if err := s.db.CreateCharacter(uuid, faction, loadout); err != nil {
+				return
+			}
+		} else if _, ok := database.AllowedFactions[faction]; !ok {
+			return
+		}
+		sess.Lock()
+		sess.PendingCreate = false
+		sess.Faction = faction
+		sess.Position = [3]float32{-211.3, -20.2, -145.8}
+		sess.CurrentLevel = "l01_escape"
+		sess.Health = 100.0
+		sessID := sess.SessionID
+		sess.Unlock()
+		s.grid.Insert(sessID, -211.3, -145.8)
+		load := protocol.ShowStart{Level: 0, PosX: -211.3, PosY: -20.2, PosZ: -145.8, Flags: 0, EcoTier: 1}
+		s.SendToSession(sess, protocol.OpLoadLevel, protocol.FlagReliable, load)
+		res := protocol.HandshakeRes{Status: 0, SpawnX: -211.3, SpawnY: -20.2, SpawnZ: -145.8, WorldTime: uint64(time.Now().Unix()), EcoTier: 1, HasCharacter: 1}
+		copy(res.Faction[:], faction)
+		binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
+		s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+		s.sendSafezoneState(sess)
+		s.sendExistingPeersToNewcomer(sess)
+	case protocol.OpLevelChange:
+		var lvl protocol.LevelChangePayload
+		if err := binary.Read(buf, binary.LittleEndian, &lvl); err != nil {
+			return
+		}
+		sess := s.sessions.GetByAddr(addr.String())
+		if sess == nil {
+			return
+		}
+		levelName := nullTermString(lvl.Level[:])
+		if levelName == "" || len(levelName) > 31 || !isPrintableLevelName(levelName) {
+			s.logger.Warn("Rejected invalid level change",
+				zap.String("addr", addr.String()),
+				zap.String("level", levelName),
+			)
+			return
+		}
+		sess.Lock()
+		oldLevel := sess.CurrentLevel
+		sess.CurrentLevel = levelName
+		sess.InSafeZone = false
+		sess.SafeZoneID = ""
+		sess.Unlock()
+
+		s.aoi.RemoveSession(sess.SessionID)
+		if oldLevel != levelName {
+			s.broadcastEntityLeaveToPeers(sess.SessionID, oldLevel)
+			s.broadcastEntityEnter(sess)
+			s.sendExistingPeersToNewcomer(sess)
+		}
+		s.sendSafezoneState(sess)
+	case protocol.OpPlayerVisual:
+		var pv protocol.PlayerVisualPayload
+		if err := binary.Read(buf, binary.LittleEndian, &pv); err != nil {
+			return
+		}
+		sess := s.sessions.GetByAddr(addr.String())
+		if sess == nil {
+			return
+		}
+		visual := sanitizeVisual(nullTermString(pv.Visual[:]))
+		if visual == "" {
+			return
+		}
+		sess.Lock()
+		copy(sess.Visual[:], visual)
+		sess.HasVisual = true
+		sess.Unlock()
+		s.broadcastEntityEnter(sess)
 	case OpAck:
 		if s.ackQueue != nil {
 			var ackSeq uint32
@@ -893,6 +1106,237 @@ func (s *Server) sendAck(addr *net.UDPAddr, seq uint32) {
 	}
 }
 
+// healthToUint8 clamps a float health value into the wire u8 range.
+func healthToUint8(h float32) uint8 {
+	if h <= 0 {
+		return 0
+	}
+	if h >= 255 {
+		return 255
+	}
+	return uint8(h)
+}
+
+// isPrintableLevelName reports whether s contains only printable runes.
+func isPrintableLevelName(s string) bool {
+	for _, r := range s {
+		if !unicode.IsPrint(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeVisual strips control characters and invalid UTF-8 from a client
+// actor section, capping it at 63 bytes so the 64-byte field stays
+// null-terminated.
+func sanitizeVisual(raw string) string {
+	if !utf8.ValidString(raw) {
+		raw = strings.ToValidUTF8(raw, "")
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if unicode.IsPrint(r) && !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	if len(s) > 63 {
+		s = strings.ToValidUTF8(s[:63], "")
+	}
+	return s
+}
+
+// sendSafezoneState recomputes the session's safe-zone status from its current
+// position and level, updates the session flags and sends OpSafezoneState.
+func (s *Server) sendSafezoneState(sess *network.PlayerSession) {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	pos := sess.Position
+	level := sess.CurrentLevel
+	sess.Unlock()
+
+	szObj := CheckSafeZone(pos[0], pos[1], pos[2], level)
+	inSafe := szObj != nil
+	zoneID := ""
+	if inSafe {
+		zoneID = szObj.ZoneID
+	}
+
+	sess.Lock()
+	sess.InSafeZone = inSafe
+	sess.SafeZoneID = zoneID
+	sess.Unlock()
+
+	payload := protocol.SafezoneStatePayload{Locked: boolToUint8(inSafe)}
+	copy(payload.ZoneID[:], zoneID)
+	s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, payload)
+}
+
+// buildEntityEnter builds the ENTITY_ENTER_AOI payload for a player session,
+// falling back to DefaultActorVisual when no OpPlayerVisual was received yet.
+func (s *Server) buildEntityEnter(sess *network.PlayerSession) protocol.EntityEnterAoI {
+	var pkt protocol.EntityEnterAoI
+	if sess == nil {
+		return pkt
+	}
+	sess.Lock()
+	pkt.EntityID = sess.SessionID
+	pkt.EntityType = 1
+	visual := nullTermString(sess.Visual[:])
+	if visual == "" {
+		visual = DefaultActorVisual
+	}
+	copy(pkt.Section[:], visual)
+	pkt.PosX, pkt.PosY, pkt.PosZ = sess.Position[0], sess.Position[1], sess.Position[2]
+	copy(pkt.Faction[:], sess.Faction)
+	pkt.Health = healthToUint8(sess.Health)
+	pkt.Gvid = sess.Gvid
+	sess.Unlock()
+	return pkt
+}
+
+// broadcastEntityEnter sends ENTITY_ENTER_AOI for sess to every same-level peer.
+func (s *Server) broadcastEntityEnter(sess *network.PlayerSession) {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	sessID := sess.SessionID
+	level := sess.CurrentLevel
+	sess.Unlock()
+
+	pkt := s.buildEntityEnter(sess)
+	for _, other := range s.sessions.GetAll() {
+		if other.SessionID == sessID {
+			continue
+		}
+		other.Lock()
+		sameLevel := other.CurrentLevel == level
+		other.Unlock()
+		if sameLevel {
+			s.SendToSession(other, protocol.OpEntityEnterAoI, protocol.FlagReliable, pkt)
+		}
+	}
+}
+
+// broadcastEntityLeaveToPeers sends ENTITY_LEAVE_AOI for sessID to every
+// remaining peer on the given level.
+func (s *Server) broadcastEntityLeaveToPeers(sessID uint32, level string) {
+	pkt := protocol.EntityLeaveAoI{EntityID: sessID}
+	for _, other := range s.sessions.GetAll() {
+		if other.SessionID == sessID {
+			continue
+		}
+		other.Lock()
+		sameLevel := other.CurrentLevel == level
+		other.Unlock()
+		if sameLevel {
+			s.SendToSession(other, protocol.OpEntityLeaveAoI, protocol.FlagReliable, pkt)
+		}
+	}
+}
+
+// sendExistingPeersToNewcomer sends ENTITY_ENTER_AOI for all same-level peers
+// to a session that just joined or changed level.
+func (s *Server) sendExistingPeersToNewcomer(sess *network.PlayerSession) {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	sessID := sess.SessionID
+	level := sess.CurrentLevel
+	sess.Unlock()
+
+	for _, other := range s.sessions.GetAll() {
+		if other.SessionID == sessID {
+			continue
+		}
+		other.Lock()
+		sameLevel := other.CurrentLevel == level
+		other.Unlock()
+		if sameLevel {
+			s.SendToSession(sess, protocol.OpEntityEnterAoI, protocol.FlagReliable, s.buildEntityEnter(other))
+		}
+	}
+}
+
+// handleServerQuery answers OpServerQuery from any address without creating a
+// session or touching the database.
+func (s *Server) handleServerQuery(addr *net.UDPAddr) {
+	udp := s.GetUDP()
+	if udp == nil && activeSink == nil {
+		return
+	}
+
+	serverName := "Zone Online"
+	mapName := "l01_escape"
+	mode := 0
+	locked := false
+	maxPlayers := 0
+	tickRate := 30
+	if s.cfg != nil {
+		if s.cfg.ServerName != "" {
+			serverName = s.cfg.ServerName
+		}
+		if s.cfg.MapName != "" {
+			mapName = s.cfg.MapName
+		}
+		mode = s.cfg.Mode
+		locked = s.cfg.Locked
+		maxPlayers = s.cfg.MaxPlayers
+		if s.cfg.TickRateHz > 0 {
+			tickRate = s.cfg.TickRateHz
+		}
+	}
+
+	players := s.sessions.Count()
+	if players > 255 {
+		players = 255
+	}
+	if maxPlayers < 0 {
+		maxPlayers = 0
+	} else if maxPlayers > 255 {
+		maxPlayers = 255
+	}
+	if mode < 0 {
+		mode = 0
+	} else if mode > 255 {
+		mode = 255
+	}
+	if tickRate < 0 {
+		tickRate = 0
+	} else if tickRate > 255 {
+		tickRate = 255
+	}
+
+	var res protocol.ServerQueryRes
+	copy(res.Name[:], serverName)
+	copy(res.Map[:], mapName)
+	res.Players = uint8(players)
+	res.MaxPlayers = uint8(maxPlayers)
+	res.Mode = uint8(mode)
+	res.Locked = boolToUint8(locked)
+	res.ProtoVer = protocol.ProtocolVer
+	res.TickRateHz = uint8(tickRate)
+
+	seq := s.seq.Add(1)
+	var buf bytes.Buffer
+	if err := protocol.WritePacket(&buf, protocol.OpServerQueryRes, seq, protocol.FlagUnreliable, res); err != nil {
+		return
+	}
+	data := buf.Bytes()
+	if activeSink != nil {
+		activeSink.Record(data)
+	}
+	if udp != nil {
+		_ = udp.Send(addr, data)
+	}
+}
+
 func (s *Server) Tick(now time.Time) {
 	// S-01: Only increment play time once per second (every 30 ticks at 30Hz)
 	tick := s.tickCount.Add(1)
@@ -908,7 +1352,7 @@ func (s *Server) Tick(now time.Time) {
 			health := sl.Health
 			sl.RUnlock()
 			if uuid != "" {
-				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+				s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
 			}
 			s.grid.Remove(sl.EntityID)
 		}, func(sl *Sleeper) {
@@ -918,7 +1362,16 @@ func (s *Server) Tick(now time.Time) {
 			yaw := sl.Rotation[0]
 			sl.RUnlock()
 			if uuid != "" {
-				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+				s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, 0.0)
+				if s.db != nil {
+					if char, err := s.db.LoadCharacter(uuid); err == nil && char != nil {
+						char.PosX, char.PosY, char.PosZ = pos[0], pos[1], pos[2]
+						char.Yaw = yaw
+						char.Health = 0
+						char.Dead = 1
+						_ = s.db.SaveCharacter(char)
+					}
+				}
 			}
 			s.grid.Remove(sl.EntityID)
 		})
@@ -949,6 +1402,7 @@ func (s *Server) Tick(now time.Time) {
 		if stale {
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
+			s.broadcastEntityLeaveToPeers(sessID, level)
 			if s.ackQueue != nil && addrStr != "" {
 				s.ackQueue.RemoveByAddr(addrStr)
 			}
@@ -956,8 +1410,19 @@ func (s *Server) Tick(now time.Time) {
 			if s.anticheat != nil {
 				s.anticheat.ViolationReset(sessID)
 			}
-			if uuid != "" && dirty {
-				s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+			if uuid != "" && (dirty || health <= 0) {
+				s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+				if s.db != nil {
+					if health <= 0 {
+						if char, err := s.db.LoadCharacter(uuid); err == nil && char != nil {
+							char.PosX, char.PosY, char.PosZ = pos[0], pos[1], pos[2]
+							char.Yaw = yaw
+							char.Health = 0
+							char.Dead = 1
+							_ = s.db.SaveCharacter(char)
+						}
+					}
+				}
 			}
 			// PRODUCTION FIX (§17.1): pull-the-cable combat logging must spawn
 			// a sleeper exactly like explicit disconnect. Old code only did
@@ -1002,6 +1467,16 @@ func (s *Server) Tick(now time.Time) {
 			s.squads.Tick(now, func(squadID uint32, state ai.AIState, pos [3]float32) {
 				s.broadcastSquadAction(squadID, state, pos)
 			})
+		}
+	}
+
+	// Periodic safe-zone state: every connected client receives a fresh
+	// snapshot every 2 seconds, in addition to the immediate send on join,
+	// level change and enter/exit transitions.
+	if now.Sub(s.lastSafezoneBroadcast) >= 2*time.Second {
+		s.lastSafezoneBroadcast = now
+		for _, sess := range s.sessions.GetAll() {
+			s.sendSafezoneState(sess)
 		}
 	}
 }
@@ -1061,8 +1536,14 @@ func (s *Server) QueueWrite(query string, args ...interface{}) {
 	select {
 	case s.dbQueue <- &database.DBWriteJob{Query: query, Args: args}:
 	default:
-		s.logger.Warn("DB write queue full, dropping write", zap.String("query", query))
 	}
+}
+
+func (s *Server) SyncFlushPlayerTransform(uuid string, x, y, z, yaw, health float32) {
+	if s.db == nil {
+		return
+	}
+	_ = s.db.FlushPlayerTransform(uuid, x, y, z, yaw, health)
 }
 
 func (s *Server) QueuePlayerTransform(uuid string, x, y, z, yaw, health float32) {
@@ -1124,19 +1605,26 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	pos := sess.Position
 	yaw := sess.Rotation[0]
 	health := sess.Health
+	level := sess.CurrentLevel
 	sess.Unlock()
 
 	if uuid != "" {
-		s.QueuePlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
-		if s.db != nil && s.dbQueue == nil {
-			_, _ = s.db.RawDB().Exec(
-				"UPDATE characters SET pos_x=?, pos_y=?, pos_z=?, yaw=?, health=?, updated_at=? WHERE client_uuid=?",
-				pos[0], pos[1], pos[2], yaw, health, time.Now().Unix(), uuid,
-			)
+		s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
+		if s.db != nil {
+			if health <= 0 {
+				if char, err := s.db.LoadCharacter(uuid); err == nil && char != nil {
+					char.PosX, char.PosY, char.PosZ = pos[0], pos[1], pos[2]
+					char.Yaw = yaw
+					char.Health = 0
+					char.Dead = 1
+					_ = s.db.SaveCharacter(char)
+				}
+			}
 		}
 	}
 
 	s.SendToSession(sess, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
+	s.broadcastEntityLeaveToPeers(sessionID, level)
 	s.grid.Remove(sessionID)
 	s.aoi.RemoveSession(sessionID)
 	s.sessions.RemoveSession(sessionID)

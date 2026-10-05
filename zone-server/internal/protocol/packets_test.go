@@ -29,12 +29,17 @@ func TestPacketByteLengths(t *testing.T) {
 		value    interface{}
 		expected int
 	}{
-		{"HandshakeReq", HandshakeReq{}, 102},         // 37 + 32 + 32 + 1 = 102
-		{"HandshakeRes", HandshakeRes{}, 26},          // 4 + 1 + 12 + 8 + 1 = 26
-		{"ServerSnapshot", ServerSnapshot{}, 705},     // 1 + 32 * 22 = 705
+		{"HandshakeReq", HandshakeReq{}, 102},                // 37 + 32 + 32 + 1 = 102
+		{"HandshakeRes", HandshakeRes{}, 43},                 // 4 + 1 + 12 + 8 + 1 + 1 + 16 = 43
+		{"ServerSnapshot", ServerSnapshot{}, 705},            // 1 + 32 * 22 = 705
 		{"SafezoneStatePayload", SafezoneStatePayload{}, 33}, // 1 + 32 = 33
-		{"WorldEventPayload", WorldEventPayload{}, 6}, // 1 + 1 + 4 = 6
-		{"AIActionPayload", AIActionPayload{}, 9},     // 4 + 1 + 4 = 9
+		{"WorldEventPayload", WorldEventPayload{}, 6},        // 1 + 1 + 4 = 6
+		{"AIActionPayload", AIActionPayload{}, 9},            // 4 + 1 + 4 = 9
+		{"ClientTransform", ClientTransform{}, 29},           // 4 + 12 + 6 + 1 + 2 = 29 (v2 gvid)
+		{"EntityEnterAoI", EntityEnterAoI{}, 100},            // 4 + 1 + 64 + 12 + 16 + 1 + 2 = 100 (v2)
+		{"ServerQueryRes", ServerQueryRes{}, 70},             // 32 + 32 + 6 = 70
+		{"LevelChangePayload", LevelChangePayload{}, 32},
+		{"PlayerVisualPayload", PlayerVisualPayload{}, 64},
 	}
 
 	for _, tc := range tests {
@@ -149,16 +154,18 @@ func TestPackets(t *testing.T) {
 	t.Run("OpHandshakeRes Roundtrip and Layout", func(t *testing.T) {
 		var buf bytes.Buffer
 		res := HandshakeRes{
-			SessionID: [4]byte{0x01, 0x02, 0x03, 0x04},
-			Status:    0,
-			SpawnX:    -211.35,
-			SpawnY:    -20.25,
-			SpawnZ:    -145.80,
-			WorldTime: 1716382910,
-			EcoTier:   2,
+			SessionID:    [4]byte{0x01, 0x02, 0x03, 0x04},
+			Status:       0,
+			SpawnX:       -211.35,
+			SpawnY:       -20.25,
+			SpawnZ:       -145.80,
+			WorldTime:    1716382910,
+			EcoTier:      2,
+			HasCharacter: 1,
 		}
+		copy(res.Faction[:], "loner")
 
-		const expectedLen = 4 + 1 + 4 + 4 + 4 + 8 + 1 // 26 bytes
+		const expectedLen = 4 + 1 + 4 + 4 + 4 + 8 + 1 + 1 + 16 // 43 bytes
 		if err := WritePacket(&buf, OpHandshakeRes, 11, FlagReliable, res); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
@@ -192,6 +199,12 @@ func TestPackets(t *testing.T) {
 		}
 		if decoded.EcoTier != res.EcoTier {
 			t.Errorf("EcoTier mismatch: got %d, want %d", decoded.EcoTier, res.EcoTier)
+		}
+		if decoded.HasCharacter != res.HasCharacter {
+			t.Errorf("HasCharacter mismatch: got %d, want %d", decoded.HasCharacter, res.HasCharacter)
+		}
+		if decoded.Faction != res.Faction {
+			t.Errorf("Faction mismatch: got %v, want %v", decoded.Faction, res.Faction)
 		}
 	})
 
@@ -237,9 +250,10 @@ func TestPackets(t *testing.T) {
 			VelY:      0,
 			VelZ:      -150,
 			AnimFlags: 0x05,
+			Gvid:      0xBEEF,
 		}
 
-		const expectedLen = 4 + 4 + 4 + 4 + 2 + 2 + 2 + 2 + 2 + 1 // 27 bytes
+		const expectedLen = 4 + 4 + 4 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 2 // 29 bytes
 		if err := WritePacket(&buf, OpClientTransform, 13, FlagUnreliable, ct); err != nil {
 			t.Fatalf("WritePacket failed: %v", err)
 		}
@@ -273,6 +287,9 @@ func TestPackets(t *testing.T) {
 		}
 		if decoded.AnimFlags != ct.AnimFlags {
 			t.Errorf("AnimFlags mismatch: got %d, want %d", decoded.AnimFlags, ct.AnimFlags)
+		}
+		if decoded.Gvid != ct.Gvid {
+			t.Errorf("Gvid mismatch: got 0x%04X, want 0x%04X", decoded.Gvid, ct.Gvid)
 		}
 	})
 
@@ -406,11 +423,12 @@ func TestPackets(t *testing.T) {
 			PosY:       0.0,
 			PosZ:       -42.25,
 			Health:     100,
+			Gvid:       0x1234,
 		}
 		copy(enter.Section[:], "sim_default_stalker_novice")
 		copy(enter.Faction[:], "loner")
 
-		const expectedEnterLen = 4 + 1 + 32 + 4 + 4 + 4 + 16 + 1 // 62 bytes
+		const expectedEnterLen = 4 + 1 + 64 + 4 + 4 + 4 + 16 + 1 + 2 // 100 bytes
 		var buf bytes.Buffer
 		if err := WritePacket(&buf, OpEntityEnterAoI, 17, FlagReliable, enter); err != nil {
 			t.Fatalf("WritePacket OpEntityEnterAoI failed: %v", err)
@@ -433,6 +451,12 @@ func TestPackets(t *testing.T) {
 		}
 		if decodedEnter.EntityID != enter.EntityID || decodedEnter.Health != enter.Health {
 			t.Errorf("Enter fields mismatch: %+v", decodedEnter)
+		}
+		if decodedEnter.Gvid != enter.Gvid {
+			t.Errorf("Enter Gvid mismatch: got 0x%04X, want 0x%04X", decodedEnter.Gvid, enter.Gvid)
+		}
+		if string(bytes.TrimRight(decodedEnter.Section[:], "\x00")) != "sim_default_stalker_novice" {
+			t.Errorf("Enter Section mismatch: %q", string(decodedEnter.Section[:]))
 		}
 
 		// Leave AoI
@@ -894,4 +918,80 @@ func TestPackets(t *testing.T) {
 			t.Errorf("Expected io.ErrUnexpectedEOF, got %v", err)
 		}
 	})
+}
+
+func TestProtocolV2Opcodes(t *testing.T) {
+	cases := []struct {
+		name string
+		got  uint16
+		want uint16
+	}{
+		{"OpServerQuery", OpServerQuery, 0x0006},
+		{"OpServerQueryRes", OpServerQueryRes, 0x0007},
+		{"OpLevelChange", OpLevelChange, 0x0074},
+		{"OpPlayerVisual", OpPlayerVisual, 0x0075},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = 0x%04X, want 0x%04X", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestServerQueryResRoundtrip(t *testing.T) {
+	res := ServerQueryRes{
+		Players:    7,
+		MaxPlayers: 64,
+		Mode:       2,
+		Locked:     1,
+		ProtoVer:   ProtocolVer,
+		TickRateHz: 30,
+	}
+	copy(res.Name[:], "Zone Online")
+	copy(res.Map[:], "l01_escape")
+
+	var buf bytes.Buffer
+	if err := WritePacket(&buf, OpServerQueryRes, 77, FlagUnreliable, res); err != nil {
+		t.Fatalf("WritePacket failed: %v", err)
+	}
+	hdr, err := ReadHeader(&buf)
+	if err != nil {
+		t.Fatalf("ReadHeader failed: %v", err)
+	}
+	if hdr.Opcode != OpServerQueryRes {
+		t.Fatalf("Opcode mismatch: got 0x%04X, want 0x%04X", hdr.Opcode, OpServerQueryRes)
+	}
+	if hdr.PayloadLength != 70 {
+		t.Fatalf("Payload length mismatch: got %d, want 70", hdr.PayloadLength)
+	}
+
+	decoded, err := ReadServerQueryRes(&buf)
+	if err != nil {
+		t.Fatalf("ReadServerQueryRes failed: %v", err)
+	}
+	if string(bytes.TrimRight(decoded.Name[:], "\x00")) != "Zone Online" {
+		t.Errorf("Name mismatch: %q", string(decoded.Name[:]))
+	}
+	if string(bytes.TrimRight(decoded.Map[:], "\x00")) != "l01_escape" {
+		t.Errorf("Map mismatch: %q", string(decoded.Map[:]))
+	}
+	if decoded.Players != res.Players || decoded.MaxPlayers != res.MaxPlayers ||
+		decoded.Mode != res.Mode || decoded.Locked != res.Locked ||
+		decoded.ProtoVer != res.ProtoVer || decoded.TickRateHz != res.TickRateHz {
+		t.Errorf("field mismatch: got %+v, want %+v", decoded, res)
+	}
+}
+
+func TestLevelChangeAndPlayerVisualPayloads(t *testing.T) {
+	var lvl LevelChangePayload
+	copy(lvl.Level[:], "l02_garbage")
+	if got := string(bytes.TrimRight(lvl.Level[:], "\x00")); got != "l02_garbage" {
+		t.Errorf("LevelChange level mismatch: %q", got)
+	}
+
+	var pv PlayerVisualPayload
+	copy(pv.Visual[:], `actors\stalker_neutral\stalker_neutral_1`)
+	if got := string(bytes.TrimRight(pv.Visual[:], "\x00")); got != `actors\stalker_neutral\stalker_neutral_1` {
+		t.Errorf("PlayerVisual mismatch: %q", got)
+	}
 }

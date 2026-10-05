@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
 	"zone-online/zone-server/internal/config"
-	"zone-online/zone-server/internal/database"
 	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
 )
@@ -52,9 +50,21 @@ func TestLifecycle_HandshakeSuccess(t *testing.T) {
 		t.Errorf("expected default level 'l01_escape', got '%s'", level)
 	}
 
-	// Verify session added to spatial grid
+	sess.Lock()
+	pending := sess.PendingCreate
+	sess.Unlock()
+	if !pending {
+		t.Errorf("expected PendingCreate true for new character")
+	}
+	if s.grid.Contains(sessID) {
+		t.Errorf("expected session %d to skip spatial grid until CharacterSelect", sessID)
+	}
+	var sel protocol.CharacterSelect
+	copy(sel.Faction[:], "stalker")
+	rawSel := buildTestPacket(t, protocol.OpCharacterSelect, 2, protocol.FlagReliable, sel)
+	s.HandlePacket(rawSel, addr)
 	if !s.grid.Contains(sessID) {
-		t.Errorf("expected session %d to be inserted into spatial grid", sessID)
+		t.Errorf("expected session %d to be inserted into spatial grid after CharacterSelect", sessID)
 	}
 	gx, gz, ok := s.grid.GetPosition(sessID)
 	if !ok || gx != pos[0] || gz != pos[2] {
@@ -66,7 +76,22 @@ func TestLifecycle_HandshakeSuccess(t *testing.T) {
 		t.Fatal("expected OpHandshakeRes packet sent, got none")
 	}
 
-	r := bytes.NewReader(sink.LastPacket())
+	var rawRes []byte
+	sink.mu.Lock()
+	for i := len(sink.sent) - 1; i >= 0; i-- {
+		rr := bytes.NewReader(sink.sent[i])
+		h, err := protocol.ReadHeader(rr)
+		if err != nil || h.Opcode != protocol.OpHandshakeRes {
+			continue
+		}
+		rawRes = sink.sent[i]
+		break
+	}
+	sink.mu.Unlock()
+	if rawRes == nil {
+		t.Fatal("expected OpHandshakeRes packet sent, got none")
+	}
+	r := bytes.NewReader(rawRes)
 	hdr, err := protocol.ReadHeader(r)
 	if err != nil {
 		t.Fatalf("failed to read packet header: %v", err)
@@ -120,7 +145,22 @@ func TestLifecycle_HandshakeMaxPlayersEnforcement(t *testing.T) {
 	if sink.PacketCount() == 0 {
 		t.Fatalf("expected HandshakeRes for player 1")
 	}
-	r1 := bytes.NewReader(sink.LastPacket())
+	var raw1Res []byte
+	sink.mu.Lock()
+	for i := len(sink.sent) - 1; i >= 0; i-- {
+		rr := bytes.NewReader(sink.sent[i])
+		h, err := protocol.ReadHeader(rr)
+		if err != nil || h.Opcode != protocol.OpHandshakeRes {
+			continue
+		}
+		raw1Res = sink.sent[i]
+		break
+	}
+	sink.mu.Unlock()
+	if raw1Res == nil {
+		t.Fatalf("expected HandshakeRes for player 1")
+	}
+	r1 := bytes.NewReader(raw1Res)
 	_, _ = protocol.ReadHeader(r1)
 	var res1 protocol.HandshakeRes
 	_ = binary.Read(r1, binary.LittleEndian, &res1)
@@ -293,9 +333,8 @@ func TestLifecycle_ClientTransformSafeZoneTransition(t *testing.T) {
 }
 
 func TestLifecycle_DisconnectPacket(t *testing.T) {
-	s, sink, _ := setupTestServerWithDB(t)
-	dbQueue := make(chan *database.DBWriteJob, 10)
-	s.dbQueue = dbQueue
+	s, sink, db := setupTestServerWithDB(t)
+	_ = db.AutoProvision("uuid-dc-player", "hwid-dc", "DcPlayer")
 	sink.Reset()
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 30031}
@@ -352,14 +391,16 @@ func TestLifecycle_DisconnectPacket(t *testing.T) {
 		t.Errorf("expected session %d to be removed from spatial grid", sessID)
 	}
 
-	// 3. Verify transform queued
-	if len(dbQueue) == 0 {
-		t.Errorf("expected transform to be queued in DB write queue upon disconnect")
-	} else {
-		job := <-dbQueue
-		if !strings.Contains(job.Query, "UPDATE characters") {
-			t.Errorf("expected UPDATE characters query, got '%s'", job.Query)
-		}
+	// 3. Verify transform flushed to DB
+	char, err := db.LoadCharacter("uuid-dc-player")
+	if err != nil {
+		t.Fatalf("LoadCharacter: %v", err)
+	}
+	if char.PosX != 15.0 || char.PosY != 1.0 || char.PosZ != 25.0 {
+		t.Errorf("expected DB pos [15,1,25], got [%f,%f,%f]", char.PosX, char.PosY, char.PosZ)
+	}
+	if char.Health != 85.0 {
+		t.Errorf("expected DB health 85, got %f", char.Health)
 	}
 
 	// 4. Verify OpLeave (OpEntityLeaveAoI, 0x0013) was broadcast to peer

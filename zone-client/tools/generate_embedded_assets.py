@@ -21,6 +21,7 @@ MOD_FILES = [
     "scripts/zone_net.script",
     "scripts/zone_main.script",
     "scripts/zone_ui_server_list.script",
+    "scripts/zone_ui_peer_faction.script",
     "scripts/zone_ai_proxy.script",
     "scripts/zone_dummy.script",
     "scripts/zone_hud.script",

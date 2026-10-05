@@ -5,3 +5,7 @@ db_path: "zone_world.db"
 log_level: "info"
 emission_interval_min: 45
 admin_pipe: "\\\\.\\pipe\\zone_admin"
+server_name: "Zone Online"
+map_name: "l01_escape"
+mode: 0
+locked: false

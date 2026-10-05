@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	MaxSafeUDPPacketSize = 1200
-	OpAck         uint16 = 0x0005
+	MaxSafeUDPPacketSize        = 1200
+	OpAck                uint16 = 0x0005
 )
 
 var (
@@ -25,13 +25,30 @@ type HandshakeReq struct {
 }
 
 type HandshakeRes struct {
-	SessionID [4]byte
-	Status    uint8
-	SpawnX    float32
-	SpawnY    float32
-	SpawnZ    float32
-	WorldTime uint64
-	EcoTier   uint8
+	SessionID    [4]byte
+	Status       uint8
+	SpawnX       float32
+	SpawnY       float32
+	SpawnZ       float32
+	WorldTime    uint64
+	EcoTier      uint8
+	HasCharacter uint8
+	Faction      [16]byte
+}
+
+type ShowStart struct {
+	Level   uint8
+	PosX    float32
+	PosY    float32
+	PosZ    float32
+	Flags   uint8
+	EcoTier uint8
+}
+
+type CharacterSelect struct {
+	Faction [16]byte
+	Money   uint32
+	Items   [256]byte
 }
 
 type ClientTransform struct {
@@ -45,6 +62,7 @@ type ClientTransform struct {
 	VelY      int16
 	VelZ      int16
 	AnimFlags uint8
+	Gvid      uint16
 }
 
 type SnapshotEntry struct {
@@ -71,16 +89,62 @@ type SafezoneStatePayload struct {
 type EntityEnterAoI struct {
 	EntityID   uint32
 	EntityType uint8
-	Section    [32]byte
+	Section    [64]byte
 	PosX       float32
 	PosY       float32
 	PosZ       float32
 	Faction    [16]byte
 	Health     uint8
+	Gvid       uint16
 }
 
 type EntityLeaveAoI struct {
 	EntityID uint32
+}
+
+// ServerQueryRes is the OpServerQueryRes (0x0007) reply. Frozen v2 payload is
+// 70 bytes: two 32-byte fixed strings and six single-byte fields.
+type ServerQueryRes struct {
+	Name       [32]byte
+	Map        [32]byte
+	Players    uint8
+	MaxPlayers uint8
+	Mode       uint8
+	Locked     uint8
+	ProtoVer   uint8
+	TickRateHz uint8
+}
+
+// ReadServerQueryRes decodes a ServerQueryRes payload.
+func ReadServerQueryRes(r io.Reader) (*ServerQueryRes, error) {
+	buf := make([]byte, 70)
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	if n < 70 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	var q ServerQueryRes
+	copy(q.Name[:], buf[0:32])
+	copy(q.Map[:], buf[32:64])
+	q.Players = buf[64]
+	q.MaxPlayers = buf[65]
+	q.Mode = buf[66]
+	q.Locked = buf[67]
+	q.ProtoVer = buf[68]
+	q.TickRateHz = buf[69]
+	return &q, nil
+}
+
+// LevelChangePayload carries the destination level for OpLevelChange (0x0074).
+type LevelChangePayload struct {
+	Level [32]byte
+}
+
+// PlayerVisualPayload carries the actor section for OpPlayerVisual (0x0075).
+type PlayerVisualPayload struct {
+	Visual [64]byte
 }
 
 type DamageNotify struct {
@@ -134,7 +198,7 @@ type StashInteractPayload struct {
 // Status: 0=OK, 1=NotFound, 2=Error
 type StashResponsePayload struct {
 	StashID uint32
-	Status  uint8     // 0=OK, 1=NotFound, 2=Error
+	Status  uint8 // 0=OK, 1=NotFound, 2=Error
 	Count   uint16
 	Data    [256]byte // JSON-serialised stash contents on Action=1 (Open)
 }

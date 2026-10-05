@@ -337,6 +337,12 @@ func TestHandleOpStashInteract_Store(t *testing.T) {
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9005}
 	registerStashTestSession(t, s, addr, "l03_agroprom", [3]float32{0, 0, 0})
+	if err := db.AutoProvision("test-uuid-"+addr.String(), "hwid-test", "Tester"); err != nil {
+		t.Fatalf("AutoProvision failed: %v", err)
+	}
+	if err := db.CreateCharacter("test-uuid-"+addr.String(), "stalker", "medkit,medkit"); err != nil {
+		t.Fatalf("CreateCharacter failed: %v", err)
+	}
 	raw := buildStashInteractPacket(t, stashID, 3 /*Store*/, "medkit", 2)
 	s.HandlePacket(raw, addr)
 
