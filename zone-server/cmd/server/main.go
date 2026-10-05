@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -16,9 +17,24 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load("zone_server.yaml")
+	configPath := flag.String("config", "zone_server.yaml", "path to the YAML configuration file")
+	port := flag.Int("port", 0, "override UDP listen port (0 = use config)")
+	dbPath := flag.String("db-path", "", "override SQLite database path (empty = use config)")
+	tickRate := flag.Int("tick-rate", 0, "override tick rate in Hz (0 = use config)")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+	if *port > 0 {
+		cfg.Port = *port
+	}
+	if *dbPath != "" {
+		cfg.DBPath = *dbPath
+	}
+	if *tickRate > 0 {
+		cfg.TickRateHz = *tickRate
 	}
 
 	level := zapcore.InfoLevel
@@ -60,7 +76,7 @@ func main() {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
 	defer db.Close()
-	
+
 	if err := game.SeedSafeZones(db.RawDB()); err != nil {
 		log.Fatalf("Failed to seed safe zones: %v", err)
 	}

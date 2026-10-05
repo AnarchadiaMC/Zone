@@ -30,7 +30,7 @@ graph TB
     subgraph Client["Client Machine"]
         EXE["AnomalyDX11.exe"] --> DLL["ZoneClient.dll<br/>injected via CreateRemoteThread"]
         DLL --> LUA["LuaJIT VM"]
-        LUA --> SCRIPTS["9 Native Lua Scripts"]
+        LUA --> SCRIPTS["11 Native Lua Scripts"]
     end
 
     subgraph DLLInternals["ZoneClient.dll Internals"]
@@ -38,11 +38,11 @@ graph TB
         HOOK["MinHook detour on<br/>luaL_openlibs in LuaJIT.dll"]
         PROV["AssetProvisioner<br/>auto-writes missing configs"]
         ID["Identity<br/>UUID + HWID hash<br/>persisted in %APPDATA%"]
-        BIND["ZoneNet Lua Polyfill<br/>10 Lua wrappers in zone_net.script"]
+        BIND["ZoneNet Lua Polyfill<br/>FFI bindings in zone_net.script"]
         RING["Lock-free SPSC Ring Buffer<br/>256 entries × 1500 bytes"]
     end
 
-    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 16 opcodes"| NET
+    UDP <-.->|"Binary UDP :27015<br/>12-byte header · 25 opcodes"| NET
     BIND <-.->|"ZoneNet.* Lua calls"| SCRIPTS
 
     style Server fill:#1a1a2e,stroke:#0f3460,color:#e0e0e0
@@ -54,17 +54,19 @@ graph TB
 
 ## Key Highlights
 
-- **Headless Authoritative Daemon (`zone-server`)** — Written in Go for native concurrency and low memory footprint. Ticks at a fixed **30 Hz** (33,333 µs), managing a 64m spatial grid, 220m Area of Interest radius, and two-tier AI simulation. Runs on Windows and Linux.
+- **Headless Authoritative Daemon (`zone-server`)** — Written in Go for native concurrency and low memory footprint. Ticks at **30 Hz** by default (33,333 µs; **configurable via `tick_rate_hz`**), managing a 64m spatial grid, 220m Area of Interest radius, and two-tier AI simulation. Runs on Windows and Linux.
 
 - **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue (buffered channel, capacity 1000) is wired into the game loop for non-blocking DB writes.
 
-- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`) and UI layouts (`zone_ui_server_list.xml`) on attach — DLTX configs only if missing (user edits preserved); scripts + UI XML overwritten atomically (temp + `MoveFileEx`) to match the DLL.
+- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. Contains an embedded `AssetProvisioner` that auto-provisions DLTX configs (`mod_system_zone_online.ltx`, `system.ltx_patch.ltx`), UI layouts (`zone_ui_server_list.xml`, `ui_mm_zone_peer_faction.xml`) and localization (`text/{eng,rus}/ui_zone.xml`) on attach — `system.ltx_patch.ltx` only if missing (user edits preserved); scripts, Zone-owned configs, UI XML and text are overwritten atomically (temp + `MoveFileEx`) to match the DLL.
 
-- **Native X-Ray UI** — Zero external overlay layers or DirectX Present hooks. Injects a native `CUI3tButton` on the main menu via Lua script, opening a native `CUIScriptWnd` Server Browser with Direct Connect, persistent Favorites (up to 16), and double-click-to-connect.
+- **Seamless Join to `l01_escape`** — A new player handshakes, receives `SHOW_START` (`0x0071`), and is taken straight into the native faction/loadout dialog; the server validates the choice, creates the character plus starter inventory in SQLite, then sends `LOAD_LEVEL` (`0x0073`) and `INVENTORY_SYNC` (`0x0076`). The client starts the stock singleplayer level, applies faction, spawn position and inventory, and keeps a pending-join marker across the Lua VM restart. Returning players skip the dialog and go directly to their spawn. Only `l01_escape` is hosted; arbitrary level loading is an engine limitation tracked in [ROADMAP.md](ROADMAP.md).
+
+- **Native X-Ray UI** — Zero external overlay layers or DirectX Present hooks. Injects a native `CUI3tButton` on the main menu via Lua script, opening a native `CUIScriptWnd` Server Browser with Internet/LAN/Favorites/Direct Connect tabs, a synchronous server-query (`0x0006`/`0x0007`) scan, persistent favorites (up to 32) and history (up to 20), and double-click-to-connect. The faction/loadout dialog is a native X-Ray window defined in `ui_mm_zone_peer_faction.xml`. All widgets use stock Anomaly textures; Zone ships no custom textures, and UI strings are localized in `gamedata/configs/text/{eng,rus}/ui_zone.xml`.
 
 - **Cubic Hermite Spline Interpolation** — Remote stalker proxies are smoothed using Catmull-Rom tangent estimation with a **100ms jitter buffer** and an 8-sample position history ring buffer, eliminating stuttering and rubberbanding.
 
-- **Cylindrical Safe Zones** — 12 canonical Zone locations enforce weapon holstering, godmode protection, and PDA alerts on entry/leave. Server-authoritative boundary checks use 2D distance + vertical half-extent.
+- **Cylindrical Safe Zones** — 12 canonical Zone locations (seeded into the DB and loaded at startup) enforce weapon holstering, fire-input blocking, damage immunity in both directions (neither a protected actor nor their attacker deals or receives damage inside), and client-side AI hostility suppression so NPCs and mutants do not acquire targets while either side stands in a zone, plus PDA alerts on entry/leave. Server-authoritative boundary checks use 2D distance + vertical half-extent.
 
 - **Lock-Free Networking** — Client uses a single-producer/single-consumer ring buffer (256 entries) for received packets. Server dispatches packets across 8 worker goroutines using FNV-1a hash of the client address for per-client ordering guarantees.
 
@@ -88,7 +90,7 @@ zone-online/
 │   │   ├── database/            # SQLite schema (7 tables), CRUD, async write queue, stash + ban ops
 │   │   ├── game/                # 30Hz ticker, spatial grid, safe zones, AoI, events, economy, stashes, admin
 │   │   ├── network/             # UDP listener (8 workers), sessions, reliable ACK queue
-│   │   └── protocol/            # Binary wire protocol (14 opcodes, 12-byte header)
+│   │   └── protocol/            # Binary wire protocol (25 opcodes, 12-byte header)
 │   └── zone_server.yaml         # Server configuration
 │
 ├── zone-client/                 # C++ injectable client DLL + automated injector
@@ -98,26 +100,30 @@ zone-online/
 │       ├── main.cpp             # DllMain: MinHook init, Identity, AssetProvisioner
 │       ├── hook/                # MinHook detour on luaL_openlibs
 │       ├── identity/            # UUID + HWID persistence (%APPDATA%\zone_identity.ltx)
-│       ├── lua/                 # ZoneNet global table (8 Lua C bindings)
+│       ├── lua/                 # 17 ZN_* exports consumed via LuaJIT FFI
 │       ├── net/                 # UDP client: background thread, state machine, ring buffer
 │       ├── protocol/            # Packed binary structs (#pragma pack(push, 1))
 │       └── provision/           # Auto-provisions DLTX configs + UI XML on first inject
 │
 ├── gamedata/                    # Native X-Ray configs & scripts for Anomaly 1.5.3
 │   ├── configs/
-│   │   ├── mod_system_zone_online.ltx   # DLTX proxy stalker definition
-│   │   ├── system.ltx_patch.ltx         # Supplementary patch (net_spawn_flags)
-│   │   └── ui/zone_ui_server_list.xml   # Server browser dialog layout
+│   │   ├── mod_system_zone_online.ltx      # DLTX proxy stalker definition
+│   │   ├── system.ltx_patch.ltx            # Supplementary patch (net_spawn_flags)
+│   │   ├── ui/zone_ui_server_list.xml      # Server browser dialog layout
+│   │   ├── ui/ui_mm_zone_peer_faction.xml  # Faction/loadout dialog layout
+│   │   └── text/{eng,rus}/ui_zone.xml      # Zone localization strings
 │   └── scripts/
-│       ├── zone_main.script             # Bootstrap, identity loading, callbacks
-│       ├── zone_net.script              # 30Hz tick, packet dispatcher, transform sync
-│       ├── zone_dummy.script            # Player proxy + Hermite spline interpolation
-│       ├── zone_safezone.script         # Weapon holstering, damage suppression
-│       ├── zone_hud.script              # HUD status overlay, PDA news
-│       ├── zone_menu_patch.script       # Main menu button injection
-│       ├── zone_ui_server_list.script   # Server browser dialog with favorites
-│       ├── zone_ai_proxy.script         # Server-authoritative AI puppets
-│       └── zone_worldevent.script       # Emission + mutant raid sync
+│       ├── zone_main.script              # Bootstrap, identity, save/load veto, SHOW_START owner
+│       ├── zone_net.script               # ZoneNet FFI polyfill, 30Hz tick, packet dispatcher, join flow
+│       ├── zone_dummy.script             # Remote player proxies + Hermite spline interpolation
+│       ├── zone_safezone.script          # Weapon holster, fire block, damage cancel, AI suppression
+│       ├── zone_hud.script               # HUD status overlay, PDA news
+│       ├── modxml_zone_main_menu.script  # XML patch: injects the "Zone" button
+│       ├── zone_menu_patch.script        # Menu button behavior + menu-safe packet pump
+│       ├── zone_ui_server_list.script    # Server browser (tabs, LAN scan, favorites, history)
+│       ├── zone_ui_peer_faction.script   # Faction grid + loadout selection dialog
+│       ├── zone_ai_proxy.script          # Server-authoritative AI puppets
+│       └── zone_worldevent.script        # Emission + mutant raid sync
 │
 ├── Makefile                     # Root build orchestrator
 ├── INSTALL.md                   # Detailed installation and setup guide
@@ -145,6 +151,9 @@ graph TD
     NET -->|"0x0030 world event"| EVENT["zone_worldevent.script<br/>Emissions · Raids"]
     NET -->|"0x0060 chat"| HUD["zone_hud.script<br/>HUD overlay"]
     NET -->|"0x0070 AI action"| AI["zone_ai_proxy.script<br/>AI puppets"]
+    NET -->|"0x0071 show start"| FAC["zone_ui_peer_faction.script<br/>Faction · Loadout"]
+    FAC -->|"0x0072 character select"| NET
+    NET -->|"0x0073/0x0076 spawn + kit"| GAME["Engine: stock start<br/>l01_escape"]
 
     DUMMY -->|"interpolation"| HUD
     SAFE -->|"notify_safezone()"| HUD
@@ -155,15 +164,17 @@ graph TD
 
 | Script | Lines | Purpose |
 |:---|:---:|:---|
-| `zone_main` | 55 | Bootstrap entry point. Reads `%APPDATA%\zone_identity.ltx`, calls `ZoneNet:Connect()`, registers `actor_on_update` and hit/key callbacks. |
-| `zone_net` | 177 | Core network tick. Sends player transform at 30 Hz via LuaJIT FFI. Parses 12-byte packet headers and dispatches by opcode to other scripts. Also defines the `ZoneNet` Lua polyfill table wrapping DLL exports. |
-| `zone_dummy` | 213 | Manages remote player proxy objects. Spawns alife stalkers, buffers 8 position samples, applies cubic Hermite (Catmull-Rom) interpolation with 100ms jitter buffer every frame. Handles damage/kill propagation. |
-| `zone_safezone` | 104 | Enforces safe zone rules. Nullifies incoming damage (`s_hit.power = 0`), blocks fire input, forces weapon holster via `db.actor:hide_weapon()`. Re-holsters every frame. |
-| `zone_hud` | 210 | Persistent HUD indicator at top-right showing `[ZO] Online` / `Safe Zone` / `Offline` with ping. Issues PDA news tips on state transitions. Runs at 1 Hz. |
-| `zone_menu_patch` | 94 | Monkey-patches `ui_main_menu.main_menu:InitControls` to append a native `CUI3tButton` labeled "Zone". Button position defined in XML layout. |
-| `zone_ui_server_list` | 506 | Full `CUIScriptWnd` server browser. Favorites persisted in `%APPDATA%\zone_identity.ltx` (max 16). Supports direct IP connect, double-click-to-connect, add/remove favorites. |
-| `zone_ai_proxy` | 86 | Spawns server-authoritative AI puppets. Handles entity enter (NPC/mutant), AI action events (attack, death), and entity leave. |
-| `zone_worldevent` | 43 | Handles emission warnings (`0x01`), active emissions (`0x02`), clear (`0x03`), raid start (`0x04`), and raid end (`0x05`). Triggers weather changes and siren sounds. |
+| `zone_main` | 276 | Bootstrap entry point. Loads or generates `%APPDATA%\zone_identity.ltx`, calls `ZoneNet:Connect()` for auto-dial, registers the save/load veto and tick callbacks. Sole owner of `SHOW_START` handling: opens the faction/loadout dialog only when the server says this player still needs a character. |
+| `zone_net` | 1127 | Core network layer. Defines the `ZoneNet` polyfill over 17 DLL exports via LuaJIT FFI, sends the player transform at 30 Hz, validates the 12-byte header, and dispatches every opcode. Owns the join/spawn flow (`0x0071`/`0x0073`/`0x0076`/`0x0077`), level/visual reports, inventory materialization, and the menu-safe packet pump. |
+| `zone_dummy` | 557 | Manages remote player proxy objects. Spawns alife stalkers, buffers 8 position samples, applies cubic Hermite (Catmull-Rom) interpolation with a 100ms jitter buffer every frame. Handles damage/kill propagation. |
+| `zone_safezone` | 485 | Enforces safe-zone rules. Lowers/hides the weapon, blocks fire and quick-use binds, cancels damage involving a protected actor, and suppresses AI hostility (`xr_combat_ignore.is_enemy` wrap, `on_enemy_eval` override, monster enemy callback). Reconciled from both the packet state and the client atomic. |
+| `zone_hud` | 354 | Persistent HUD indicator at top-right showing `[ZO] Online` / `Safe Zone` / `Offline` with ping. Issues PDA news tips on state transitions. Runs at 1 Hz. |
+| `modxml_zone_main_menu` | 150 | XML patch that injects `btn_zone_online` into `ui_mm_main.xml` / `ui_mm_main_16.xml`, resizes the menu list and disclaimer, and chains safely with xrRazom's main-menu patch. |
+| `zone_menu_patch` | 112 | Handles the "Zone" button behavior. Wraps `ui_main_menu.main_menu` Update/OnButton, opens the browser, and keeps the menu-safe packet pump running while the menu is up. |
+| `zone_ui_server_list` | 1591 | Full `CUIScriptWnd` server browser with Internet/LAN/Favorites/Direct Connect tabs, synchronous query (`0x0006`/`0x0007`), LAN broadcast probe, favorites (max 32) and history (max 20) persisted in `%APPDATA%\zone_identity.ltx`, and double-click-to-connect. |
+| `zone_ui_peer_faction` | 612 | Faction grid + loadout selection dialog (`ui_mm_zone_peer_faction.xml`). Shows 9 base factions (plus optionally unlocked renegade/greh/isg), point-budgeted loadout from `new_game_loadouts.ltx`, and sends `CHARACTER_SELECT`. |
+| `zone_ai_proxy` | 206 | Spawns server-authoritative AI puppets. Handles entity enter (NPC/mutant), AI action events (attack, death), and entity leave. |
+| `zone_worldevent` | 142 | Handles emission warnings (`0x01`), active emissions (`0x02`), clear (`0x03`), raid start (`0x04`), and raid end (`0x05`). Triggers weather changes and siren sounds. |
 
 ---
 
@@ -194,9 +205,21 @@ sequenceDiagram
     participant C as Client (ZoneClient.dll)
     participant S as Server (zone-server)
 
+    C->>S: SERVER_QUERY (0x0006)<br/>empty payload
+    S->>C: SERVER_QUERY_RES (0x0007)<br/>Name · Map · Players · TickRate
+
     C->>S: HANDSHAKE_REQ (0x0001)<br/>UUID · HWID · Nickname · ProtoVer
-    S->>C: HANDSHAKE_RES (0x0002)<br/>SessionID · Spawn XYZ · WorldTime
-    Note over C,S: Connection established
+    S->>C: HANDSHAKE_RES (0x0002)<br/>SessionID · Status · Spawn · HasCharacter · Faction
+
+    alt New character
+        S->>C: SHOW_START (0x0071)<br/>Level · Spawn · EcoTier
+        C->>S: CHARACTER_SELECT (0x0072)<br/>Faction · Money · Loadout items
+        S->>C: LOAD_LEVEL (0x0073)<br/>l01_escape · Spawn · Faction
+        S->>C: INVENTORY_SYNC (0x0076)<br/>Starter kit (MTU-chunked)
+    else Returning character
+        S->>C: LOAD_LEVEL (0x0073)<br/>Saved spawn · Faction
+        S->>C: INVENTORY_SYNC (0x0076)<br/>Restored inventory
+    end
 
     loop Every 1 second
         C->>S: HEARTBEAT (0x0004)<br/>Timestamp
@@ -204,15 +227,20 @@ sequenceDiagram
     end
 
     loop Every 33ms (30 Hz)
-        C->>S: CLIENT_TRANSFORM (0x0010)<br/>Position · Yaw/Pitch · Velocity · AnimFlags
+        C->>S: CLIENT_TRANSFORM (0x0010)<br/>Position · Yaw/Pitch · Velocity · Gvid
     end
 
+    C->>S: LEVEL_CHANGE (0x0074)<br/>Current level name
+    C->>S: PLAYER_VISUAL (0x0075)<br/>Actor section
+
     S->>C: SERVER_SNAPSHOT (0x0011)<br/>Batch of peer positions
-    S->>C: ENTITY_ENTER_AOI (0x0012)<br/>NPC/mutant spawn
+    S->>C: ENTITY_ENTER_AOI (0x0012)<br/>Player/AI spawn
+    S->>C: ENTITY_LEAVE_AOI (0x0013)<br/>EntityID
     S->>C: SAFEZONE_STATE (0x0020)<br/>Locked · ZoneID
     S->>C: WORLD_EVENT (0x0030)<br/>Emission/Raid event
     S->>C: DAMAGE_NOTIFY (0x0050)<br/>Target · Attacker · Damage · Bone
     S->>C: AI_ACTION_EVENT (0x0070)<br/>EntityID · Action · Target
+    S->>C: ERROR (0x0077)<br/>Code · Message
 
     C->>S: DISCONNECT (0x0003)<br/>Reason
 ```
@@ -222,23 +250,32 @@ sequenceDiagram
 | Opcode | Name | Dir | Payload |
 |:---:|:---|:---:|:---|
 | `0x0001` | `PKT_HANDSHAKE_REQ` | C→S | UUID (37B), HWID (32B SHA-256), Nickname (32B), ProtoVer (1B) |
-| `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B: 0=ok/1=full/2=banned/3=version), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B) |
+| `0x0002` | `PKT_HANDSHAKE_RES` | S→C | SessionID (4B), Status (1B: 0=ok/1=full/2=banned/3=version), SpawnXYZ (12B), WorldTime (8B), EcoTier (1B), HasCharacter (1B), Faction (16B) |
 | `0x0003` | `PKT_DISCONNECT` | Both | Reason (1B) |
 | `0x0004` | `PKT_HEARTBEAT` | Both | Timestamp (8B) |
 | `0x0005` | `PKT_ACK` | Both | Sequence (4B) |
-| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | 27B total: SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (1B) |
-| `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), Array of 32: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
-| `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | EntityID (4B), Type (1B), Section (32B), PosXYZ (12B), Faction (16B), Health (1B) |
+| `0x0006` | `PKT_SERVER_QUERY` | C→S | Empty. Answered without creating a session |
+| `0x0007` | `PKT_SERVER_QUERY_RES` | S→C | 70B fixed: Name (32B), Map (32B), Players (1B), MaxPlayers (1B), Mode (1B), Locked (1B), ProtoVer (1B), TickRateHz (1B) |
+| `0x0010` | `PKT_CLIENT_TRANSFORM` | C→S | 29B: SessionID (4B), PosXYZ (12B), Yaw/Pitch (4B), VelXYZ (6B), AnimFlags (1B), Gvid (2B) |
+| `0x0011` | `PKT_SERVER_SNAPSHOT` | S→C | Peer Count (1B), sparse array of up to 32 × 22B: SessionID, PosXYZ, Yaw/Pitch, AnimFlags, Health |
+| `0x0012` | `PKT_ENTITY_ENTER_AOI` | S→C | 100B: EntityID (4B), Type (1B: 0=AI squad, 1=player), Section (64B), PosXYZ (12B), Faction (16B), Health (1B), Gvid (2B) |
 | `0x0013` | `PKT_ENTITY_LEAVE_AOI` | S→C | EntityID (4B) |
 | `0x0020` | `PKT_SAFEZONE_STATE` | S→C | Locked (1B: 0=free, 1=locked), ZoneID (32B) |
 | `0x0030` | `PKT_WORLD_EVENT` | S→C | EventType (1B), State (1B), Timer (4B) |
-| `0x0040` | `PKT_STASH_INTERACT` | C→S | StashID (4B), Action (1B), ItemSection (32B), Count (2B) |
-| `0x0041` | `PKT_STASH_RESPONSE` | S→C | Stash contents response |
+| `0x0040` | `PKT_STASH_INTERACT` | C→S | StashID (4B), Action (1B: 1=Open/2=Take/3=Store), ItemSection (32B), Count (2B) |
+| `0x0041` | `PKT_STASH_RESPONSE` | S→C | StashID (4B), Status (1B: 0=OK/1=NotFound/2=Error), Count (2B), Data (256B JSON contents on Open) |
 | `0x0050` | `PKT_DAMAGE_NOTIFY` | Both | TargetSessionID (4B), AttackerSessionID (4B), Damage (4B float), BoneID (1B) |
 | `0x0060` | `PKT_CHAT_TEXT` | Both | SenderID (4B), Length (1B), Message Text (up to 255B) |
 | `0x0070` | `PKT_AI_ACTION_EVENT` | S→C | EntityID (4B), Action (1B: Idle/Patrol/Attack/Flee/Death), TargetID (4B) |
+| `0x0071` | `PKT_SHOW_START` | S→C | Level (1B), SpawnXYZ (12B), Flags (1B), EcoTier (1B). Sent when the account has no character |
+| `0x0072` | `PKT_CHARACTER_SELECT` | C→S | Faction (16B), Money (4B), Loadout items (256B `section:count,...`) |
+| `0x0073` | `PKT_LOAD_LEVEL` | S→C | 30B: Level (1B), PosXYZ (12B), Faction (16B), EcoTier (1B) |
+| `0x0074` | `PKT_LEVEL_CHANGE` | C→S | Level (32B). Client reports the level it is on |
+| `0x0075` | `PKT_PLAYER_VISUAL` | C→S | Visual/actor section (64B) |
+| `0x0076` | `PKT_INVENTORY_SYNC` | S→C | ItemCount (1B) + up to 16 × 70B entries: Section (64B), Count (2B), Condition (1B, %), Ammo (2B), Slot (1B, -1 unslotted). MTU-chunked |
+| `0x0077` | `PKT_ERROR` | S→C | Code (1B: 1=invalid faction, 2=invalid loadout, 3=character creation failed), Message (96B) |
 
-Handshake `Status` surfaces distinct client errors via `ZN_GetLastError` (full/banned/version). Chat is level-filtered + rate-limited (5 msgs/5s per session). Reliable inbound packets are ACKed immediately; replayed reliable sequences are dropped after ACK.
+Handshake `Status` surfaces distinct client errors via `ZN_GetLastError` (full/banned/version). Chat is level-filtered + rate-limited (5 msgs/5s per session). Reliable inbound packets are ACKed immediately; replayed reliable sequences are dropped after ACK. `PKT_SERVER_QUERY` is answered from any source address without creating a session, and `PKT_INVENTORY_SYNC` is chunked to stay under the 1200-byte safe MTU.
 
 ---
 
@@ -266,7 +303,7 @@ ZoneClient_Injector.exe --launch "C:\Anomaly\bin\AnomalyDX11.exe"
 Once in the main menu:
 1. Click the native **Zone** button below the menu options.
 2. Enter the server IP (default `127.0.0.1`), port (`27015`), and your callsign.
-3. Click **Connect** and keep the dialog open: the footer polls `ZoneNet:IsConnected()` (~2 Hz) from `Connecting` to `Connected` (then close via **Back** and start/load a game) or `Failed` after ~16s with the `ZN_GetLastError` reason. Do not run xrRazom co-op at the same time — Zone refuses while co-op is live.
+3. Click **Connect**. A new account is taken automatically into the faction/loadout dialog (`SHOW_START`); a returning account is loaded straight to its saved spawn. Pick a faction and loadout and click **Start**: the server creates the character and starter inventory, then the client starts `l01_escape`, applies the server spawn/faction, and materializes the sent inventory. The browser footer polls `ZoneNet:IsConnected()` (~2 Hz) while the handshake is pending; if it fails, it shows `Failed` after ~16s with the `ZN_GetLastError` reason. Do not run xrRazom co-op at the same time — Zone refuses while co-op is live.
 
 ---
 
@@ -276,14 +313,14 @@ Once in the main menu:
 
 | Subsystem | Notes |
 |:---|:---|
-| Config loading (YAML) | 7 keys: port, tick_rate_hz, max_players, db_path, log_level, emission_interval_min, admin_pipe. Complete bounds validation (`Validate()`). |
+| Config loading (YAML) | 11 keys: port, tick_rate_hz, max_players, db_path, log_level, emission_interval_min, admin_pipe, server_name, map_name, mode, locked. Complete bounds validation (`Validate()`). |
 | Database schema (7 tables) | accounts, characters, character_inventory, world_stashes, safe_zones, audit_log, ai_squads. WAL mode via pragma. |
 | Database CRUD & Lifecycle | AutoProvision, LoadCharacter, SaveCharacter, FlushPlayerTransform, GetCharacterInventory (with `rows.Err()` checks), IsPlayerBanned, BanAccount, GetStash, SaveStash, UpdateStashContents, clean `Close()` method. |
 | DB async write queue | `StartWriteQueue()` routes writes through buffered channel (cap 1000). Gracefully drains all pending jobs on server shutdown. |
-| Safe zone seeding + detection | 12 cylindrical zones hardcoded, seeded into DB on startup. 2D distance + height check. |
+| Safe zone seeding + detection | 12 cylindrical zones seeded into the DB on first startup, then loaded from `safe_zones` so operator edits apply on restart. 2D distance + height check. |
 | UDP listener + worker pool | 8 goroutines, FNV-1a address affinity, sync.Pool buffer recycling, atomic dropped packet counter + warnings. |
 | Session management | Dual-index map (by ID + by addr), cached slice for lock-free reads, 30s stale timeout, session ID collision cleanup. |
-| Binary protocol read/write | 12-byte header, little-endian, 16 wire opcodes (incl. `0x0005` ACK). `WritePacket` bounds-checks payload length <= 65535. Sparse `ServerSnapshot` delta serialization. Replay protection via per-session `LastSequence` (stale reliable dropped after ACK). |
+| Binary protocol read/write | 12-byte header, little-endian, 25 wire opcodes (incl. `0x0005` ACK). `WritePacket` enforces the 1200-byte safe MTU and the uint16 payload ceiling. Sparse `ServerSnapshot` serialization. Replay protection via per-session `LastSequence` (stale reliable dropped after ACK). |
 | Reliable delivery (send + retransmit) | 500ms retransmit interval, 5 retries, checked each game tick. Client sends immediate `0x0005` ACK on reliable receipt; server ACKs inbound reliable packets the same way. |
 | AI pathfinding (A*) | Full implementation with priority queue, 3D Euclidean heuristic, quantized integer waypoint keys, 5000-iteration ceiling. |
 | Anti-Cheat & Transform Validation | Total 3D speed magnitude validation (`sqrt(vx^2 + vy^2 + vz^2) <= 25m/s`), NaN/Inf coordinate rejection, +/-10000 coordinate clamping. |
@@ -295,8 +332,8 @@ Once in the main menu:
 | Asset provisioning | DLTX configs written only if missing; scripts + UI XML overwritten atomically (temp + `MoveFileEx`). Robust `\bin` directory matching preventing over-stripping. |
 | Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering, dropped packet tracking, capacity-checked event polling. |
 | Player proxy interpolation | Cubic Hermite (Catmull-Rom), 100ms jitter buffer, O(1) ring buffer history, non-uniform time scaling, smooth edge interval handling. |
-| Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0`), fire input block (`kWPN_FIRE`/`kWPN_ZOOM`), weapon re-holster every frame, state reset on level change & disconnect. |
-| Server browser UI | CUIScriptWnd with favorites (max 16), direct connect, double-click-to-connect, direct io-only LTX write (no tmp/rename), nickname sanitization. Dialog stays open with `Connecting→Connected/Failed` footer (~2 Hz `IsConnected()` poll, 16s timeout); Connect gated on DLL-loaded (`ffi.load`) and xrRazom-idle. |
+| Safe zone enforcement (client) | Damage nullification (`s_hit.power = 0` plus hard cancel), fire and quick-use input block, weapon lower/hide with per-frame re-holster, AI hostility suppression (`xr_combat_ignore.is_enemy` wrap, `on_enemy_eval` override, monster enemy callback), state reset on level change & disconnect. |
+| Server browser UI | CUIScriptWnd with Internet/LAN/Favorites/Direct Connect tabs, synchronous `0x0006`/`0x0007` query with ping, LAN broadcast probe, favorites (max 32) and history (max 20) persisted in `%APPDATA%\zone_identity.ltx`, double-click-to-connect, direct io-only LTX write (no tmp/rename), nickname sanitization. Dialog stays open with `Connecting→Connected/Failed` footer (~2 Hz `IsConnected()` poll, 16s timeout); Connect gated on DLL-loaded (`ffi.load`) and xrRazom-idle. |
 | HUD status overlay | CUIStatic at top-right, 1 Hz update, dynamic screen resolution and aspect-ratio tracking via `device().width`/`device().height`, PDA news on transitions. |
 | World event sync | Emission warn/active/clear, raid start/end. 6-byte wire protocol (`eventType`, `state`, `timer`), weather changes + siren sounds, nil-safe audio objects, state reset on disconnect. |
 | Economy & Stash systems | Buy/sell transactions, ruble currency, atomic balance checks, tier progression, unmarshal-safe stash CRUD without lock starvation. Stash access is 5m + same-level + passcode-gated, fail-closed (no passcode field on the wire yet, so locked stashes reject). |
@@ -304,6 +341,9 @@ Once in the main menu:
 | Per-IP Rate Limiting | Token bucket per client IP (100 pkt/s, burst 150) in raw UDP ingestion loop with 60s idle cleanup, early-dropping flood traffic before worker queue. |
 | Chat (level-filtered + rate-limited) | Sender-ID forgery rejected, 5 msgs/5s per-session limit, sanitized UTF-8, broadcast to sender's level only (admin sender 0 still global). |
 | Client Reliable ACK Engine | Immediate `Opcode::ACK` (0x0005) dispatch on receiving reliable packets (`flags & 0x01`), halting server retransmission timeouts. |
+| Seamless join flow (0x0071/0x0072/0x0073/0x0076) | New account: `SHOW_START` → native faction/loadout dialog → server validates faction/loadout, creates the character and starter inventory in SQLite → `LOAD_LEVEL` + `INVENTORY_SYNC`. Returning account: `LOAD_LEVEL` + inventory directly. Client persists a pending-join marker across the Lua VM restart and applies faction/spawn/kit once the level loads. |
+| Server query (0x0006/0x0007) | Answered from any source address without creating a session; returns name, map, player/max counts, mode, lock state, protocol version and tick rate in a frozen 70-byte payload. |
+| Level & visual replication (0x0074/0x0075) | Client reports its level on change and actor section at 1 Hz or on change; server validates the level whitelist, sanitizes the visual and broadcasts entity enter to peers. |
 | Anti-Combat Logging Sleeper System | Spawns authoritative 30-second sleeper proxy entities on explicit disconnect AND 30s timeout outside safe zones or during active combat; persists damage and death to database. |
 | Server-Authoritative Combat & Damage Rules | Validates attack distance (300m ceiling), enforces safe zone damage immunity for attacker and target, clamps damage, tracks 30-second combat engagement status. |
 | Session Authentication & Ban Enforcement | Validates session IDs and tokens on incoming client packets; handshake returns Status 0/1/2/3 (ok/full/banned/version) with distinct `ZN_GetLastError` client errors. |
@@ -312,16 +352,13 @@ Once in the main menu:
 
 ---
 
-## To-Do & Roadmap
+## What Works / What Is Next
 
-Subsystems and features scheduled for upcoming milestones:
+**Works today:** dedicated Go server on UDP `:27015` with binary protocol v2; seamless join and server-created characters on `l01_escape`; client-side proxy rendering and interpolation of remote players; authoritative cylindrical safe zones with weapon holstering, damage immunity and client-side AI hostility suppression; level/visual replication; chat; economy and stash backend; server query; admin named pipe.
 
-### Infrastructure & Deployment
+**Next:** two-client runtime verification on a live install; arbitrary-level loading (blocked by the engine — a menu start runs the stock `all.spawn` registry and no Lua API loads an arbitrary level by name); full inventory sync (client→server item moves, containers, trader stock); server-authoritative NPC/AI damage once AI simulation exists.
 
-| Subsystem | Priority | Description |
-|:---|:---:|:---|
-| Master Server Browser | Low | Add central HTTP master server listing for public community servers |
-| Dedicated Headless Linux VM Deployment | Low | Deploy to headless Ubuntu container and verify LAN latency |
+See [ROADMAP.md](ROADMAP.md) for the full production roadmap, including faction warfare design, persistence rules, infrastructure and known gaps.
 
 ---
 
