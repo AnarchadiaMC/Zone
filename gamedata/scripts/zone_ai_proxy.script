@@ -17,7 +17,9 @@ end
 function on_entity_enter(pkt, offset)
     if xrr_active() then return end
     if not pkt or not offset then return end
-    if string.len(pkt) < offset + 100 - 1 then return end
+    -- ENTITY_ENTER_AOI v3 is 132 bytes (entityID u32, type u8, section[64],
+    -- x/y/z f32, faction[16], health u8, gvid u16, name[32]).
+    if string.len(pkt) < offset + 132 - 1 then return end
     local eid, pos = zone_net.read_uint32_le(pkt, offset)
     local typ, pos = zone_net.read_uint8(pkt, pos)
     local section, pos = zone_net.read_string(pkt, pos, 64)
@@ -31,6 +33,10 @@ function on_entity_enter(pkt, offset)
     faction = faction:gsub("%z+", "")
     local health, pos = zone_net.read_uint8(pkt, pos)
     local gvid, pos = zone_net.read_uint16_le(pkt, pos)
+    -- name[32] is player-only metadata; AI puppets ignore it but must consume
+    -- it so the v3 bounds/cursor stay aligned.
+    local name, pos = zone_net.read_string(pkt, pos, 32)
+    name = name:gsub("%z+", "")
     
     -- typ 0 = AI squad (wire EntityType), 2/3 = legacy NPC/Mutant values.
     if typ == 0 or typ == 2 or typ == 3 then

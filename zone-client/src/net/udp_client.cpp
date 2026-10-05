@@ -8,6 +8,7 @@
 #include <mutex>
 #include <chrono>
 #include <vector>
+#include <algorithm>
 #include <condition_variable>
 #include <iostream>
 
@@ -75,6 +76,50 @@ namespace
         bool updated = false;
     } g_Transform;
     std::mutex g_TransformMutex;
+
+    // Non-blocking server query table. Each in-flight query owns a dedicated
+    // temporary UDP socket plus one WSAStartup reference, released exactly once
+    // when the entry is removed (poll success/failure, cancel, or expiry sweep).
+    struct PendingQuery
+    {
+        int id = 0;
+        SOCKET sock = INVALID_SOCKET;
+        std::chrono::steady_clock::time_point deadline;
+        std::chrono::steady_clock::time_point rttStart;
+    };
+    constexpr size_t kMaxPendingQueries = 32;
+    std::mutex g_QueryMutex;
+    std::vector<PendingQuery> g_PendingQueries;
+    std::atomic<int> g_NextQueryId = 1;
+    std::atomic<uint32_t> g_QuerySequence = 1;
+
+    void CloseQuerySocket(PendingQuery& query)
+    {
+        if (query.sock != INVALID_SOCKET)
+        {
+            closesocket(query.sock);
+            query.sock = INVALID_SOCKET;
+        }
+        WSACleanup();
+    }
+
+    // Must be called with g_QueryMutex held.
+    void SweepExpiredQueries(std::chrono::steady_clock::time_point now)
+    {
+        auto it = g_PendingQueries.begin();
+        while (it != g_PendingQueries.end())
+        {
+            if (now >= it->deadline)
+            {
+                CloseQuerySocket(*it);
+                it = g_PendingQueries.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
 
     void SendPacket(const char* buf, int len)
     {
@@ -555,6 +600,7 @@ namespace NetClient
             closesocket(g_Socket);
             g_Socket = INVALID_SOCKET;
         }
+        QueryCancelAll();
         WSACleanup();
     }
 
@@ -842,5 +888,186 @@ namespace NetClient
         closesocket(sock);
         WSACleanup();
         return result;
+    }
+
+    int QueryStart(const std::string& ip, uint16_t port, int timeoutMs)
+    {
+        if (ip.empty() || port == 0 || timeoutMs <= 0)
+            return -1;
+
+        sockaddr_in target = {};
+        target.sin_family = AF_INET;
+        target.sin_port = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &target.sin_addr) != 1)
+            return -1;
+
+        // One WSAStartup reference per in-flight query; released in
+        // CloseQuerySocket when the entry leaves g_PendingQueries.
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+            return -1;
+
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET)
+        {
+            WSACleanup();
+            return -1;
+        }
+
+        u_long nonBlocking = 1;
+        if (ioctlsocket(sock, FIONBIO, &nonBlocking) != 0)
+        {
+            closesocket(sock);
+            WSACleanup();
+            return -1;
+        }
+
+        auto rttStart = std::chrono::steady_clock::now();
+        uint32_t seq = g_QuerySequence.fetch_add(1, std::memory_order_relaxed);
+        ZO_Header hdr = { 0x5A4F, 1, 1, seq, (uint16_t)Opcode::SERVER_QUERY, 0 };
+        int sent = sendto(sock, (const char*)&hdr, sizeof(hdr), 0, (sockaddr*)&target, sizeof(target));
+        if (sent == SOCKET_ERROR)
+        {
+            closesocket(sock);
+            WSACleanup();
+            return -1;
+        }
+
+        std::lock_guard<std::mutex> lock(g_QueryMutex);
+        SweepExpiredQueries(rttStart);
+
+        if (g_PendingQueries.size() >= kMaxPendingQueries)
+        {
+            closesocket(sock);
+            WSACleanup();
+            return -2;
+        }
+
+        int queryId = 0;
+        do
+        {
+            queryId = g_NextQueryId.fetch_add(1, std::memory_order_relaxed);
+        } while (queryId <= 0);
+
+        PendingQuery query;
+        query.id = queryId;
+        query.sock = sock;
+        query.deadline = rttStart + std::chrono::milliseconds(timeoutMs);
+        query.rttStart = rttStart;
+        g_PendingQueries.push_back(query);
+        return queryId;
+    }
+
+    int QueryPoll(int queryId, char* outBuf, int outBufLen, int* outRttMs)
+    {
+        if (queryId <= 0 || !outBuf || outBufLen <= 0)
+            return -1;
+
+        std::lock_guard<std::mutex> lock(g_QueryMutex);
+
+        auto it = std::find_if(g_PendingQueries.begin(), g_PendingQueries.end(),
+            [queryId](const PendingQuery& q) { return q.id == queryId; });
+        if (it == g_PendingQueries.end())
+            return -1;
+
+        auto now = std::chrono::steady_clock::now();
+        if (now >= it->deadline)
+        {
+            CloseQuerySocket(*it);
+            g_PendingQueries.erase(it);
+            return -1;
+        }
+
+        // Bounded, zero-timeout receive loop on this query's socket only.
+        int result = 0;
+        char recvBuf[1500];
+        for (int iter = 0; iter < 32; ++iter)
+        {
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(it->sock, &readfds);
+            timeval tv = {0, 0};
+            int sel = select(0, &readfds, nullptr, nullptr, &tv);
+            if (sel <= 0)
+                break;
+
+            sockaddr_in from;
+            int fromLen = sizeof(from);
+            int res = recvfrom(it->sock, recvBuf, sizeof(recvBuf), 0, (sockaddr*)&from, &fromLen);
+            if (res == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK)
+                    break;
+                // WSAECONNRESET (ICMP port unreachable) and other receive
+                // errors are terminal for this query.
+                result = -1;
+                break;
+            }
+            if (res < (int)sizeof(ZO_Header))
+                continue;
+
+            ZO_Header* rhdr = (ZO_Header*)recvBuf;
+            if (rhdr->magic != 0x5A4F || rhdr->opcode != (uint16_t)Opcode::SERVER_QUERY_RES)
+                continue;
+
+            int payloadLen = res - (int)sizeof(ZO_Header);
+            if (payloadLen > outBufLen)
+            {
+                result = -1;
+                break;
+            }
+
+            memcpy(outBuf, recvBuf + sizeof(ZO_Header), payloadLen);
+            if (outRttMs)
+            {
+                auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - it->rttStart).count();
+                *outRttMs = (int)rtt;
+            }
+            result = payloadLen;
+            break;
+        }
+
+        if (result == 0)
+        {
+            now = std::chrono::steady_clock::now();
+            if (now >= it->deadline)
+            {
+                CloseQuerySocket(*it);
+                g_PendingQueries.erase(it);
+                return -1;
+            }
+            return 0;
+        }
+
+        CloseQuerySocket(*it);
+        g_PendingQueries.erase(it);
+        return result;
+    }
+
+    void QueryCancel(int queryId)
+    {
+        if (queryId <= 0)
+            return;
+
+        std::lock_guard<std::mutex> lock(g_QueryMutex);
+        auto it = std::find_if(g_PendingQueries.begin(), g_PendingQueries.end(),
+            [queryId](const PendingQuery& q) { return q.id == queryId; });
+        if (it == g_PendingQueries.end())
+            return;
+
+        CloseQuerySocket(*it);
+        g_PendingQueries.erase(it);
+    }
+
+    void QueryCancelAll()
+    {
+        std::lock_guard<std::mutex> lock(g_QueryMutex);
+        for (auto& query : g_PendingQueries)
+        {
+            CloseQuerySocket(query);
+        }
+        g_PendingQueries.clear();
     }
 }

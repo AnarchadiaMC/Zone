@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     event_type TEXT NOT NULL,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS faction_relations (
+    faction TEXT NOT NULL,
+    other TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (faction, other)
+);
 CREATE TABLE IF NOT EXISTS ai_squads (
     squad_id INTEGER PRIMARY KEY AUTOINCREMENT,
     level_name TEXT NOT NULL,

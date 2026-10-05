@@ -10,6 +10,7 @@ type PlayerSession struct {
 	sync.Mutex
 	SessionID         uint32
 	AccountID         string
+	Name              string
 	UDPAddr           *net.UDPAddr
 	CurrentLevel      string
 	Position          [3]float32
@@ -189,6 +190,26 @@ func (sm *SessionManager) GetByAddr(addr string) *PlayerSession {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.byAddr[addr]
+}
+
+// GetByName returns the connected session whose nickname matches exactly, or
+// nil when no session carries that name. Used by group invitations.
+func (sm *SessionManager) GetByName(name string) *PlayerSession {
+	if name == "" {
+		return nil
+	}
+	sm.mu.RLock()
+	all := sm.allCached
+	sm.mu.RUnlock()
+	for _, sess := range all {
+		sess.Lock()
+		match := sess.Name == name
+		sess.Unlock()
+		if match {
+			return sess
+		}
+	}
+	return nil
 }
 
 func (sm *SessionManager) GetAll() []*PlayerSession {

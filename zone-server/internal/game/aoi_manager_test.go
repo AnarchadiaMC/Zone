@@ -27,8 +27,9 @@ func TestAoIManager_NotifyEntity(t *testing.T) {
 		Type:    2,
 		Section: "stalker_regular",
 		Pos:     [3]float32{10, 20, 30},
-		Faction: 1,
+		Faction: "stalker",
 		Health:  100,
+		Name:    "Regular",
 	}
 
 	var seq atomic.Uint32

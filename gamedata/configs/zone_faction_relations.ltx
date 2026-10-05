@@ -1,0 +1,21 @@
+; Zone Online faction relations
+; Derived from vanilla Anomaly configs\creatures\game_relations.ltx
+; [communities_relations], restricted to the selectable factions.
+; Values: -2000 = enemy, 0 = neutral, 300 = ally, 2000 = coalition ally.
+; The matrix is symmetric; server defaults are embedded in the Go build and
+; seeded into the faction_relations database table when it is empty.
+
+[faction_relations]
+stalker = bandit:-2000, monolith:-2000, killer:-2000, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:0, freedom:0, ecolog:0, csky:0, isg:0
+bandit = stalker:-2000, monolith:-2000, killer:0, army:-2000, renegade:300, greh:-2000, zombied:-2000, dolg:-2000, freedom:0, ecolog:-2000, csky:-2000, isg:-2000
+dolg = stalker:0, bandit:-2000, monolith:-2000, killer:-2000, army:0, renegade:-2000, greh:-2000, zombied:-2000, freedom:-2000, ecolog:0, csky:0, isg:-2000
+freedom = stalker:0, bandit:0, monolith:-2000, killer:0, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:-2000, ecolog:0, csky:0, isg:-2000
+csky = stalker:0, bandit:-2000, monolith:-2000, killer:0, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:0, freedom:0, ecolog:0, isg:-2000
+ecolog = stalker:0, bandit:-2000, monolith:-2000, killer:0, army:0, renegade:-2000, greh:-2000, zombied:-2000, dolg:0, freedom:0, csky:0, isg:-2000
+killer = stalker:-2000, bandit:0, monolith:-2000, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:-2000, freedom:0, ecolog:0, csky:0, isg:0
+army = stalker:-2000, bandit:-2000, monolith:-2000, killer:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:0, freedom:-2000, ecolog:0, csky:-2000, isg:-2000
+monolith = stalker:-2000, bandit:-2000, killer:-2000, army:-2000, renegade:-2000, greh:300, zombied:300, dolg:-2000, freedom:-2000, ecolog:-2000, csky:-2000, isg:-2000
+renegade = stalker:-2000, bandit:300, monolith:-2000, killer:-2000, army:-2000, greh:-2000, zombied:-2000, dolg:-2000, freedom:-2000, ecolog:-2000, csky:-2000, isg:-2000
+greh = stalker:-2000, bandit:-2000, monolith:300, killer:-2000, army:-2000, renegade:-2000, zombied:300, dolg:-2000, freedom:-2000, ecolog:-2000, csky:-2000, isg:-2000
+isg = stalker:-2000, bandit:-2000, monolith:-2000, killer:0, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:-2000, freedom:-2000, ecolog:-2000, csky:-2000
+zombied = stalker:-2000, bandit:-2000, monolith:300, killer:-2000, army:-2000, renegade:-2000, greh:300, dolg:-2000, freedom:-2000, ecolog:-2000, csky:-2000, isg:-2000

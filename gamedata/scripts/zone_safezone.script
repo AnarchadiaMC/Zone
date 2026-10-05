@@ -412,7 +412,18 @@ local function on_before_hit(victim, s_hit, bone_id, flags)
     end)
 end
 
+-- Cheap guard: while the Zone chat edit box is capturing text, do not treat
+-- keystrokes as offensive input (zone_hud already suppresses the binds).
+local function chat_input_open()
+    local open = false
+    pcall(function()
+        if zone_hud and zone_hud.is_chat_open then open = zone_hud.is_chat_open() == true end
+    end)
+    return open
+end
+
 local function on_before_key_press(dik, bind, dis, flags)
+    if chat_input_open() then return end
     pcall(function()
         if not enforced then return end
         ensure_blocklist()
@@ -421,6 +432,7 @@ local function on_before_key_press(dik, bind, dis, flags)
 end
 
 local function on_before_key_hold(dik, bind, dis, flags)
+    if chat_input_open() then return end
     pcall(function()
         if not enforced then return end
         ensure_blocklist()

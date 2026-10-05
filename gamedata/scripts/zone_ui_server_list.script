@@ -4,10 +4,22 @@ local HISTORY_SEC = "zone_history"
 local LEGACY_SEC = "server_history"
 local IDENTITY_SEC = "identity"
 local MAX_FAVORITES = 32
-local MAX_HISTORY = 20
+local MAX_HISTORY = 100
 local ROW_H = 26
+-- Blocking probe values. Only used by the legacy ScanStep fallback when the
+-- loaded DLL does not export the async query API.
 local SCAN_TIMEOUT_MS = 450
 local SCAN_STEP_MS = 50
+-- Async scan scheduling (ZN_QueryStart / ZN_QueryPoll).
+local ASYNC_TIMEOUT_INTERNET_MS = 750
+local ASYNC_TIMEOUT_LAN_MS = 400
+local ASYNC_MAX_INTERNET = 16
+local ASYNC_MAX_LAN = 4
+local ASYNC_POLL_PER_UPDATE = 24
+local RETRY_BACKOFF = { 30, 60, 120, 300 }
+local RETRY_MAX_ACTIVE = 4
+local MAX_FILTER_LEN = 24
+local MAX_PING_CYCLE = { 0, 80, 160, 300 }
 local CONNECT_TIMEOUT_MS = 16000
 local CONNECT_POLL_MS = 500
 local LAN_PROBE_COUNT = 4
@@ -24,6 +36,7 @@ local TAB_INTERNET = "tab_internet"
 local TAB_LAN = "tab_lan"
 local TAB_FAVORITES = "tab_favorites"
 local TAB_DIRECT = "tab_direct"
+local TAB_ORDER = { TAB_INTERNET, TAB_LAN, TAB_FAVORITES, TAB_DIRECT }
 
 local function argb(a, r, g, b)
     if GetARGB then
@@ -96,10 +109,34 @@ local function field_text(id, value)
     return "%c[0,140,140,134]" .. tr(id) .. ": %c[0,225,225,215]" .. tostring(value)
 end
 
+-- UTF-8 safe truncation: never cut inside a multibyte sequence, and strip
+-- control characters (server-provided names/maps are untrusted).
+local function utf8_safe_prefix(s, max_bytes)
+    if type(s) ~= "string" then return "" end
+    s = s:gsub("[%z\1-\8\11\12\14-\31\127]", "")
+    if #s <= max_bytes then return s end
+    local cut = max_bytes
+    local b = s:byte(cut)
+    -- Walk back over continuation bytes (0x80..0xBF) to the sequence lead.
+    while cut > 1 and b and b >= 128 and b < 192 do
+        cut = cut - 1
+        b = s:byte(cut)
+    end
+    if b and b >= 192 then
+        local need = 2
+        if b >= 240 then need = 4
+        elseif b >= 224 then need = 3 end
+        if cut + need - 1 > max_bytes then cut = cut - 1 end
+    end
+    if cut < 0 then cut = 0 end
+    return s:sub(1, cut)
+end
+
 local function clip_text(s, n)
     if type(s) ~= "string" then return "" end
-    if #s <= n then return s end
-    return s:sub(1, n - 1) .. "."
+    local prefix = utf8_safe_prefix(s, n)
+    if prefix == s then return prefix end
+    return prefix .. "."
 end
 
 local function mode_name(m)
@@ -148,7 +185,7 @@ local function sanitize_label(label, fallback_ip, fallback_port)
         if fallback_ip then return string.format("%s:%s", tostring(fallback_ip), tostring(fallback_port)) end
         return "Server"
     end
-    if #cleaned > 32 then cleaned = cleaned:sub(1, 32) end
+    if #cleaned > 32 then cleaned = utf8_safe_prefix(cleaned, 32) end
     return cleaned
 end
 
@@ -189,6 +226,8 @@ local function parse_entry(raw, is_fav_default)
     local ipport = nil
     local flagStr = nil
     local tsStr = nil
+    local protoStr = nil
+    local addedStr = nil
 
     if #parts == 1 then
         local s = parts[1]
@@ -206,6 +245,8 @@ local function parse_entry(raw, is_fav_default)
         ipport = parts[2]:match("^%s*(.-)%s*$")
         flagStr = parts[3]
         if #parts >= 4 then tsStr = parts[4] end
+        if #parts >= 5 then protoStr = parts[5] end
+        if #parts >= 6 then addedStr = parts[6] end
     end
 
     if not ipport then return nil end
@@ -236,6 +277,14 @@ local function parse_entry(raw, is_fav_default)
     end
     if lastSeen == 0 then lastSeen = now_timestamp() end
 
+    local proto = 0
+    if protoStr then proto = tonumber(protoStr) or 0 end
+    local added = 0
+    if addedStr then added = tonumber(addedStr) or 0 end
+    if added == 0 then added = lastSeen end
+
+    -- Persisted format (back-compatible):
+    --   label|ip:port|fav|last_seen|proto|added
     return {
         label = label,
         ip = ip,
@@ -243,7 +292,10 @@ local function parse_entry(raw, is_fav_default)
         is_fav = is_fav,
         status = is_fav and "Favorite" or "Recent",
         lastSeen = lastSeen,
-        added = lastSeen,
+        added = added,
+        proto = proto,
+        fail_count = 0,
+        retry_at = 0,
         state = nil,
         query = nil
     }
@@ -254,6 +306,46 @@ local function find_entry_by_addr(list, ip, port)
         if e.ip == ip and e.port == port then return e, idx end
     end
     return nil, nil
+end
+
+local function write_lines_to_file(path, lines)
+    local ok_open, out = pcall(io.open, path, "w")
+    if not ok_open or not out then return false end
+    local write_ok = true
+    pcall(function()
+        for _, l in ipairs(lines) do
+            if out:write(l .. "\n") == nil then write_ok = false break end
+        end
+    end)
+    pcall(function() out:close() end)
+    return write_ok
+end
+
+-- Atomic persistence: write a temp file next to the target, then rename.
+-- Windows rename-over-existing can fail, so remove the destination once and
+-- retry. If os.rename is unavailable (or keeps failing), fall back to a direct
+-- non-atomic write.
+local function write_lines_atomic(path, lines)
+    if type(os.rename) ~= "function" then
+        -- No atomic rename available: direct write fallback (non-atomic).
+        return write_lines_to_file(path, lines)
+    end
+    local tmp = path .. ".tmp"
+    if not write_lines_to_file(tmp, lines) then
+        pcall(os.remove, tmp)
+        return write_lines_to_file(path, lines)
+    end
+    -- os.rename reports failure by returning nil, err (it does not raise).
+    local moved = false
+    pcall(function() moved = (os.rename(tmp, path) == true) end)
+    if not moved then
+        pcall(os.remove, path)
+        pcall(function() moved = (os.rename(tmp, path) == true) end)
+    end
+    if moved then return true end
+    pcall(os.remove, tmp)
+    -- Rename keeps failing (locked file): last-resort direct write.
+    return write_lines_to_file(path, lines)
 end
 
 local _server_browser_dlg = nil
@@ -290,6 +382,35 @@ function UIZoneServerList:__init(owner)
     self.scan_prev_connected = false
     self.broadcast_hit = nil
 
+    -- Async scheduler state.
+    self.scan_mode = nil
+    self.async_ok = nil
+    self.scan_gen = 0
+    self.query_inflight = {}
+    self.queue_internet = {}
+    self.queue_lan = {}
+    self.scan_total = 0
+    self.scan_done = 0
+    self.scan_fail_reason = nil
+    self.last_fail_reason = nil
+    self.last_retry_service = 0
+
+    -- Row model widgets keyed by ip:port, and their view indices.
+    self.row_widgets = {}
+    self.row_index = {}
+    self.view_dirty = false
+
+    -- Sort/filter view state.
+    self.sort_key = "ping"
+    self.sort_asc = true
+    self.filter_text = ""
+    self.filter_editing = false
+    self.hide_full = false
+    self.hide_empty = false
+    self.hide_locked = false
+    self.max_ping = 0
+    self.own_proto = nil
+
     self.connect_ip = nil
     self.connect_port = nil
     self.connect_start = 0
@@ -301,6 +422,7 @@ function UIZoneServerList:__init(owner)
 end
 
 function UIZoneServerList:__finalize()
+    self:AbortScan()
     _server_browser_dlg = nil
 end
 
@@ -318,6 +440,16 @@ function UIZoneServerList:NetAvailable()
         return ZoneNet ~= nil and type(ZoneNet.QueryServer) == "function"
     end)
     return ok and avail and true or false
+end
+
+function UIZoneServerList:AsyncAvailable()
+    local avail = false
+    pcall(function()
+        if ZoneNet and type(ZoneNet.HasAsyncQuery) == "function" then
+            avail = ZoneNet:HasAsyncQuery() and true or false
+        end
+    end)
+    return avail
 end
 
 function UIZoneServerList:ClientLoaded()
@@ -488,6 +620,20 @@ function UIZoneServerList:InitCallBacks()
             self:AddCallback("server_list", ui_events.WINDOW_LBUTTON_DB_CLICK, self.OnConnect, self)
         end
     end
+    -- Sortable column headers: the header controls exist in the dialog XML;
+    -- clicking one selects that column (Mode cycles Mode/Proto/Lock).
+    if ui_events.WINDOW_LBUTTON_DOWN then
+        local function header_cb(ctrl, name, fn)
+            if not ctrl then return end
+            self:Register(ctrl, name)
+            self:AddCallback(name, ui_events.WINDOW_LBUTTON_DOWN, fn, self)
+        end
+        header_cb(self.col_name, "col_name", self.OnSortName)
+        header_cb(self.col_map, "col_map", self.OnSortMap)
+        header_cb(self.col_players, "col_players", self.OnSortPlayers)
+        header_cb(self.col_ping, "col_ping", self.OnSortPing)
+        header_cb(self.col_mode, "col_mode", self.OnSortMode)
+    end
 end
 
 function UIZoneServerList:UpdateLabels()
@@ -518,6 +664,24 @@ function UIZoneServerList:UpdateLabels()
         cap(TAB_LAN, tr("ui_zone_tab_lan"))
         cap(TAB_FAVORITES, tr("ui_zone_tab_favorites"))
         cap(TAB_DIRECT, tr("ui_zone_tab_direct"))
+    end
+    self:UpdateSortMarkers()
+end
+
+function UIZoneServerList:UpdateSortMarkers()
+    local arrow = (self.sort_asc == false) and " v" or " ^"
+    local key = self.sort_key or "ping"
+    local ctrl, id = nil, nil
+    if key == "name" then ctrl, id = self.col_name, "ui_zone_col_name"
+    elseif key == "map" then ctrl, id = self.col_map, "ui_zone_col_map"
+    elseif key == "players" then ctrl, id = self.col_players, "ui_zone_col_players"
+    elseif key == "ping" then ctrl, id = self.col_ping, "ui_zone_col_ping"
+    elseif key == "mode" then ctrl, id = self.col_mode, "ui_zone_col_mode"
+    elseif key == "proto" then ctrl, id = self.col_mode, "ui_zone_col_proto"
+    elseif key == "lock" then ctrl, id = self.col_mode, "ui_zone_lock"
+    end
+    if ctrl then
+        set_widget_text(ctrl, tr(id) .. arrow, AMBER)
     end
 end
 
@@ -630,6 +794,9 @@ function UIZoneServerList:LoadFavorites()
             status = "Favorite",
             lastSeen = ts,
             added = ts,
+            proto = 0,
+            fail_count = 0,
+            retry_at = 0,
             state = nil,
             query = nil
         }
@@ -678,149 +845,356 @@ function UIZoneServerList:SaveFavorites()
         end
     end
 
+    local function entry_line(i, entry, fav_flag)
+        local proto = tonumber(entry.proto)
+        if not proto and entry.query then proto = tonumber(entry.query.proto) end
+        proto = proto or 0
+        local ts = entry.lastSeen or now_timestamp()
+        local added = entry.added or ts
+        return string.format("entry_%d = %s|%s:%d|%d|%d|%d|%d",
+            i - 1, entry.label or (entry.ip .. ":" .. tostring(entry.port)),
+            entry.ip, entry.port, fav_flag, ts, proto, added)
+    end
+
     lines[#lines + 1] = ""
     lines[#lines + 1] = "[" .. FAVORITES_SEC .. "]"
     for i, entry in ipairs(self.favorites) do
-        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|1|%d",
-            i - 1, entry.label or (entry.ip .. ":" .. tostring(entry.port)), entry.ip, entry.port,
-            entry.lastSeen or now_timestamp())
+        lines[#lines + 1] = entry_line(i, entry, 1)
     end
 
     lines[#lines + 1] = ""
     lines[#lines + 1] = "[" .. HISTORY_SEC .. "]"
     for i, entry in ipairs(self.history) do
-        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|0|%d",
-            i - 1, entry.label or (entry.ip .. ":" .. tostring(entry.port)), entry.ip, entry.port,
-            entry.lastSeen or now_timestamp())
+        lines[#lines + 1] = entry_line(i, entry, 0)
     end
 
     lines[#lines + 1] = ""
     lines[#lines + 1] = "[" .. LEGACY_SEC .. "]"
 
-    local ok_open, out = pcall(io.open, target_path, "w")
-    if not ok_open or not out then
-        printf("Zone UI Error: failed to open identity file for saving")
-        return false
-    end
-    local write_ok = true
-    pcall(function()
-        for _, l in ipairs(lines) do
-            if out:write(l .. "\n") == nil then write_ok = false break end
-        end
-    end)
-    pcall(function() out:close() end)
-    if not write_ok then
+    if not write_lines_atomic(target_path, lines) then
         printf("Zone UI Error: failed writing identity file")
         return false
     end
     return true
 end
 
+function UIZoneServerList:EntryKey(e)
+    if not e then return "" end
+    return (e.ip or "") .. ":" .. tostring(e.port or 0)
+end
+
+function UIZoneServerList:EntryLabel(e)
+    local info = e.query
+    local name = info and info.name
+    if not name or name == "" then name = e.label end
+    if not name or name == "" then name = (e.ip or "") .. ":" .. tostring(e.port or 0) end
+    return name
+end
+
+function UIZoneServerList:ProtoMismatch(e)
+    if not e then return false end
+    local p = tonumber(e.proto)
+    if (not p or p <= 0) and e.query then p = tonumber(e.query.proto) end
+    if not p or p <= 0 then return false end
+    local own = tonumber(self.own_proto)
+    if not own or own <= 0 then return false end
+    return p ~= own
+end
+
+function UIZoneServerList:EntryPassesFilter(e)
+    local needle = self.filter_text
+    if type(needle) == "string" and needle ~= "" then
+        needle = needle:lower()
+        local name = ((e.query and e.query.name) or e.label or ""):lower()
+        local map = (((e.query and e.query.map) or "")):lower()
+        if not (name:find(needle, 1, true) or map:find(needle, 1, true)) then
+            return false
+        end
+    end
+
+    local info = e.query
+    if self.hide_full then
+        local maxp = info and tonumber(info.maxPlayers)
+        local pl = info and tonumber(info.players)
+        if maxp and maxp > 0 and pl and pl >= maxp then return false end
+    end
+    if self.hide_empty and (not info or (tonumber(info.players) or 0) <= 0) then
+        return false
+    end
+    if self.hide_locked and info and tonumber(info.locked or 0) ~= 0 then
+        return false
+    end
+    if tonumber(self.max_ping) and tonumber(self.max_ping) > 0 then
+        local p = info and tonumber(info.ping_ms)
+        if not p or p > tonumber(self.max_ping) then return false end
+    end
+    return true
+end
+
+function UIZoneServerList:SortValue(e, key)
+    local info = e.query
+    if key == "name" then
+        local n = (info and info.name ~= "" and info.name) or e.label or e.ip or ""
+        return n:lower()
+    elseif key == "map" then
+        return ((info and info.map) or ""):lower()
+    elseif key == "players" then
+        return tonumber(info and info.players) or -1
+    elseif key == "ping" then
+        local p = tonumber(info and info.ping_ms)
+        if not p then return 1e12 end
+        return p
+    elseif key == "mode" then
+        return tonumber(info and info.mode) or -1
+    elseif key == "proto" then
+        local p = tonumber(e.proto)
+        if not p and info then p = tonumber(info.proto) end
+        return p or -1
+    elseif key == "lock" then
+        return tonumber(info and info.locked) or 0
+    end
+    return 0
+end
+
+function UIZoneServerList:SortEntries(list)
+    local key = self.sort_key or "ping"
+    local asc = self.sort_asc
+    if asc == nil then asc = true end
+    local function tie(a, b)
+        return self:EntryKey(a) < self:EntryKey(b)
+    end
+    table.sort(list, function(a, b)
+        local va = self:SortValue(a, key)
+        local vb = self:SortValue(b, key)
+        if va == vb then return tie(a, b) end
+        if asc then return va < vb end
+        return va > vb
+    end)
+end
+
+function UIZoneServerList:SetSort(key)
+    if self.sort_key == key then
+        self.sort_asc = not (self.sort_asc ~= false)
+    else
+        self.sort_key = key
+        self.sort_asc = true
+    end
+    self:UpdateLabels()
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
 function UIZoneServerList:GetView()
     local out = {}
     local seen = {}
     local function push(e)
-        local key = e.ip .. ":" .. tostring(e.port)
+        local key = self:EntryKey(e)
         if seen[key] then return end
         seen[key] = true
+        if self.tab_id ~= TAB_DIRECT and not self:EntryPassesFilter(e) then return end
         out[#out + 1] = e
     end
 
     if self.tab_id == TAB_FAVORITES then
         for _, e in ipairs(self.favorites) do push(e) end
-        table.sort(out, function(a, b) return (a.label or ""):lower() < (b.label or ""):lower() end)
     elseif self.tab_id == TAB_DIRECT then
         return out
     else
-        local favs = {}
-        local hists = {}
-        for _, e in ipairs(self.favorites) do favs[#favs + 1] = e end
-        for _, e in ipairs(self.history) do hists[#hists + 1] = e end
-        table.sort(favs, function(a, b) return (a.label or ""):lower() < (b.label or ""):lower() end)
-        table.sort(hists, function(a, b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
-        for _, e in ipairs(favs) do push(e) end
-        for _, e in ipairs(hists) do push(e) end
+        for _, e in ipairs(self.favorites) do push(e) end
+        for _, e in ipairs(self.history) do push(e) end
     end
+
+    self:SortEntries(out)
     return out
 end
 
-function UIZoneServerList:AddRow(entry, index)
+-- Row rendering is split from row creation so an in-place result update only
+-- rewrites the cells of the affected row (no list rebuild during a scan).
+function UIZoneServerList:FillRow(w, entry, index)
+    if not w or not entry then return end
     local info = entry.query
-    local online = entry.state == "online"
+    local online = (entry.state == "online" or entry.state == "locked")
+    local stale = (entry.state == "stale")
+    local offline = (entry.state == "offline")
     local locked = info and tonumber(info.locked or 0) ~= 0
 
-    local icon_tex = LAMP_OFF
-    local icon_col = argb(255, 130, 130, 124)
-    if entry.state == "offline" then
-        icon_tex, icon_col = LAMP_RED, argb(255, 200, 70, 70)
-    elseif online and locked then
-        icon_tex, icon_col = LAMP_RED, argb(255, 230, 90, 90)
-    elseif online then
-        icon_tex, icon_col = LAMP_GREEN, argb(255, 110, 220, 110)
+    if w.icon then
+        local tex, col = LAMP_OFF, argb(255, 130, 130, 124)
+        if offline then
+            tex, col = LAMP_RED, argb(255, 200, 70, 70)
+        elseif stale then
+            tex, col = LAMP_OFF, AMBER
+        elseif online and locked then
+            tex, col = LAMP_RED, argb(255, 230, 90, 90)
+        elseif online then
+            tex, col = LAMP_GREEN, argb(255, 110, 220, 110)
+        end
+        pcall(function()
+            w.icon:InitTexture(tex)
+            w.icon:SetTextureColor(col)
+        end)
     end
 
+    if w.name then
+        local color = WHITE
+        if entry.is_fav then color = argb(255, 255, 210, 90)
+        elseif stale then color = AMBER
+        elseif offline then color = DIM end
+        pcall(function()
+            w.name:SetText(clip_text(self:EntryLabel(entry), 22))
+            w.name:SetTextColor(color)
+        end)
+    end
+
+    if w.map then
+        local map_txt = (info and info.map and info.map ~= "") and info.map or "-"
+        pcall(function()
+            w.map:SetText(clip_text(map_txt, 12))
+            w.map:SetTextColor(GRAY)
+        end)
+    end
+
+    if w.players then
+        local pl_txt = "-"
+        if info and tonumber(info.maxPlayers) then
+            pl_txt = string.format("%d/%d", tonumber(info.players) or 0, tonumber(info.maxPlayers))
+            if locked then pl_txt = pl_txt .. " L" end
+        end
+        local pl_col = GRAY
+        if locked then pl_col = argb(255, 225, 120, 120)
+        elseif online then pl_col = argb(255, 150, 220, 150)
+        elseif stale then pl_col = AMBER
+        elseif offline then pl_col = DIM end
+        pcall(function()
+            w.players:SetText(pl_txt)
+            w.players:SetTextColor(pl_col)
+        end)
+    end
+
+    if w.ping then
+        local ping_txt = "-"
+        local c = GRAY
+        local p = info and tonumber(info.ping_ms)
+        if p then
+            ping_txt = string.format("%d", math.floor(p))
+            if online then
+                if p < 80 then c = argb(255, 120, 220, 120)
+                elseif p < 160 then c = argb(255, 235, 200, 80)
+                else c = argb(255, 225, 90, 90) end
+            elseif stale then
+                c = AMBER
+            elseif offline then
+                c = DIM
+            end
+        end
+        pcall(function()
+            w.ping:SetText(ping_txt)
+            w.ping:SetTextColor(c)
+        end)
+    end
+
+    if w.mode then
+        local mode_txt = "-"
+        if info then
+            mode_txt = mode_name(info.mode)
+            local proto = tonumber(entry.proto)
+            if not proto then proto = tonumber(info.proto) end
+            if proto and proto > 0 then
+                mode_txt = mode_txt .. " v" .. tostring(proto)
+            end
+        end
+        local mode_col = GRAY
+        if self:ProtoMismatch(entry) then
+            mode_col = RED
+        elseif stale then
+            mode_col = AMBER
+        elseif offline then
+            mode_col = DIM
+        end
+        pcall(function()
+            w.mode:SetText(clip_text(mode_txt, 12))
+            w.mode:SetTextColor(mode_col)
+        end)
+    end
+end
+
+function UIZoneServerList:AddRow(entry, index)
     local item = CUIListBoxItem(ROW_H)
     local font = GetFontLetterica16Russian and GetFontLetterica16Russian() or nil
+    local w = { item = item }
 
     local icon = item:AddIconField(24)
     if icon then
-        icon:InitTexture(icon_tex)
-        icon:SetTextureColor(icon_col)
+        if font then pcall(function() icon:SetFont(font) end) end
+        w.icon = icon
+    end
+    local name = item:AddTextField("", 128)
+    if name then
+        if font then name:SetFont(font) end
+        w.name = name
+    end
+    local map = item:AddTextField("", 78)
+    if map then
+        if font then map:SetFont(font) end
+        w.map = map
+    end
+    local players = item:AddTextField("", 52)
+    if players then
+        if font then players:SetFont(font) end
+        w.players = players
+    end
+    local ping = item:AddTextField("", 46)
+    if ping then
+        if font then ping:SetFont(font) end
+        w.ping = ping
+    end
+    local mode = item:AddTextField("", 70)
+    if mode then
+        if font then mode:SetFont(font) end
+        w.mode = mode
     end
 
-    local name = entry.query and entry.query.name
-    if not name or name == "" then name = entry.label end
-    if not name or name == "" then name = entry.ip .. ":" .. tostring(entry.port) end
-    local f_name = item:AddTextField(clip_text(name, 22), 128)
-    if f_name then
-        if font then f_name:SetFont(font) end
-        f_name:SetTextColor(entry.is_fav and argb(255, 255, 210, 90) or WHITE)
-    end
-
-    local map_txt = (info and info.map and info.map ~= "") and info.map or "-"
-    local f_map = item:AddTextField(clip_text(map_txt, 12), 78)
-    if f_map then
-        if font then f_map:SetFont(font) end
-        f_map:SetTextColor(GRAY)
-    end
-
-    local pl_txt = (info and tonumber(info.maxPlayers)) and string.format("%d/%d", info.players or 0, info.maxPlayers) or "-"
-    local f_pl = item:AddTextField(pl_txt, 52)
-    if f_pl then
-        if font then f_pl:SetFont(font) end
-        f_pl:SetTextColor(online and argb(255, 150, 220, 150) or GRAY)
-    end
-
-    local ping_txt = (info and tonumber(info.ping_ms)) and string.format("%d", math.floor(info.ping_ms)) or "-"
-    local f_ping = item:AddTextField(ping_txt, 46)
-    if f_ping then
-        if font then f_ping:SetFont(font) end
-        local c = GRAY
-        if info and tonumber(info.ping_ms) then
-            local p = tonumber(info.ping_ms)
-            if p <= 80 then c = argb(255, 120, 220, 120)
-            elseif p <= 180 then c = argb(255, 235, 200, 80)
-            else c = argb(255, 225, 90, 90) end
-        end
-        f_ping:SetTextColor(c)
-    end
-
-    local mode_txt = info and mode_name(info.mode) or "-"
-    local f_mode = item:AddTextField(clip_text(mode_txt, 10), 70)
-    if f_mode then
-        if font then f_mode:SetFont(font) end
-        f_mode:SetTextColor(GRAY)
-    end
-
+    self:FillRow(w, entry, index)
     item:SetTAG(index)
     self.list_servers:AddExistingItem(item)
+
+    local key = self:EntryKey(entry)
+    self.row_widgets[key] = w
+    self.row_index[key] = index
+    return w
+end
+
+function UIZoneServerList:UpdateRowInPlace(entry)
+    if not entry then return false end
+    if self.view_dirty then return false end
+    local key = self:EntryKey(entry)
+    local w = self.row_widgets and self.row_widgets[key]
+    if not w then
+        self.view_dirty = true
+        return false
+    end
+    if not self:EntryPassesFilter(entry) then
+        self.view_dirty = true
+        return false
+    end
+    local index = self.row_index and self.row_index[key]
+    if not index then
+        self.view_dirty = true
+        return false
+    end
+    pcall(function() self:FillRow(w, entry, index) end)
+    return true
 end
 
 function UIZoneServerList:RefreshList()
     if not self.list_servers then return end
-    local keep = self.sel_entry and (self.sel_entry.ip .. ":" .. tostring(self.sel_entry.port)) or nil
+    local keep = self.sel_entry and self:EntryKey(self.sel_entry) or nil
+    local saved_scroll = nil
+    pcall(function() saved_scroll = self.list_servers:GetCurrentScrollPos() end)
 
     self.rows = self:GetView()
+    self.row_widgets = {}
+    self.row_index = {}
     pcall(function() self.list_servers:RemoveAll() end)
 
     for i = 1, #self.rows do
@@ -832,11 +1206,9 @@ function UIZoneServerList:RefreshList()
     self.sel_entry = nil
     if keep then
         for i = 1, #self.rows do
-            local e = self.rows[i]
-            if (e.ip .. ":" .. tostring(e.port)) == keep then
-                self.sel_entry = e
+            if self:EntryKey(self.rows[i]) == keep then
+                self.sel_entry = self.rows[i]
                 pcall(function() self.list_servers:SetSelectedIndex(i - 1) end)
-                self:EnsureRowVisible(i - 1)
                 break
             end
         end
@@ -847,6 +1219,15 @@ function UIZoneServerList:RefreshList()
         if idx >= 0 then self.sel_entry = self.rows[idx + 1] end
     end
 
+    -- Selection and scroll survive the rebuild.
+    if saved_scroll and saved_scroll > 0 then
+        pcall(function() self.list_servers:SetScrollPos(math.floor(saved_scroll)) end)
+    elseif self.sel_entry then
+        local idx = self.row_index[self:EntryKey(self.sel_entry)]
+        if idx then self:EnsureRowVisible(idx - 1) end
+    end
+
+    self.view_dirty = false
     self:UpdateEmptyState()
     self:UpdateDetails()
 end
@@ -879,13 +1260,16 @@ function UIZoneServerList:EnsureRowVisible(idx)
     end)
 end
 
-function UIZoneServerList:MoveSelection(delta)
+function UIZoneServerList:PageSize()
+    local h = 0
+    pcall(function() if self.list_servers then h = self.list_servers:GetHeight() or 0 end end)
+    local n = math.floor(h / ROW_H)
+    if n < 1 then n = 1 end
+    return n
+end
+
+function UIZoneServerList:SelectRow(idx)
     if not self.list_servers or #self.rows == 0 then return end
-    local idx = self:SelectedIndexSafe()
-    if idx < 0 then
-        idx = delta > 0 and -1 or 0
-    end
-    idx = idx + delta
     if idx < 0 then idx = 0 end
     if idx > #self.rows - 1 then idx = #self.rows - 1 end
     pcall(function() self.list_servers:SetSelectedIndex(idx) end)
@@ -894,6 +1278,20 @@ function UIZoneServerList:MoveSelection(delta)
     pcall(function() if self.edit_port and self.sel_entry then self.edit_port:SetText(tostring(self.sel_entry.port)) end end)
     self:UpdateDetails()
     self:EnsureRowVisible(idx)
+end
+
+function UIZoneServerList:MoveSelection(delta)
+    if not self.list_servers or #self.rows == 0 then return end
+    local idx = self:SelectedIndexSafe()
+    if idx < 0 then
+        idx = delta > 0 and -1 or 0
+    end
+    self:SelectRow(idx + delta)
+end
+
+function UIZoneServerList:MoveSelectionTo(idx)
+    if not self.list_servers or #self.rows == 0 then return end
+    self:SelectRow(idx)
 end
 
 function UIZoneServerList:UpdateEmptyState()
@@ -929,24 +1327,65 @@ function UIZoneServerList:UpdateDetails()
     local info = e.query or {}
     local name = (info.name and info.name ~= "") and info.name or (e.label or "-")
     local lines = {}
-    lines[#lines + 1] = "%c[0,255,210,90]" .. name
-    lines[#lines + 1] = field_text("ui_zone_direct_host", e.ip .. ":" .. tostring(e.port))
+    lines[#lines + 1] = "%c[0,255,210,90]" .. clip_text(name, 48)
+    lines[#lines + 1] = field_text("ui_zone_direct_host", (e.ip or "") .. ":" .. tostring(e.port or 0))
     lines[#lines + 1] = field_text("ui_zone_col_map", (info.map and info.map ~= "") and info.map or "-")
-    lines[#lines + 1] = field_text("ui_zone_col_players",
-        tonumber(info.maxPlayers) and string.format("%d/%d", info.players or 0, info.maxPlayers) or "-")
+
+    local pl = "-"
+    if tonumber(info.maxPlayers) then
+        pl = string.format("%d/%d", tonumber(info.players) or 0, tonumber(info.maxPlayers))
+        if tonumber(info.locked or 0) ~= 0 then pl = pl .. " (L)" end
+    end
+    lines[#lines + 1] = field_text("ui_zone_col_players", pl)
     lines[#lines + 1] = field_text("ui_zone_col_ping",
         tonumber(info.ping_ms) and (tostring(math.floor(info.ping_ms)) .. " ms") or "-")
     lines[#lines + 1] = field_text("ui_zone_col_mode", tonumber(info.mode) and mode_name(info.mode) or "-")
-    lines[#lines + 1] = field_text("ui_zone_lock", (info.locked ~= nil) and ((tonumber(info.locked) ~= 0) and "1" or "0") or "-")
-    lines[#lines + 1] = field_text("ui_zone_last_seen", age_text(e.lastSeen))
+
+    local proto = tonumber(e.proto)
+    if not proto then proto = tonumber(info.proto) end
+    local proto_txt = proto and tostring(proto) or "-"
+    if self:ProtoMismatch(e) then
+        proto_txt = proto_txt .. " (" .. tr("ui_zone_proto_mismatch") .. ")"
+    end
+    lines[#lines + 1] = field_text("ui_zone_col_proto", proto_txt)
+    lines[#lines + 1] = field_text("ui_zone_col_tick",
+        tonumber(info.tick) and tostring(math.floor(info.tick)) or "-")
+    lines[#lines + 1] = field_text("ui_zone_lock",
+        (info.locked ~= nil) and ((tonumber(info.locked) ~= 0) and "1" or "0") or "-")
+
+    if e.state == "stale" or e.state == "offline" then
+        local state_id = (e.state == "offline") and "ui_zone_state_offline" or "ui_zone_state_stale"
+        lines[#lines + 1] = tr(state_id) .. " (" .. age_text(e.last_ok or e.lastSeen) .. ")"
+    end
+    lines[#lines + 1] = field_text("ui_zone_last_seen", age_text(e.last_ok or e.lastSeen))
     set_widget_text(self.details_body, table.concat(lines, "\\n"), nil)
+end
+
+function UIZoneServerList:CountStates()
+    local online, offline = 0, 0
+    local seen = {}
+    local function count(e)
+        local key = self:EntryKey(e)
+        if seen[key] then return end
+        seen[key] = true
+        if e.state == "online" or e.state == "locked" then
+            online = online + 1
+        elseif e.state == "stale" or e.state == "offline" then
+            offline = offline + 1
+        end
+    end
+    for _, e in ipairs(self.favorites) do count(e) end
+    for _, e in ipairs(self.history) do count(e) end
+    return online, offline
 end
 
 function UIZoneServerList:UpdateStatus()
     local state = self.state or STATE_IDLE
     local text, color, lamp
     if state == STATE_SCANNING then
-        text, color, lamp = tr("ui_zone_scanning"), AMBER, LAMP_OFF
+        local done = tonumber(self.scan_done) or 0
+        local total = tonumber(self.scan_total) or 0
+        text, color, lamp = tr("ui_zone_scan_progress") .. string.format(" %d/%d", done, total), AMBER, LAMP_OFF
     elseif state == STATE_CONNECTING then
         text, color, lamp = tr("ui_zone_connecting"), AMBER, LAMP_OFF
     elseif state == STATE_CONNECTED then
@@ -960,9 +1399,29 @@ function UIZoneServerList:UpdateStatus()
             text, color, lamp = tr("ui_zone_status_offline"), RED, LAMP_RED
         end
     end
-    if self.state_detail and self.state_detail ~= "" and state ~= STATE_IDLE then
-        text = text .. ": " .. self.state_detail
+
+    if self.state_detail and self.state_detail ~= "" then
+        if state == STATE_CONNECTING or state == STATE_CONNECTED or state == STATE_FAILED then
+            text = text .. ": " .. self.state_detail
+        end
     end
+
+    if state == STATE_IDLE or state == STATE_FAILED then
+        local online, offline = self:CountStates()
+        if online + offline > 0 then
+            text = tr("ui_zone_online_count") .. ": " .. tostring(online)
+                .. " / " .. tr("ui_zone_offline_count") .. ": " .. tostring(offline)
+            if self.last_fail_reason and self.last_fail_reason ~= "" and offline > 0 then
+                text = text .. " (" .. clip_text(self.last_fail_reason, 28) .. ")"
+            end
+        elseif state == STATE_IDLE then
+            text = tr("ui_zone_sort_hint")
+        end
+        if self.filter_editing then
+            text = tr("ui_zone_filter_hint") .. " " .. (self.filter_text or "")
+        end
+    end
+
     set_widget_text(self.status_label, text, color)
     set_widget_text(self.status_header, text, color)
     if self.header_lamp then
@@ -1080,6 +1539,9 @@ function UIZoneServerList:UpsertHistory(ip, port)
         status = "Recent",
         lastSeen = ts,
         added = ts,
+        proto = 0,
+        fail_count = 0,
+        retry_at = 0,
         state = nil,
         query = nil
     }
@@ -1087,7 +1549,20 @@ function UIZoneServerList:UpsertHistory(ip, port)
     return entry
 end
 
-function UIZoneServerList:StartScan()
+function UIZoneServerList:MarkFailure(entry)
+    if not entry then return end
+    entry.fail_count = (entry.fail_count or 0) + 1
+    if entry.fail_count >= 2 then
+        entry.state = "offline"
+    else
+        entry.state = "stale"
+    end
+    local idx = entry.fail_count
+    if idx > #RETRY_BACKOFF then idx = #RETRY_BACKOFF end
+    entry.retry_at = now_timestamp() + RETRY_BACKOFF[idx]
+end
+
+function UIZoneServerList:StartScan(reset_backoff)
     if self.scan_active or self.state == STATE_CONNECTING then return end
     if self:IsDirectTab() then return end
     if not self:NetAvailable() then
@@ -1099,70 +1574,356 @@ function UIZoneServerList:StartScan()
         return
     end
 
-    local queue = {}
-    local view = self:GetView()
-    for _, e in ipairs(view) do
-        queue[#queue + 1] = { ip = e.ip, port = e.port }
+    self.async_ok = self:AsyncAvailable()
+    self.scan_prev_connected = (self.state == STATE_CONNECTED)
+    self.broadcast_hit = nil
+    self.last_scan_step = 0
+
+    if not self.async_ok then
+        -- Blocking fallback (DLL without ZN_QueryStart): legacy 450 ms probes
+        -- spaced by SCAN_STEP_MS so the UI stays responsive.
+        self.scan_mode = "blocking"
+        local queue = {}
+        local seen = {}
+        local function push(e)
+            if not e then return end
+            local key = self:EntryKey(e)
+            if seen[key] then return end
+            seen[key] = true
+            if reset_backoff then
+                e.fail_count = 0
+                e.retry_at = 0
+            end
+            queue[#queue + 1] = { ip = e.ip, port = e.port }
+        end
+        for _, e in ipairs(self.favorites) do push(e) end
+        for _, e in ipairs(self.history) do push(e) end
+        if self.tab_id == TAB_LAN then
+            local port = self:CurrentPort()
+            for _ = 1, LAN_PROBE_COUNT do
+                queue[#queue + 1] = { ip = BROADCAST_ADDR, port = port, broadcast = true }
+            end
+        end
+
+        self.scan_queue = queue
+        self.scan_index = 1
+        self.scan_active = (#queue > 0)
+        if self.scan_active and not self.scan_prev_connected then
+            self:SetState(STATE_SCANNING)
+        end
+        return
     end
+
+    -- Async scheduling: new generation, favorites/history first, LAN
+    -- broadcast entries on the LAN tab, then fill up to the concurrency caps.
+    self.scan_mode = "async"
+    self.scan_gen = (self.scan_gen or 0) + 1
+    self.query_inflight = {}
+    self.queue_internet = {}
+    self.queue_lan = {}
+    self.scan_total = 0
+    self.scan_done = 0
+    self.scan_fail_reason = nil
+    self.view_dirty = false
+
+    local now_wall = now_timestamp()
+    local seen = {}
+    local function add_entry(e)
+        if not e then return end
+        local key = self:EntryKey(e)
+        if seen[key] then return end
+        seen[key] = true
+        if reset_backoff then
+            e.fail_count = 0
+            e.retry_at = 0
+        elseif (e.fail_count or 0) >= 1 and (e.retry_at or 0) > now_wall then
+            -- Backoff has not elapsed; the retry service will pick this up.
+            return
+        end
+        self.queue_internet[#self.queue_internet + 1] = {
+            ip = e.ip,
+            port = e.port,
+            lane = "internet",
+            timeout = ASYNC_TIMEOUT_INTERNET_MS,
+            gen = self.scan_gen,
+            scan = true,
+        }
+        self.scan_total = self.scan_total + 1
+    end
+    for _, e in ipairs(self.favorites) do add_entry(e) end
+    for _, e in ipairs(self.history) do add_entry(e) end
     if self.tab_id == TAB_LAN then
         local port = self:CurrentPort()
         for _ = 1, LAN_PROBE_COUNT do
-            queue[#queue + 1] = { ip = BROADCAST_ADDR, port = port, broadcast = true }
+            self.queue_lan[#self.queue_lan + 1] = {
+                ip = BROADCAST_ADDR,
+                port = port,
+                lane = "lan",
+                timeout = ASYNC_TIMEOUT_LAN_MS,
+                gen = self.scan_gen,
+                scan = true,
+                broadcast = true,
+            }
+            self.scan_total = self.scan_total + 1
         end
     end
 
-    self.broadcast_hit = nil
-    self.scan_queue = queue
-    self.scan_index = 1
-    self.scan_active = (#queue > 0)
-    self.scan_prev_connected = (self.state == STATE_CONNECTED)
-    self.last_scan_step = 0
+    self.scan_active = (self.scan_total > 0)
     if self.scan_active and not self.scan_prev_connected then
         self:SetState(STATE_SCANNING)
     end
+    self:PumpQueries()
+    self:UpdateStatus()
+    self:CheckScanFinished()
 end
 
 function UIZoneServerList:AbortScan()
+    -- New generation invalidates any result still in flight; cancel all
+    -- outstanding queries so the DLL-side sockets are released.
+    self.scan_gen = (self.scan_gen or 0) + 1
     self.scan_active = false
     self.scan_queue = nil
     self.scan_index = nil
     self.scan_prev_connected = false
+    self.queue_internet = {}
+    self.queue_lan = {}
+    local had_inflight = (self.query_inflight and next(self.query_inflight) ~= nil)
+    self.query_inflight = {}
+    if had_inflight then
+        pcall(function()
+            if ZoneNet and type(ZoneNet.QueryCancelAll) == "function" then
+                ZoneNet:QueryCancelAll()
+            end
+        end)
+    end
+end
+
+function UIZoneServerList:StartProbe(probe)
+    if not probe then return false end
+    local id, err = nil, nil
+    local ok = pcall(function()
+        id, err = ZoneNet:QueryStart(probe.ip, probe.port, probe.timeout)
+    end)
+    if ok and type(id) == "number" and id > 0 then
+        probe.deadline = self:Now() + (tonumber(probe.timeout) or ASYNC_TIMEOUT_INTERNET_MS) + 150
+        self.query_inflight[id] = probe
+        return true
+    end
+    self:OnProbeFailure(probe, err or "start failed")
+    return false
+end
+
+function UIZoneServerList:PumpSlots()
+    local internet, lan = 0, 0
+    for _, p in pairs(self.query_inflight) do
+        if p.lane == "lan" then lan = lan + 1 else internet = internet + 1 end
+    end
+    while internet < ASYNC_MAX_INTERNET and #self.queue_internet > 0 do
+        local probe = table.remove(self.queue_internet, 1)
+        if self:StartProbe(probe) then internet = internet + 1 end
+    end
+    while lan < ASYNC_MAX_LAN and #self.queue_lan > 0 do
+        local probe = table.remove(self.queue_lan, 1)
+        if self:StartProbe(probe) then lan = lan + 1 end
+    end
+end
+
+-- Bounded async pump: at most ASYNC_POLL_PER_UPDATE ZN_QueryPoll calls per
+-- UI update, then top up the in-flight slots from the queues.
+function UIZoneServerList:PumpQueries()
+    local inflight = self.query_inflight
+    if not inflight then return end
+    if next(inflight) == nil and #self.queue_internet == 0 and #self.queue_lan == 0 then
+        self:CheckScanFinished()
+        return
+    end
+
+    local now = self:Now()
+    local polls = 0
+    local changed = false
+    for qid, probe in pairs(inflight) do
+        if polls >= ASYNC_POLL_PER_UPDATE then break end
+        polls = polls + 1
+        local ok_poll, res, err = pcall(function() return ZoneNet:QueryPoll(qid) end)
+        if not ok_poll then
+            inflight[qid] = nil
+            self:OnProbeFailure(probe, "poll error")
+            changed = true
+        elseif res == false then
+            inflight[qid] = nil
+            self:OnProbeFailure(probe, err or "query failed")
+            changed = true
+        elseif res == nil then
+            -- Still pending; soft deadline guards against a lost result.
+            if probe.deadline and now > probe.deadline + 250 then
+                pcall(function() ZoneNet:QueryCancel(qid) end)
+                inflight[qid] = nil
+                self:OnProbeFailure(probe, "timeout")
+                changed = true
+            end
+        else
+            inflight[qid] = nil
+            self:OnProbeSuccess(probe, res)
+            changed = true
+        end
+    end
+
+    self:PumpSlots()
+    if changed or self.scan_active then
+        self:UpdateStatus()
+    end
+    self:CheckScanFinished()
 end
 
 function UIZoneServerList:ApplyQuery(probe, info)
+    if not info then return nil end
     if probe.broadcast then
         self.broadcast_hit = info
         self.state_detail = info.name or ""
         self:UpdateStatus()
         self:UpdateEmptyState()
-        return false
+        return nil
     end
 
     local entry = self:FindEntry(probe.ip, probe.port)
     if not entry then
         entry = self:UpsertHistory(probe.ip, probe.port)
         self.scan_discoveries = true
+        self.view_dirty = true
     end
-    if not entry then return false end
+    if not entry then return nil end
 
     entry.query = info
     entry.state = (tonumber(info.locked or 0) ~= 0) and "locked" or "online"
+    entry.fail_count = 0
+    entry.retry_at = 0
+    entry.lastSeen = now_timestamp()
+    entry.last_ok = entry.lastSeen
+    if not entry.added or entry.added <= 0 then entry.added = entry.lastSeen end
+    if tonumber(info.proto) then entry.proto = tonumber(info.proto) end
     if info.name and info.name ~= "" then
         entry.label = sanitize_label(info.name, entry.ip, entry.port)
     end
-    return true
+
+    -- While connected, the connected server's proto becomes our reference for
+    -- mismatch highlighting (the session API exposes no own-proto field).
+    if self.state == STATE_CONNECTED and probe.ip == self.connect_ip
+        and tonumber(probe.port) == tonumber(self.connect_port) then
+        self.own_proto = tonumber(info.proto) or self.own_proto
+    end
+    return entry
 end
 
 function UIZoneServerList:ApplyOffline(probe)
-    if probe.broadcast then return false end
+    if probe.broadcast then return nil end
     local entry = self:FindEntry(probe.ip, probe.port)
-    if not entry then return false end
-    if entry.state == "offline" then return false end
-    entry.state = "offline"
-    entry.query = nil
-    return true
+    if not entry then return nil end
+    self:MarkFailure(entry)
+    return entry
 end
 
+function UIZoneServerList:OnProbeSuccess(probe, info)
+    if probe.gen and probe.gen ~= self.scan_gen then return end
+    local entry = self:ApplyQuery(probe, info)
+    if probe.scan then
+        self.scan_done = (self.scan_done or 0) + 1
+    end
+    if entry then
+        self:UpdateRowInPlace(entry)
+    end
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:OnProbeFailure(probe, reason)
+    if probe.gen and probe.gen ~= self.scan_gen then
+        if probe.scan then self.scan_done = (self.scan_done or 0) + 1 end
+        return
+    end
+    if probe.scan then
+        self.scan_done = (self.scan_done or 0) + 1
+    end
+    if not probe.broadcast then
+        self.last_fail_reason = reason or ""
+        if probe.scan then self.scan_fail_reason = reason or "" end
+        local entry = self:FindEntry(probe.ip, probe.port)
+        if entry then
+            self:MarkFailure(entry)
+            self:UpdateRowInPlace(entry)
+        end
+    end
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:CheckScanFinished()
+    if not self.scan_active then return end
+    if #self.queue_internet > 0 or #self.queue_lan > 0 then return end
+    if next(self.query_inflight) ~= nil then return end
+
+    self.scan_active = false
+    if self.scan_discoveries then
+        self.scan_discoveries = false
+        pcall(function() self:SaveFavorites() end)
+    end
+    -- Single rebuild per batch: sorting and filter transitions are applied
+    -- here, not for every landed result.
+    self.view_dirty = true
+    pcall(function() self:RefreshList() end)
+    if self.scan_prev_connected then
+        self.scan_prev_connected = false
+        self:SetState(STATE_CONNECTED, self.state_detail)
+    elseif self.state ~= STATE_CONNECTING and self.state ~= STATE_CONNECTED then
+        self:SetState(STATE_IDLE)
+    end
+    self:UpdateStatus()
+end
+
+-- Backoff re-query: failed entries retry after 30/60/120 s (cap 5 min), at
+-- most RETRY_MAX_ACTIVE at once, never while connecting and never while a
+-- scan is running.
+function UIZoneServerList:ServiceRetries()
+    if self.state == STATE_CONNECTING then return end
+    if self:IsDirectTab() or self.scan_active then return end
+    if self.async_ok == nil then self.async_ok = self:AsyncAvailable() end
+    if not self.async_ok then return end
+
+    local now_wall = now_timestamp()
+    if (self.last_retry_service or 0) == now_wall then return end
+    self.last_retry_service = now_wall
+
+    local retry_keys = {}
+    local active = 0
+    for _, p in pairs(self.query_inflight or {}) do
+        if p.retry then
+            active = active + 1
+            retry_keys[p.ip .. ":" .. tostring(p.port)] = true
+        end
+    end
+    if active >= RETRY_MAX_ACTIVE then return end
+
+    for _, e in ipairs(self.rows or {}) do
+        if active >= RETRY_MAX_ACTIVE then break end
+        local key = self:EntryKey(e)
+        -- One failure is enough to schedule a re-query: the second failure is
+        -- what flips the row to "offline" (2 consecutive failures rule).
+        if not retry_keys[key] and (e.fail_count or 0) >= 1
+            and (e.retry_at or 0) > 0 and e.retry_at <= now_wall then
+            local probe = {
+                ip = e.ip,
+                port = e.port,
+                lane = "internet",
+                timeout = ASYNC_TIMEOUT_INTERNET_MS,
+                gen = self.scan_gen,
+                retry = true,
+            }
+            if self:StartProbe(probe) then
+                active = active + 1
+                retry_keys[key] = true
+            end
+        end
+    end
+end
+
+-- Legacy blocking fallback path, used only when the DLL lacks the async API.
 function UIZoneServerList:ScanStep()
     if not self.scan_active then return end
     local now = self:Now()
@@ -1182,6 +1943,7 @@ function UIZoneServerList:ScanStep()
         elseif self.state ~= STATE_CONNECTING and self.state ~= STATE_CONNECTED then
             self:SetState(STATE_IDLE)
         end
+        self.view_dirty = true
         pcall(function() self:RefreshList() end)
         return
     end
@@ -1193,14 +1955,14 @@ function UIZoneServerList:ScanStep()
         if type(r) == "table" then info = r end
     end)
 
-    local changed = false
+    local entry = nil
     if info then
-        changed = self:ApplyQuery(probe, info)
+        entry = self:ApplyQuery(probe, info)
     else
-        changed = self:ApplyOffline(probe)
+        entry = self:ApplyOffline(probe)
     end
-    if changed then
-        pcall(function() self:RefreshList() end)
+    if entry then
+        pcall(function() self:UpdateRowInPlace(entry) end)
     end
 end
 
@@ -1247,8 +2009,15 @@ end
 
 function UIZoneServerList:Update()
     pcall(function() CUIScriptWnd.Update(self) end)
-    pcall(function() self:ScanStep() end)
+    pcall(function()
+        if self.async_ok then
+            self:PumpQueries()
+        else
+            self:ScanStep()
+        end
+    end)
     pcall(function() self:PollConnect() end)
+    pcall(function() self:ServiceRetries() end)
     pcall(function() self:AnimateSpinner() end)
     -- Menu-safe pump: the join flow packets (SHOW_START/LOAD_LEVEL) arrive
     -- before actor_on_update exists; drain them while the browser is open.
@@ -1296,14 +2065,16 @@ function UIZoneServerList:OnTabChanged()
             self:SetState(STATE_IDLE)
         end
     else
-        self:StartScan()
+        self:StartScan(false)
     end
 end
 
 function UIZoneServerList:OnRefresh()
+    -- User-initiated refresh: drop backoff so every known endpoint is probed.
+    self:AbortScan()
     self.broadcast_hit = nil
     self:RefreshList()
-    self:StartScan()
+    self:StartScan(true)
 end
 
 function UIZoneServerList:OnConnect()
@@ -1439,7 +2210,10 @@ function UIZoneServerList:OnToggleFavorite()
                 is_fav = false,
                 status = "Recent",
                 lastSeen = ts,
-                added = ts,
+                added = fav.added or ts,
+                proto = fav.proto or 0,
+                fail_count = fav.fail_count or 0,
+                retry_at = fav.retry_at or 0,
                 state = fav.state,
                 query = fav.query
             }
@@ -1459,6 +2233,9 @@ function UIZoneServerList:OnToggleFavorite()
             status = "Favorite",
             lastSeen = ts,
             added = hist and hist.added or ts,
+            proto = hist and (hist.proto or 0) or 0,
+            fail_count = hist and (hist.fail_count or 0) or 0,
+            retry_at = hist and (hist.retry_at or 0) or 0,
             state = hist and hist.state or nil,
             query = hist and hist.query or nil
         }
@@ -1519,7 +2296,7 @@ function UIZoneServerList:OnShow()
     end
 
     self:RefreshList()
-    self:StartScan()
+    self:StartScan(true)
 end
 
 function UIZoneServerList:OnBack()
@@ -1533,14 +2310,172 @@ function UIZoneServerList:OnBack()
     end
 end
 
+function UIZoneServerList:OnSortName() self:SetSort("name") end
+function UIZoneServerList:OnSortMap() self:SetSort("map") end
+function UIZoneServerList:OnSortPlayers() self:SetSort("players") end
+function UIZoneServerList:OnSortPing() self:SetSort("ping") end
+
+-- No dedicated Proto/Lock headers exist in the dialog XML, so the Mode header
+-- cycles through Mode -> Proto -> Lock.
+function UIZoneServerList:OnSortMode()
+    if self.sort_key == "mode" then
+        self:SetSort("proto")
+    elseif self.sort_key == "proto" then
+        self:SetSort("lock")
+    else
+        self:SetSort("mode")
+    end
+end
+
+function UIZoneServerList:ToggleHideFull()
+    self.hide_full = not self.hide_full
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:ToggleHideEmpty()
+    self.hide_empty = not self.hide_empty
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:ToggleHideLocked()
+    self.hide_locked = not self.hide_locked
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:CycleMaxPing()
+    local cur = tonumber(self.max_ping) or 0
+    local next_v = 0
+    for i = 1, #MAX_PING_CYCLE do
+        if MAX_PING_CYCLE[i] == cur then
+            next_v = MAX_PING_CYCLE[(i % #MAX_PING_CYCLE) + 1]
+            break
+        end
+    end
+    self.max_ping = next_v
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:SwitchTab(delta)
+    if not self.tabs or not self.tabs.SetActiveTab then return end
+    local cur = 1
+    for i = 1, #TAB_ORDER do
+        if TAB_ORDER[i] == self.tab_id then cur = i end
+    end
+    local next_i = cur + delta
+    if next_i < 1 then next_i = #TAB_ORDER end
+    if next_i > #TAB_ORDER then next_i = 1 end
+    pcall(function() self.tabs:SetActiveTab(TAB_ORDER[next_i]) end)
+    local after = self:GetActiveTabId()
+    if self.tab_id ~= after then
+        self.tab_id = after
+        self:OnTabChanged()
+    end
+end
+
+local key_char_map = nil
+
+local function build_key_char_map()
+    local map = {}
+    if not DIK_keys then return map end
+    local function add(dik_name, ch)
+        local code = DIK_keys[dik_name]
+        if code then map[code] = ch end
+    end
+    add("DIK_A", "a")
+    add("DIK_B", "b")
+    add("DIK_C", "c")
+    add("DIK_D", "d")
+    add("DIK_E", "e")
+    add("DIK_F", "f")
+    add("DIK_G", "g")
+    add("DIK_H", "h")
+    add("DIK_I", "i")
+    add("DIK_J", "j")
+    add("DIK_K", "k")
+    add("DIK_L", "l")
+    add("DIK_M", "m")
+    add("DIK_N", "n")
+    add("DIK_O", "o")
+    add("DIK_P", "p")
+    add("DIK_Q", "q")
+    add("DIK_R", "r")
+    add("DIK_S", "s")
+    add("DIK_T", "t")
+    add("DIK_U", "u")
+    add("DIK_V", "v")
+    add("DIK_W", "w")
+    add("DIK_X", "x")
+    add("DIK_Y", "y")
+    add("DIK_Z", "z")
+    add("DIK_1", "1")
+    add("DIK_2", "2")
+    add("DIK_3", "3")
+    add("DIK_4", "4")
+    add("DIK_5", "5")
+    add("DIK_6", "6")
+    add("DIK_7", "7")
+    add("DIK_8", "8")
+    add("DIK_9", "9")
+    add("DIK_0", "0")
+    add("DIK_SPACE", " ")
+    add("DIK_MINUS", "-")
+    add("DIK_PERIOD", ".")
+    return map
+end
+
 function UIZoneServerList:OnKeyboard(dik, keyboard_action)
     local res = false
     pcall(function() res = CUIScriptWnd.OnKeyboard(self, dik, keyboard_action) end)
     if res then return res end
     if keyboard_action ~= ui_events.WINDOW_KEY_PRESSED then return false end
     if not DIK_keys then return false end
+    if dik == nil then return false end
+
+    -- Filter entry mode: printable keys build the name/map filter.
+    if self.filter_editing then
+        if dik == DIK_keys.DIK_ESCAPE then
+            self.filter_editing = false
+            self.filter_text = ""
+            self:RefreshList()
+            self:UpdateStatus()
+            return true
+        elseif dik == DIK_keys.DIK_RETURN then
+            self.filter_editing = false
+            self:RefreshList()
+            self:UpdateStatus()
+            return true
+        elseif dik == DIK_keys.DIK_BACK then
+            if #self.filter_text > 0 then
+                self.filter_text = self.filter_text:sub(1, #self.filter_text - 1)
+                self:RefreshList()
+                self:UpdateStatus()
+            end
+            return true
+        else
+            if not key_char_map then key_char_map = build_key_char_map() end
+            local ch = key_char_map[dik]
+            if ch then
+                if #self.filter_text < MAX_FILTER_LEN then
+                    self.filter_text = self.filter_text .. ch
+                    self:RefreshList()
+                    self:UpdateStatus()
+                end
+                return true
+            end
+        end
+    end
 
     if dik == DIK_keys.DIK_ESCAPE then
+        if self.filter_text ~= "" then
+            self.filter_text = ""
+            self:RefreshList()
+            self:UpdateStatus()
+            return true
+        end
         self:OnBack()
         return true
     elseif dik == DIK_keys.DIK_RETURN then
@@ -1549,11 +2484,45 @@ function UIZoneServerList:OnKeyboard(dik, keyboard_action)
     elseif dik == DIK_keys.DIK_F5 then
         self:OnRefresh()
         return true
+    elseif dik == DIK_keys.DIK_F6 then
+        self:ToggleHideFull()
+        return true
+    elseif dik == DIK_keys.DIK_F7 then
+        self:ToggleHideEmpty()
+        return true
+    elseif dik == DIK_keys.DIK_F8 then
+        self:ToggleHideLocked()
+        return true
+    elseif dik == DIK_keys.DIK_F9 then
+        self:CycleMaxPing()
+        return true
+    elseif dik == DIK_keys.DIK_SLASH then
+        self.filter_editing = true
+        self:UpdateStatus()
+        return true
     elseif dik == DIK_keys.DIK_UP then
         self:MoveSelection(-1)
         return true
     elseif dik == DIK_keys.DIK_DOWN then
         self:MoveSelection(1)
+        return true
+    elseif dik == DIK_keys.DIK_HOME then
+        self:MoveSelectionTo(0)
+        return true
+    elseif dik == DIK_keys.DIK_END then
+        self:MoveSelectionTo(#self.rows - 1)
+        return true
+    elseif dik == DIK_keys.DIK_PRIOR then
+        self:MoveSelection(-self:PageSize())
+        return true
+    elseif dik == DIK_keys.DIK_NEXT then
+        self:MoveSelection(self:PageSize())
+        return true
+    elseif dik == DIK_keys.DIK_LEFT then
+        self:SwitchTab(-1)
+        return true
+    elseif dik == DIK_keys.DIK_RIGHT then
+        self:SwitchTab(1)
         return true
     elseif dik == DIK_keys.DIK_TAB then
         if self:IsDirectTab() then
@@ -1562,6 +2531,22 @@ function UIZoneServerList:OnKeyboard(dik, keyboard_action)
             self:ApplyEditFocus()
         end
         return true
+    end
+
+    -- Fallback filter entry: on list tabs a printable key starts the filter
+    -- even if DIK_SLASH is unavailable in this build.
+    if not self:IsDirectTab() then
+        if not key_char_map then key_char_map = build_key_char_map() end
+        local ch = key_char_map[dik]
+        if ch and ch ~= " " then
+            self.filter_editing = true
+            if #self.filter_text < MAX_FILTER_LEN then
+                self.filter_text = self.filter_text .. ch
+            end
+            self:RefreshList()
+            self:UpdateStatus()
+            return true
+        end
     end
     return false
 end

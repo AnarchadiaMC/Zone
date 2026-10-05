@@ -92,6 +92,7 @@ type Server struct {
 	emissionMgr           *EmissionOrchestrator
 	damageHandler         *DamageHandler
 	sleepers              *SleeperManager
+	groups                *GroupManager
 	startTime             time.Time
 	tickCount             atomic.Uint64
 	lastSafezoneBroadcast time.Time
@@ -143,12 +144,33 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		s.emissionMgr.SetDormantDuration(time.Duration(cfg.EmissionIntervalMin) * time.Minute)
 	}
 
+	groupMax := 4
+	inviteTTL := 60 * time.Second
+	if cfg != nil {
+		if cfg.GroupMaxPlayers > 0 {
+			groupMax = cfg.GroupMaxPlayers
+		}
+		if cfg.InviteTTLSec > 0 {
+			inviteTTL = time.Duration(cfg.InviteTTLSec) * time.Second
+		}
+	}
+	s.groups = NewGroupManager(groupMax, inviteTTL)
+	s.damageHandler.SetGroupManager(s.groups)
+
 	if db != nil {
 		if err := LoadSafeZones(db.RawDB()); err != nil && s.logger != nil {
 			s.logger.Warn("Failed to load safe zones from DB; using defaults", zap.Error(err))
 		}
+		if err := LoadFactionRelations(db); err != nil && s.logger != nil {
+			s.logger.Warn("Failed to load faction relations from DB; using defaults", zap.Error(err))
+		}
 	}
 	return s
+}
+
+// Groups returns the active GroupManager instance.
+func (s *Server) Groups() *GroupManager {
+	return s.groups
 }
 
 // DamageHandler returns the active DamageHandler instance.
@@ -373,12 +395,17 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
+			nick := nullTermString(req.Nickname[:])
+			if nick == "" {
+				nick = "Stalker"
+			}
 			sessID := s.seq.Add(1)
 			token, _ := GenerateSessionToken()
 			sess := &network.PlayerSession{
 				SessionID:         sessID,
 				SessionToken:      token,
 				AccountID:         cleanUUID,
+				Name:              nick,
 				UDPAddr:           addr,
 				LastSeen:          time.Now(),
 				LastCheckpoint:    time.Now(),
@@ -390,10 +417,6 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			isNew := false
 			charFaction := ""
 			if s.db != nil {
-				nick := nullTermString(req.Nickname[:])
-				if nick == "" {
-					nick = "Stalker"
-				}
 				hwid := fmt.Sprintf("%x", req.HWIDHash)
 				_ = s.db.AutoProvision(cleanUUID, hwid, nick)
 				if char, err := s.db.LoadCharacter(cleanUUID); err == nil && char != nil {
@@ -537,6 +560,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					}
 				}
 			}
+			s.removeFromGroup(sess)
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
 
@@ -744,7 +768,26 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			zap.Uint32("sender_session", pkt.SenderID),
 			zap.String("text", sanitized),
 		)
+		// Slash commands are consumed server-side and never broadcast.
+		if strings.HasPrefix(sanitized, "/") {
+			s.handleChatCommand(sess, sanitized)
+			return
+		}
 		s.BroadcastChat(pkt.SenderID, sanitized)
+	case protocol.OpGroupResponse:
+		var resp protocol.GroupResponse
+		if err := binary.Read(buf, binary.LittleEndian, &resp); err != nil {
+			return
+		}
+		sess := s.sessions.GetByAddr(addr.String())
+		if sess == nil {
+			return
+		}
+		if resp.Accept == 1 {
+			s.groupAccept(sess)
+		} else {
+			s.groupDecline(sess)
+		}
 	case protocol.OpDamageNotify:
 		var dmg protocol.DamageNotify
 		if err := binary.Read(buf, binary.LittleEndian, &dmg); err != nil {
@@ -766,6 +809,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 					CurrentLevel: sleeper.CurrentLevel,
 					Position:     sleeper.Position,
 					Health:       sleeper.Health,
+					Faction:      sleeper.Faction,
 				}
 				sleeperTarget.InSafeZone = CheckSafeZone(sleeper.Position[0], sleeper.Position[1], sleeper.Position[2], sleeper.CurrentLevel) != nil
 				sleeper.RUnlock()
@@ -1418,6 +1462,7 @@ func (s *Server) buildEntityEnter(sess *network.PlayerSession) protocol.EntityEn
 	copy(pkt.Faction[:], sess.Faction)
 	pkt.Health = healthToUint8(sess.Health)
 	pkt.Gvid = sess.Gvid
+	copy(pkt.Name[:], sess.Name)
 	sess.Unlock()
 	return pkt
 }
@@ -1584,6 +1629,11 @@ func (s *Server) Tick(now time.Time) {
 	tick := s.tickCount.Add(1)
 	isSecondTick := (tick%30 == 0)
 
+	// Group invitation TTL sweep.
+	if s.groups != nil {
+		s.groups.Tick(now)
+	}
+
 	// Sleeper Tick (Issue 16)
 	if s.sleepers != nil {
 		s.sleepers.Tick(now, func(sl *Sleeper) {
@@ -1642,6 +1692,7 @@ func (s *Server) Tick(now time.Time) {
 		// clients that never sent a transform have InSafeZone=false).
 		inSafe := flagSafe || CheckSafeZone(pos[0], pos[1], pos[2], level) != nil
 		if stale {
+			s.removeFromGroup(sess)
 			s.grid.Remove(sessID)
 			s.aoi.RemoveSession(sessID)
 			s.broadcastEntityLeaveToPeers(sessID, level)
@@ -1825,6 +1876,84 @@ func (s *Server) BroadcastChat(senderID uint32, msg string) {
 	}
 }
 
+// SendChatToSession delivers one system chat line (sender ID 0) to a single
+// session; used for command replies, which are never broadcast to peers.
+func (s *Server) SendChatToSession(sess *network.PlayerSession, msg string) {
+	if sess == nil {
+		return
+	}
+	pkt := protocol.NewChatText(0, msg)
+	s.SendToSession(sess, protocol.OpChatText, protocol.FlagReliable, pkt)
+}
+
+// broadcastGroupState sends the current OpGroupState to every resolved member
+// of groupID.
+func (s *Server) broadcastGroupState(groupID uint32) {
+	if s.groups == nil {
+		return
+	}
+	for _, member := range s.groups.MemberSessions(groupID, s.sessions) {
+		if member == nil {
+			continue
+		}
+		s.SendToSession(member, protocol.OpGroupState, protocol.FlagReliable,
+			s.groups.StatePayload(groupID, s.sessions))
+	}
+}
+
+// notifyGroupRoster sends OpGroupState to every session in a roster snapshot:
+// members still in groupID get the real state, everyone else (the leaver, and
+// remaining members of a dissolved group) gets the empty state.
+func (s *Server) notifyGroupRoster(groupID uint32, roster []uint32) {
+	if s.groups == nil {
+		return
+	}
+	notified := make(map[uint32]bool)
+	for _, id := range roster {
+		if id == 0 || notified[id] {
+			continue
+		}
+		sess := s.sessions.GetByID(id)
+		if sess == nil {
+			continue
+		}
+		notified[id] = true
+		if gid, ok := s.groups.GroupID(id); ok && gid == groupID {
+			s.SendToSession(sess, protocol.OpGroupState, protocol.FlagReliable,
+				s.groups.StatePayload(groupID, s.sessions))
+		} else {
+			s.SendToSession(sess, protocol.OpGroupState, protocol.FlagReliable, protocol.GroupState{})
+		}
+	}
+}
+
+// sendGroupState sends the session's own current group state (or the empty
+// state when not grouped).
+func (s *Server) sendGroupState(sess *network.PlayerSession) {
+	if s.groups == nil || sess == nil {
+		return
+	}
+	if gid, ok := s.groups.GroupID(sessionIDOf(sess)); ok {
+		s.SendToSession(sess, protocol.OpGroupState, protocol.FlagReliable,
+			s.groups.StatePayload(gid, s.sessions))
+		return
+	}
+	s.SendToSession(sess, protocol.OpGroupState, protocol.FlagReliable, protocol.GroupState{})
+}
+
+// removeFromGroup detaches a disconnecting/timed-out session from its party
+// and notifies every affected member of the change.
+func (s *Server) removeFromGroup(sess *network.PlayerSession) {
+	if s.groups == nil || sess == nil {
+		return
+	}
+	gid, roster, wasMember := s.groups.Leave(sess)
+	if !wasMember || gid == 0 {
+		return
+	}
+	s.notifyGroupRoster(gid, roster)
+}
+
 func (s *Server) GetStats() (int, int, time.Duration) {
 	active := len(s.sessions.GetAll())
 	tickRate := 30
@@ -1866,6 +1995,7 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	}
 
 	s.SendToSession(sess, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
+	s.removeFromGroup(sess)
 	s.broadcastEntityLeaveToPeers(sessionID, level)
 	s.grid.Remove(sessionID)
 	s.aoi.RemoveSession(sessionID)

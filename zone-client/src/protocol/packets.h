@@ -35,7 +35,10 @@ enum class Opcode : uint16_t {
     CHARACTER_SELECT = 0x0072,
     LOAD_LEVEL = 0x0073,
     LEVEL_CHANGE = 0x0074,
-    PLAYER_VISUAL = 0x0075
+    PLAYER_VISUAL = 0x0075,
+    GROUP_INVITE_NOTIFY = 0x0078,
+    GROUP_RESPONSE = 0x0079,
+    GROUP_STATE = 0x007A
 };
 
 struct HeartbeatPayload {
@@ -137,8 +140,34 @@ struct EntityEnterAoI {
     char faction[16];
     uint8_t health;
     uint16_t gvid;
+    char name[32];         // appended last (protocol v3)
 };
-static_assert(sizeof(EntityEnterAoI) == 100, "EntityEnterAoI size must be exactly 100 bytes");
+static_assert(sizeof(EntityEnterAoI) == 132, "EntityEnterAoI size must be exactly 132 bytes");
+
+struct GroupInviteNotify {
+    uint32_t inviterSessionID;
+    char inviterName[32];
+    char inviterFaction[16];
+};
+static_assert(sizeof(GroupInviteNotify) == 52, "GroupInviteNotify size must be exactly 52 bytes");
+
+struct GroupResponse {
+    uint8_t accept;
+};
+static_assert(sizeof(GroupResponse) == 1, "GroupResponse size must be exactly 1 byte");
+
+struct GroupStateHeader {
+    uint8_t count;
+};
+static_assert(sizeof(GroupStateHeader) == 1, "GroupStateHeader size must be exactly 1 byte");
+
+struct GroupStateMember {
+    uint32_t sessionID;
+    char name[32];
+    char faction[16];
+    uint8_t isLeader;
+};
+static_assert(sizeof(GroupStateMember) == 53, "GroupStateMember size must be exactly 53 bytes");
 
 struct EntityLeaveAoI {
     uint32_t entityID;

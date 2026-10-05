@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<w>
+    <hint x="14" y="706" width="600" height="14">
+        <text font="letterica16" align="l" vert_align="c" r="220" g="220" b="210">ui_zone_chat_hint</text>
+    </hint>
+    <bg x="8" y="724" width="1008" height="34" stretch="1">
+        <texture a="170" r="0" g="0" b="0">ui_inGame2_listbox_back</texture>
+    </bg>
+    <edit_chat x="16" y="729" width="992" height="24" max_symb_count="200">
+        <text x="4" font="letterica16" align="l" vert_align="c" r="235" g="235" b="230"/>
+        <texture>ui_inGame2_edit_box_1</texture>
+    </edit_chat>
+</w>

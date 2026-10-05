@@ -78,6 +78,28 @@ extern "C" {
         return NetClient::QueryServer(ip, static_cast<uint16_t>(port), out, outLen, timeoutMs);
     }
 
+    __declspec(dllexport) int ZN_QueryStart(const char* ip, int port, int timeoutMs)
+    {
+        if (!ip || port <= 0 || port > 65535)
+            return -1;
+        return NetClient::QueryStart(ip, static_cast<uint16_t>(port), timeoutMs);
+    }
+
+    __declspec(dllexport) int ZN_QueryPoll(int queryId, char* out, int outLen, int* outRttMs)
+    {
+        return NetClient::QueryPoll(queryId, out, outLen, outRttMs);
+    }
+
+    __declspec(dllexport) void ZN_QueryCancel(int queryId)
+    {
+        NetClient::QueryCancel(queryId);
+    }
+
+    __declspec(dllexport) void ZN_QueryCancelAll()
+    {
+        NetClient::QueryCancelAll();
+    }
+
     __declspec(dllexport) bool ZN_PollEvent(char* buf, size_t* len)
     {
         if (!buf || !len)

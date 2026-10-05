@@ -19,6 +19,8 @@ type Config struct {
 	MapName             string `yaml:"map_name"`
 	Mode                int    `yaml:"mode"`
 	Locked              bool   `yaml:"locked"`
+	GroupMaxPlayers     int    `yaml:"group_max_players"`
+	InviteTTLSec        int    `yaml:"invite_ttl_sec"`
 }
 
 // SetDefaults sets sensible defaults for optional or missing fields.
@@ -37,6 +39,15 @@ func (c *Config) SetDefaults() {
 	}
 	if c.MapName == "" {
 		c.MapName = "l01_escape"
+	}
+	if c.GroupMaxPlayers <= 0 {
+		c.GroupMaxPlayers = 4
+	}
+	if c.GroupMaxPlayers > 8 {
+		c.GroupMaxPlayers = 8
+	}
+	if c.InviteTTLSec <= 0 {
+		c.InviteTTLSec = 60
 	}
 }
 

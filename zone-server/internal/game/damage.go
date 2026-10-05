@@ -15,6 +15,13 @@ type DamageHandler struct {
 	logger          *zap.Logger
 	maxRange        float32 // e.g. 300.0 meters
 	maxDamagePerHit float32 // e.g. 150.0
+	groups          *GroupManager
+}
+
+// SetGroupManager wires party membership into the friendly-fire gate. A nil
+// manager disables the same-group check (used by unit tests).
+func (dh *DamageHandler) SetGroupManager(groups *GroupManager) {
+	dh.groups = groups
 }
 
 // NewDamageHandler creates a new initialized DamageHandler.
@@ -59,6 +66,7 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 	attackerPos := attacker.Position
 	attackerLevel := attacker.CurrentLevel
 	attackerInSafe := attacker.InSafeZone
+	attackerFaction := attacker.Faction
 	attacker.Unlock()
 
 	target.Lock()
@@ -66,6 +74,7 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 	targetInSafe := target.InSafeZone
 	targetPos := target.Position
 	targetLevel := target.CurrentLevel
+	targetFaction := target.Faction
 	target.Unlock()
 
 	// PRODUCTION FIX: cross-map hits (Cordon -> Rostok) were possible because
@@ -84,6 +93,16 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 	// Return (0, false, "safe zone immunity") when either side is protected.
 	if attackerInSafe || targetInSafe {
 		return 0, false, "safe zone immunity"
+	}
+
+	// 3b. Friendly-fire gate: party members never damage each other, and
+	// players of the same normalized faction (actor_ prefix optional) never
+	// damage each other. Different factions and unset factions fall through.
+	if dh.groups != nil && dh.groups.IsSameGroup(attackerID, targetID) {
+		return 0, false, "same group friendly fire"
+	}
+	if sameFaction(attackerFaction, targetFaction) {
+		return 0, false, "same faction friendly fire"
 	}
 
 	// 4. Distance check (Issue 18):

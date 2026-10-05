@@ -15,6 +15,7 @@ type Sleeper struct {
 	sync.RWMutex
 	EntityID     uint32
 	AccountID    string
+	Faction      string
 	Position     [3]float32
 	Rotation     [2]float32
 	Health       float32
@@ -60,6 +61,7 @@ func (m *SleeperManager) CreateSleeper(sess *network.PlayerSession, duration tim
 	level := sess.CurrentLevel
 	accountID := sess.AccountID
 	sessionID := sess.SessionID
+	faction := sess.Faction
 	sess.Unlock()
 
 	m.mu.Lock()
@@ -94,6 +96,7 @@ func (m *SleeperManager) CreateSleeper(sess *network.PlayerSession, duration tim
 	sleeper := &Sleeper{
 		EntityID:     entityID,
 		AccountID:    accountID,
+		Faction:      faction,
 		Position:     pos,
 		Rotation:     rot,
 		Health:       health,

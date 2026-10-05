@@ -36,7 +36,10 @@ func TestPacketByteLengths(t *testing.T) {
 		{"WorldEventPayload", WorldEventPayload{}, 6},        // 1 + 1 + 4 = 6
 		{"AIActionPayload", AIActionPayload{}, 9},            // 4 + 1 + 4 = 9
 		{"ClientTransform", ClientTransform{}, 29},           // 4 + 12 + 6 + 1 + 2 = 29 (v2 gvid)
-		{"EntityEnterAoI", EntityEnterAoI{}, 100},            // 4 + 1 + 64 + 12 + 16 + 1 + 2 = 100 (v2)
+		{"EntityEnterAoI", EntityEnterAoI{}, 132},            // 4 + 1 + 64 + 12 + 16 + 1 + 2 + 32 = 132 (v3)
+		{"GroupInviteNotify", GroupInviteNotify{}, 52},       // 4 + 32 + 16 = 52
+		{"GroupResponse", GroupResponse{}, 1},                // 1
+		{"GroupStateMember", GroupStateMember{}, 53},         // 4 + 32 + 16 + 1 = 53
 		{"ServerQueryRes", ServerQueryRes{}, 70},             // 32 + 32 + 6 = 70
 		{"LevelChangePayload", LevelChangePayload{}, 32},
 		{"PlayerVisualPayload", PlayerVisualPayload{}, 64},
@@ -427,8 +430,9 @@ func TestPackets(t *testing.T) {
 		}
 		copy(enter.Section[:], "sim_default_stalker_novice")
 		copy(enter.Faction[:], "loner")
+		copy(enter.Name[:], "StalkerMajor")
 
-		const expectedEnterLen = 4 + 1 + 64 + 4 + 4 + 4 + 16 + 1 + 2 // 100 bytes
+		const expectedEnterLen = 4 + 1 + 64 + 4 + 4 + 4 + 16 + 1 + 2 + 32 // 132 bytes
 		var buf bytes.Buffer
 		if err := WritePacket(&buf, OpEntityEnterAoI, 17, FlagReliable, enter); err != nil {
 			t.Fatalf("WritePacket OpEntityEnterAoI failed: %v", err)
@@ -457,6 +461,9 @@ func TestPackets(t *testing.T) {
 		}
 		if string(bytes.TrimRight(decodedEnter.Section[:], "\x00")) != "sim_default_stalker_novice" {
 			t.Errorf("Enter Section mismatch: %q", string(decodedEnter.Section[:]))
+		}
+		if string(bytes.TrimRight(decodedEnter.Name[:], "\x00")) != "StalkerMajor" {
+			t.Errorf("Enter Name mismatch: %q", string(decodedEnter.Name[:]))
 		}
 
 		// Leave AoI
@@ -826,6 +833,53 @@ func TestPackets(t *testing.T) {
 		}
 		if decoded != aoi {
 			t.Errorf("Decoded mismatch: got %+v, want %+v", decoded, aoi)
+		}
+	})
+
+	t.Run("GroupState Roundtrip and Variable Length", func(t *testing.T) {
+		var gs GroupState
+		gs.MemberCount = 2
+		gs.Members[0].SessionID = 41
+		copy(gs.Members[0].Name[:], "Alpha")
+		copy(gs.Members[0].Faction[:], "dolg")
+		gs.Members[0].IsLeader = 1
+		gs.Members[1].SessionID = 42
+		copy(gs.Members[1].Name[:], "Bravo")
+		copy(gs.Members[1].Faction[:], "bandit")
+
+		var buf bytes.Buffer
+		if err := WritePacket(&buf, OpGroupState, 29, FlagReliable, gs); err != nil {
+			t.Fatalf("WritePacket OpGroupState failed: %v", err)
+		}
+		hdr, err := ReadHeader(&buf)
+		if err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		if want := 1 + 2*53; hdr.PayloadLength != uint16(want) {
+			t.Fatalf("OpGroupState payload length = %d, want %d", hdr.PayloadLength, want)
+		}
+		decoded, err := ReadGroupState(&buf)
+		if err != nil {
+			t.Fatalf("ReadGroupState failed: %v", err)
+		}
+		if decoded.MemberCount != 2 || decoded.Members[0] != gs.Members[0] || decoded.Members[1] != gs.Members[1] {
+			t.Fatalf("GroupState roundtrip mismatch: %+v", decoded)
+		}
+
+		// Empty state is one byte.
+		buf.Reset()
+		if err := WritePacket(&buf, OpGroupState, 30, FlagReliable, GroupState{}); err != nil {
+			t.Fatalf("WritePacket empty OpGroupState failed: %v", err)
+		}
+		if _, err := ReadHeader(&buf); err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		empty, err := ReadGroupState(&buf)
+		if err != nil {
+			t.Fatalf("ReadGroupState(empty) failed: %v", err)
+		}
+		if empty.MemberCount != 0 {
+			t.Fatalf("empty GroupState MemberCount = %d, want 0", empty.MemberCount)
 		}
 	})
 

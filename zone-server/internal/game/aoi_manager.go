@@ -16,9 +16,10 @@ type EntityInfo struct {
 	Type    uint8
 	Section string
 	Pos     [3]float32
-	Faction uint8
+	Faction string
 	Health  uint16
 	Gvid    uint16
+	Name    string
 }
 
 type AoIManager struct {
@@ -119,7 +120,9 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 	var sec [64]byte
 	copy(sec[:], info.Section)
 	var fac [16]byte
-	fac[0] = info.Faction
+	copy(fac[:], info.Faction)
+	var name [32]byte
+	copy(name[:], info.Name)
 
 	pkt := protocol.EntityEnterAoI{
 		EntityID:   info.ID,
@@ -131,6 +134,7 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 		Faction:    fac,
 		Health:     uint8(info.Health),
 		Gvid:       info.Gvid,
+		Name:       name,
 	}
 
 	var buf bytes.Buffer

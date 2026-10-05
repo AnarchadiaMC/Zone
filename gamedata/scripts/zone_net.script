@@ -90,6 +90,10 @@ ffi.cdef[[
     void ZN_SendLevelChange(const char* level);
     void ZN_SendPlayerVisual(const char* visual);
     int ZN_QueryServer(const char* ip, int port, char* out, int outLen, int timeoutMs);
+    int ZN_QueryStart(const char* ip, int port, int timeoutMs);
+    int ZN_QueryPoll(int queryId, char* out, int outLen, int* outRttMs);
+    void ZN_QueryCancel(int queryId);
+    void ZN_QueryCancelAll();
 ]]
 
 -- L-31: Pre-allocated FFI buffers at file/module scope
@@ -98,6 +102,12 @@ local g_poll_len = ffi.new("size_t[1]")
 local g_float_cast = ffi.new("znet_float_cast")
 local QUERY_BUF_LEN = 1024
 local g_query_buf = ffi.new("char[1024]")
+-- Async query polyfill buffers (ZN_QueryPoll result + measured RTT).
+local ASYNC_QUERY_BUF_LEN = 1024
+local g_async_query_buf = ffi.new("char[1024]")
+local g_async_rtt = ffi.new("int[1]")
+-- Cached positive result of the async-export probe (see HasAsyncQuery).
+local async_query_supported = nil
 
 local zone_client = nil
 pcall(function()
@@ -193,6 +203,76 @@ function ZoneNet:QueryServer(ip, port, timeout_ms)
     local info = parse_server_query_response(ffi.string(g_query_buf, res))
     info.ping_ms = elapsed_ms
     return info
+end
+-- Async query API (server browser): start N queries, poll them from the UI
+-- update without blocking. ZN_QueryPoll returns >0 payload bytes when ready,
+-- 0 while pending, -1 on failure/timeout (the id is cleaned up by the DLL).
+function ZoneNet:QueryStart(ip, port, timeout_ms)
+    if not zone_client then return nil, "client not loaded" end
+    local ip_s = ip
+    if type(ip_s) ~= "string" or ip_s == "" then ip_s = "127.0.0.1" end
+    local port_n = tonumber(port) or 27015
+    port_n = math.floor(port_n)
+    if port_n < 1 or port_n > 65535 then return nil, "invalid port" end
+    local timeout = tonumber(timeout_ms) or 750
+    timeout = math.floor(timeout)
+    if timeout < 1 then timeout = 1 end
+    if timeout > 10000 then timeout = 10000 end
+
+    local ok, id = pcall(function()
+        return zone_client.ZN_QueryStart(ip_s, port_n, timeout)
+    end)
+    if not ok then return nil, "query start call failed" end
+    if type(id) ~= "number" or id <= 0 then
+        return nil, string.format("query start rejected (%s)", tostring(id))
+    end
+    return math.floor(id)
+end
+function ZoneNet:QueryPoll(query_id)
+    if not zone_client then return false, "client not loaded" end
+    local qid = tonumber(query_id)
+    if not qid or qid <= 0 then return false, "invalid query id" end
+    qid = math.floor(qid)
+
+    local ok, res = pcall(function()
+        return zone_client.ZN_QueryPoll(qid, g_async_query_buf, ASYNC_QUERY_BUF_LEN, g_async_rtt)
+    end)
+    if not ok then return false, "query poll call failed" end
+    if type(res) ~= "number" then return false, "query poll bad result" end
+    if res == 0 then return nil end
+    if res < 0 then return false, "query failed or timed out" end
+    if res > ASYNC_QUERY_BUF_LEN then res = ASYNC_QUERY_BUF_LEN end
+
+    local info = parse_server_query_response(ffi.string(g_async_query_buf, res))
+    local rtt = tonumber(g_async_rtt[0]) or 0
+    if rtt < 0 then rtt = 0 end
+    info.ping_ms = rtt
+    return info
+end
+function ZoneNet:QueryCancel(query_id)
+    if not zone_client then return end
+    local qid = tonumber(query_id)
+    if not qid or qid <= 0 then return end
+    pcall(function() zone_client.ZN_QueryCancel(math.floor(qid)) end)
+end
+function ZoneNet:QueryCancelAll()
+    if not zone_client then return end
+    pcall(function() zone_client.ZN_QueryCancelAll() end)
+end
+-- True when the loaded DLL exports the async query API. Detected once by
+-- starting and immediately cancelling a throwaway query. Failure is not
+-- cached: the DLL may be redeployed between scans.
+function ZoneNet:HasAsyncQuery()
+    if not zone_client then return false end
+    if async_query_supported ~= nil then return async_query_supported end
+    local ok = pcall(function()
+        local id = zone_client.ZN_QueryStart("127.0.0.1", 1, 1)
+        if type(id) == "number" and id > 0 then
+            zone_client.ZN_QueryCancel(id)
+        end
+    end)
+    if ok then async_query_supported = true end
+    return ok and true or false
 end
 function ZoneNet:PollEvent()
     if not zone_client then return nil end
@@ -317,9 +397,10 @@ function read_string(pkt, pos, len)
     return string.sub(pkt, pos, pos + len - 1), pos + len
 end
 
--- ENTITY_ENTER_AOI v2 carries section[64] + trailing gvid u16
+-- ENTITY_ENTER_AOI v3 carries section[64] and a trailing name[32]
 -- (entityID u32, type u8, section[64], x/y/z f32, faction[16], health u8,
--- gvid u16). Consumers (zone_dummy/zone_ai_proxy) parse the v2 layout natively.
+-- gvid u16, name[32], 132-byte payload). Consumers (zone_dummy/zone_ai_proxy)
+-- parse the v3 layout natively.
 
 function dispatch_packet(pkt)
     if not pkt or string.len(pkt) < 12 then return end
@@ -351,7 +432,7 @@ function dispatch_packet(pkt)
         end
     elseif opcode == 0x0012 then
         -- Fan out to BOTH player proxies (typ 1) and AI puppets (typ 0/2/3);
-        -- each handler filters by type and parses the v2 payload layout.
+        -- each handler filters by type and parses the v3 payload layout.
         if zone_dummy and zone_dummy.on_entity_enter then
             pcall(zone_dummy.on_entity_enter, pkt, offset)
         end
@@ -412,6 +493,10 @@ function dispatch_packet(pkt)
             if db.actor and txt and txt ~= "" then
                 db.actor:give_game_news("ZoneNetwork", txt, "ui_inGame2_PDA_icon", 0, 5000, 0)
             end
+            -- Chat history overlay (zone_hud) parses the same payload.
+            if zone_hud and zone_hud.on_chat_message then
+                pcall(zone_hud.on_chat_message, pkt, offset)
+            end
         end)
     elseif opcode == 0x0070 then
         if zone_ai_proxy and zone_ai_proxy.on_ai_action then
@@ -435,6 +520,18 @@ function dispatch_packet(pkt)
         pcall(function()
             if type(on_server_error) == "function" then on_server_error(pkt, offset) end
         end)
+    elseif opcode == 0x0078 then
+        -- OpGroupInviteNotify (S->C): inviterSessionID u32, name[32], faction[16].
+        if zone_hud and zone_hud.on_group_invite then
+            pcall(zone_hud.on_group_invite, pkt, offset)
+        end
+    elseif opcode == 0x007A then
+        -- OpGroupState (S->C): memberCount u8, then per member sessionID u32,
+        -- name[32], faction[16], isLeader u8. 0x0079 (OpGroupResponse) is
+        -- client->server only, sent as chat text (/accept, /decline).
+        if zone_hud and zone_hud.on_group_state then
+            pcall(zone_hud.on_group_state, pkt, offset)
+        end
     end
 end
 

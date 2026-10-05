@@ -120,4 +120,52 @@
     <string id="ui_zone_error_not_connected">
         <text>Нет соединения с сервером.</text>
     </string>
+    <string id="ui_zone_chat_hint">
+        <text>ENTER - отправить, ESC - закрыть</text>
+    </string>
+    <string id="ui_zone_group_title">
+        <text>Группа</text>
+    </string>
+    <string id="ui_zone_group_invite">
+        <text>ПРИГЛАШЕНИЕ: %s (%s) - /accept или /decline</text>
+    </string>
+    <string id="ui_zone_nearby_title">
+        <text>Рядом</text>
+    </string>
+    <string id="ui_zone_no_group">
+        <text>Нет группы</text>
+    </string>
+    <string id="ui_zone_chat_help">
+        <text>Команды чата: /invite &lt;ник&gt;, /accept, /decline, /leave, /group</text>
+    </string>
+    <string id="ui_zone_sort_hint">
+        <text>Щёлкните заголовок столбца для сортировки</text>
+    </string>
+    <string id="ui_zone_filter_hint">
+        <text>Фильтр</text>
+    </string>
+    <string id="ui_zone_state_stale">
+        <text>Устарел</text>
+    </string>
+    <string id="ui_zone_state_offline">
+        <text>Не в сети</text>
+    </string>
+    <string id="ui_zone_proto_mismatch">
+        <text>несовместимая версия</text>
+    </string>
+    <string id="ui_zone_scan_progress">
+        <text>Сканирование</text>
+    </string>
+    <string id="ui_zone_online_count">
+        <text>В сети</text>
+    </string>
+    <string id="ui_zone_offline_count">
+        <text>Не в сети</text>
+    </string>
+    <string id="ui_zone_col_proto">
+        <text>Протокол</text>
+    </string>
+    <string id="ui_zone_col_tick">
+        <text>Тик</text>
+    </string>
 </string_table>

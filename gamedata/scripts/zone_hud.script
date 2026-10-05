@@ -204,6 +204,668 @@ local function hide_hud_display()
 end
 
 -- ============================================================
+-- Peer / group / chat overlay state
+-- ============================================================
+
+local PANEL_MAX_PLAYERS  = 8
+local NEARBY_MAX_DIST    = 120
+local PANEL_LINE_H       = 15
+local PANEL_WIDTH        = 216
+local PANEL_MARGIN_RIGHT = 8
+local NEARBY_TITLE_Y     = 32
+local GROUP_TITLE_Y      = NEARBY_TITLE_Y + PANEL_LINE_H * (PANEL_MAX_PLAYERS + 1) + 6
+local CHAT_HISTORY_MAX   = 8
+local CHAT_FADE_START_MS = 10000
+local CHAT_FADE_MS       = 5000
+local INVITE_TTL_MS      = 15000
+
+local function argb(a, r, g, b)
+    if GetARGB then return GetARGB(a, r, g, b) end
+    return (a * 16777216) + (r * 65536) + (g * 256) + b
+end
+
+local COLOR_LINE_GREEN = argb(235, 90, 220, 90)
+local COLOR_LINE_RED   = argb(235, 230, 80, 80)
+local COLOR_LINE_AMBER = argb(235, 235, 190, 70)
+local COLOR_LINE_WHITE = argb(230, 225, 225, 215)
+local COLOR_LINE_TITLE = argb(230, 255, 195, 5)
+
+-- Translation-capable label lookup: falls back to the literal key.
+local function tr(key, fallback)
+    local out = fallback or key
+    pcall(function()
+        local s = game.translate_string(key)
+        if type(s) == "string" and s ~= "" and s ~= key then out = s end
+    end)
+    return out
+end
+
+local nearby_title  = nil
+local nearby_lines  = {}
+local group_title   = nil
+local group_lines   = {}
+local invite_static = nil
+local invite        = nil
+local history_lines = {}
+local chat_history  = {}
+local group_members = {}
+local panel_widgets = {}
+
+local chat_window = nil
+local chat_open   = false
+local chat_warned = false
+
+-- ============================================================
+-- Overlay widget helpers (mirror the status CUIStatic pattern)
+-- ============================================================
+
+local function get_ui_root()
+    local ok_mgr, hud_mgr = pcall(function() return get_hud and get_hud() end)
+    if not ok_mgr or not hud_mgr then return nil end
+    local ok_ui, ui = pcall(function()
+        return (hud_mgr.GetUI and hud_mgr:GetUI()) or (hud_mgr.GetWindow and hud_mgr:GetWindow())
+    end)
+    if not ok_ui then return nil end
+    return ui
+end
+
+local function screen_scale_ratio()
+    local dev = nil
+    if device then
+        local ok_dev, d = pcall(function() return device() end)
+        if ok_dev then dev = d end
+    end
+    local dev_w = (dev and dev.width) or 1024
+    local dev_h = (dev and dev.height) or 768
+    if not dev_w or dev_w <= 0 then dev_w = 1024 end
+    if not dev_h or dev_h <= 0 then dev_h = 768 end
+    return (1024 / 768) / (dev_w / dev_h)
+end
+
+local function make_rect(x1, y1, x2, y2)
+    local ok, rect = pcall(function() return Frect():set(x1, y1, x2, y2) end)
+    if ok and rect then return rect end
+    return nil
+end
+
+local function right_panel_rect(y, h, w)
+    local ratio = screen_scale_ratio()
+    local width = w * ratio
+    local x2 = 1024 - PANEL_MARGIN_RIGHT * ratio
+    return make_rect(x2 - width, y, x2, y + h)
+end
+
+local function track_widget(st)
+    if st then panel_widgets[#panel_widgets + 1] = st end
+    return st
+end
+
+local function create_panel_widget(rect, color)
+    local root = get_ui_root()
+    if not root or not rect then return nil end
+    local ok, st = pcall(function()
+        local s = CUIStatic()
+        if not s then error("CUIStatic() returned nil") end
+        s:SetWndRect(rect)
+        local tc = s.TextControl and s:TextControl() or nil
+        if tc then
+            if GetFontLetterica16Russian and tc.SetFont then tc:SetFont(GetFontLetterica16Russian()) end
+            if tc.SetText then tc:SetText("") end
+            if tc.SetTextColor then tc:SetTextColor(color or COLOR_LINE_WHITE) end
+        end
+        if s.Show then s:Show(true) end
+        if not root.AttachChild then error("AttachChild missing") end
+        root:AttachChild(s)
+        return s
+    end)
+    if ok and st then return st end
+    return nil
+end
+
+local function widget_set(st, text, color)
+    if not st then return end
+    pcall(function()
+        local tc = st.TextControl and st:TextControl() or nil
+        if tc then
+            if tc.SetText then tc:SetText(text or "") end
+            if color and tc.SetTextColor then tc:SetTextColor(color) end
+        end
+        if st.Show then st:Show(text ~= nil and text ~= "") end
+    end)
+end
+
+local function widget_hide(st)
+    if st and st.Show then
+        pcall(function() st:Show(false) end)
+    end
+end
+
+local function ensure_lines(pool, count, rect_fn, color)
+    for i = #pool + 1, count do
+        pool[i] = track_widget(create_panel_widget(rect_fn(i), color))
+    end
+    for i = 1, count do
+        if pool[i] then
+            local r = rect_fn(i)
+            if r then pcall(function() pool[i]:SetWndRect(r) end) end
+        end
+    end
+end
+
+local function destroy_panels()
+    local root = get_ui_root()
+    for i = 1, #panel_widgets do
+        local st = panel_widgets[i]
+        if st then
+            pcall(function() if st.Show then st:Show(false) end end)
+            if root and root.DetachChild then
+                pcall(function() root:DetachChild(st) end)
+            end
+        end
+    end
+    panel_widgets = {}
+    nearby_title, group_title, invite_static = nil, nil, nil
+    nearby_lines, group_lines, history_lines = {}, {}, {}
+    group_members = {}
+    invite = nil
+    chat_history = {}
+end
+
+-- ============================================================
+-- Faction relations (configs/zone_faction_relations.ltx)
+-- section [faction_relations]: faction = other:value, other:value, ...
+-- Missing file / unreadable row => all neutral.
+-- ============================================================
+
+local relation_cache = {}
+
+local function normalize_faction(f)
+    f = tostring(f or ""):lower()
+    f = f:gsub("^%s+", ""):gsub("%s+$", "")
+    if f:sub(1, 6) == "actor_" then f = f:sub(7) end
+    return f
+end
+
+local function current_local_faction()
+    local f = ""
+    pcall(function()
+        if ZoneNet and ZoneNet.GetFaction then f = ZoneNet:GetFaction() end
+    end)
+    f = normalize_faction(f)
+    if f == "" then
+        pcall(function()
+            if db and db.actor and db.actor.character_community then
+                f = normalize_faction(db.actor:character_community())
+            end
+        end)
+    end
+    return f
+end
+
+local function load_relation_row(faction)
+    if faction == "" then return {} end
+    local cached = relation_cache[faction]
+    local now = 0
+    pcall(function() now = time_global() end)
+    -- Retry an empty (missing-file) row every 15 s so a late config is picked up.
+    if cached and (next(cached.map) ~= nil or (now - cached.t) < 15000) then
+        return cached.map
+    end
+    local map = {}
+    pcall(function()
+        local ini = system_ini()
+        if not ini or not ini.section_exist then return end
+        if not ini:section_exist("faction_relations") then return end
+        local raw = ini:r_string("faction_relations", faction)
+        if type(raw) ~= "string" or raw == "" then return end
+        for token in string.gmatch(raw, "([^,]+)") do
+            local name, val = string.match(token, "^%s*([%w_]+)%s*:%s*(-?%d+)%s*$")
+            if name and val then
+                map[normalize_faction(name)] = tonumber(val) or 0
+            end
+        end
+    end)
+    relation_cache[faction] = { map = map, t = now }
+    return map
+end
+
+local function relation_value(local_faction, other_faction)
+    if local_faction == "" or other_faction == "" then return 0 end
+    if local_faction == other_faction then return 2000 end
+    local row = load_relation_row(local_faction)
+    return row[other_faction] or 0
+end
+
+local function faction_relation_color(other_faction, is_group_member)
+    if is_group_member then return COLOR_LINE_GREEN end
+    local lf = current_local_faction()
+    local of = normalize_faction(other_faction)
+    if lf ~= "" and of ~= "" and lf == of then return COLOR_LINE_GREEN end
+    local rel = relation_value(lf, of)
+    if rel < -999 then return COLOR_LINE_RED end
+    if rel > 999 then return COLOR_LINE_GREEN end
+    if rel < 0 then return COLOR_LINE_AMBER end
+    return COLOR_LINE_WHITE
+end
+
+local function group_member_set()
+    local set = {}
+    for i = 1, #group_members do set[group_members[i].sid] = true end
+    return set
+end
+
+-- ============================================================
+-- Chat history buffer (opcode 0x0060 + system notices)
+-- ============================================================
+
+local function push_history(text, r, g, b)
+    if type(text) ~= "string" or text == "" then return end
+    local tg = 0
+    pcall(function() tg = time_global() end)
+    chat_history[#chat_history + 1] = { text = text, t = tg, r = r or 225, g = g or 225, b = b or 215 }
+    while #chat_history > CHAT_HISTORY_MAX do table.remove(chat_history, 1) end
+end
+
+local function render_history(tg)
+    if type(tg) ~= "number" or tg <= 0 then
+        pcall(function() tg = time_global() end)
+    end
+    if type(tg) ~= "number" then tg = 0 end
+
+    local kept = {}
+    for i = 1, #chat_history do
+        local e = chat_history[i]
+        local age = tg - (e.t or 0)
+        if age < (CHAT_FADE_START_MS + CHAT_FADE_MS) then kept[#kept + 1] = e end
+    end
+    chat_history = kept
+    while #chat_history > CHAT_HISTORY_MAX do table.remove(chat_history, 1) end
+
+    local n = #chat_history
+    if n == 0 then
+        for i = 1, #history_lines do widget_hide(history_lines[i]) end
+        return
+    end
+
+    local base_x, width, bottom = 12, 520, 10
+    ensure_lines(history_lines, n, function(i)
+        local y1 = 768 - bottom - (n - i + 1) * PANEL_LINE_H
+        return make_rect(base_x, y1, base_x + width, y1 + PANEL_LINE_H)
+    end, COLOR_LINE_WHITE)
+
+    for i = 1, n do
+        local e = chat_history[i]
+        local age = tg - (e.t or 0)
+        local alpha = 235
+        if age > CHAT_FADE_START_MS then
+            alpha = math.floor(235 * (1 - (age - CHAT_FADE_START_MS) / CHAT_FADE_MS))
+            if alpha < 0 then alpha = 0 end
+        end
+        widget_set(history_lines[i], e.text or "", argb(alpha, e.r or 225, e.g or 225, e.b or 215))
+    end
+    for i = n + 1, #history_lines do widget_hide(history_lines[i]) end
+end
+
+function push_system_line(text)
+    push_history(text, 255, 210, 90)
+    render_history()
+end
+
+-- ============================================================
+-- Nearby / group / invite panels
+-- ============================================================
+
+local function update_nearby_panel()
+    local players = {}
+    if zone_dummy and zone_dummy.get_nearby_players then
+        local ok, res = pcall(zone_dummy.get_nearby_players, NEARBY_MAX_DIST)
+        if ok and type(res) == "table" then players = res end
+    end
+
+    if not nearby_title then
+        nearby_title = track_widget(create_panel_widget(
+            right_panel_rect(NEARBY_TITLE_Y, PANEL_LINE_H, PANEL_WIDTH), COLOR_LINE_TITLE))
+    end
+
+    local n = #players
+    if n > PANEL_MAX_PLAYERS then n = PANEL_MAX_PLAYERS end
+    if n == 0 then
+        widget_hide(nearby_title)
+        for i = 1, #nearby_lines do widget_hide(nearby_lines[i]) end
+        return
+    end
+
+    widget_set(nearby_title,
+        string.format("%s (%d)", tr("ui_zone_nearby_title", "Nearby"), n),
+        COLOR_LINE_TITLE)
+
+    local in_group = group_member_set()
+    ensure_lines(nearby_lines, n, function(i)
+        return right_panel_rect(NEARBY_TITLE_Y + PANEL_LINE_H + (i - 1) * PANEL_LINE_H, PANEL_LINE_H, PANEL_WIDTH)
+    end, COLOR_LINE_WHITE)
+
+    for i = 1, n do
+        local p = players[i]
+        local name = tostring(p.name or "")
+        if name == "" then name = "#" .. tostring(p.session_id or 0) end
+        local faction = tostring(p.faction or "")
+        local is_member = p.session_id ~= nil and in_group[p.session_id] == true
+        local prefix = is_member and "* " or ""
+        widget_set(nearby_lines[i], prefix .. name .. " [" .. faction .. "]",
+            faction_relation_color(faction, is_member))
+    end
+    for i = n + 1, #nearby_lines do widget_hide(nearby_lines[i]) end
+end
+
+local function update_group_panel()
+    local n = #group_members
+    if n <= 1 then
+        widget_hide(group_title)
+        for i = 1, #group_lines do widget_hide(group_lines[i]) end
+        return
+    end
+    if n > PANEL_MAX_PLAYERS then n = PANEL_MAX_PLAYERS end
+
+    if not group_title then
+        group_title = track_widget(create_panel_widget(
+            right_panel_rect(GROUP_TITLE_Y, PANEL_LINE_H, PANEL_WIDTH), COLOR_LINE_TITLE))
+    end
+    widget_set(group_title,
+        string.format("%s (%d)", tr("ui_zone_group_title", "Group"), #group_members),
+        COLOR_LINE_TITLE)
+
+    ensure_lines(group_lines, n, function(i)
+        return right_panel_rect(GROUP_TITLE_Y + PANEL_LINE_H + (i - 1) * PANEL_LINE_H, PANEL_LINE_H, PANEL_WIDTH)
+    end, COLOR_LINE_WHITE)
+
+    for i = 1, n do
+        local m = group_members[i]
+        local name = tostring(m.name or "")
+        if name == "" then name = "#" .. tostring(m.sid or 0) end
+        local faction = tostring(m.faction or "")
+        local prefix = m.is_leader and "* " or "  "
+        widget_set(group_lines[i], prefix .. name .. " [" .. faction .. "]",
+            m.is_leader and COLOR_LINE_TITLE or COLOR_LINE_WHITE)
+    end
+    for i = n + 1, #group_lines do widget_hide(group_lines[i]) end
+end
+
+local function invite_text(name, faction)
+    local tmpl = tr("ui_zone_group_invite", "INVITE: %s (%s) - /accept or /decline")
+    local ok, formatted = pcall(string.format, tmpl, name, faction)
+    if ok and type(formatted) == "string" then return formatted end
+    return string.format("INVITE: %s (%s) - /accept or /decline", name, faction)
+end
+
+local function render_invite(tg)
+    if not invite then
+        widget_hide(invite_static)
+        return
+    end
+    if type(tg) == "number" and tg > 0 and tg > invite.expire then
+        invite = nil
+        widget_hide(invite_static)
+        return
+    end
+    if not invite_static then
+        invite_static = track_widget(create_panel_widget(make_rect(312, 32, 712, 54), COLOR_LINE_AMBER))
+    end
+    local name = (invite.name ~= "") and invite.name or ("#" .. tostring(invite.sid or 0))
+    local faction = (invite.faction ~= "") and invite.faction or "?"
+    widget_set(invite_static, invite_text(name, faction), COLOR_LINE_AMBER)
+end
+
+local function update_panels(tg, connected)
+    if not connected then
+        widget_hide(nearby_title)
+        for i = 1, #nearby_lines do widget_hide(nearby_lines[i]) end
+        widget_hide(group_title)
+        for i = 1, #group_lines do widget_hide(group_lines[i]) end
+        widget_hide(invite_static)
+        render_history(tg)
+        return
+    end
+    update_nearby_panel()
+    update_group_panel()
+    render_invite(tg)
+    render_history(tg)
+end
+
+-- ============================================================
+-- Inbound peer / group packets
+-- ============================================================
+
+function on_chat_message(pkt, offset)
+    if not pkt or not offset then return end
+    local got = false
+    pcall(function()
+        if string.len(pkt) < offset + 5 - 1 then return end
+        local sender_id, pos = zone_net.read_uint32_le(pkt, offset)
+        local text_len, cpos = zone_net.read_uint8(pkt, pos)
+        local avail = string.len(pkt) - cpos + 1
+        if text_len > avail then text_len = avail end
+        if text_len < 0 then text_len = 0 end
+        local txt = zone_net.read_string(pkt, cpos, text_len)
+        if type(txt) ~= "string" then return end
+        txt = txt:gsub("%z+", "")
+        if txt == "" then return end
+        local name = nil
+        if zone_dummy and zone_dummy.get_peer_name then
+            local ok, n = pcall(zone_dummy.get_peer_name, sender_id)
+            if ok and type(n) == "string" and n ~= "" then name = n end
+        end
+        if not name then name = "#" .. tostring(sender_id) end
+        push_history(name .. ": " .. txt, 235, 235, 228)
+        got = true
+    end)
+    if got then render_history() end
+end
+
+function on_group_invite(pkt, offset)
+    if not pkt or not offset then return end
+    pcall(function()
+        if string.len(pkt) < offset + 52 - 1 then return end
+        local sid, pos = zone_net.read_uint32_le(pkt, offset)
+        local name, pos = zone_net.read_string(pkt, pos, 32)
+        local faction, pos = zone_net.read_string(pkt, pos, 16)
+        name = tostring(name or ""):gsub("%z+", "")
+        faction = tostring(faction or ""):gsub("%z+", "")
+        local tg = 0
+        pcall(function() tg = time_global() end)
+        invite = { sid = sid, name = name, faction = faction, expire = tg + INVITE_TTL_MS }
+        render_invite(tg)
+        local shown = (name ~= "") and name or ("#" .. tostring(sid))
+        push_system_line(invite_text(shown, (faction ~= "") and faction or "?"))
+    end)
+end
+
+function on_group_state(pkt, offset)
+    if not pkt or not offset then return end
+    pcall(function()
+        local len = string.len(pkt)
+        local count, pos = zone_net.read_uint8(pkt, offset)
+        if not count then return end
+        if count > 16 then count = 16 end
+        if len < (pos - 1) + count * 53 then return end
+        local members = {}
+        for _ = 1, count do
+            local sid, p2 = zone_net.read_uint32_le(pkt, pos)
+            local name, p3 = zone_net.read_string(pkt, p2, 32)
+            local faction, p4 = zone_net.read_string(pkt, p3, 16)
+            local is_leader, p5 = zone_net.read_uint8(pkt, p4)
+            pos = p5
+            name = tostring(name or ""):gsub("%z+", "")
+            faction = tostring(faction or ""):gsub("%z+", "")
+            if name == "" and zone_dummy and zone_dummy.get_peer_name then
+                local ok, n = pcall(zone_dummy.get_peer_name, sid)
+                if ok and type(n) == "string" then name = n end
+            end
+            if faction == "" and zone_dummy and zone_dummy.get_peer_faction then
+                local ok, f = pcall(zone_dummy.get_peer_faction, sid)
+                if ok and type(f) == "string" then faction = f end
+            end
+            members[#members + 1] = {
+                sid = sid, name = name, faction = faction,
+                is_leader = (is_leader == 1),
+            }
+        end
+        group_members = members
+        update_group_panel()
+    end)
+end
+
+-- ============================================================
+-- Chat input window (configs/ui/zone_ui_chat.xml)
+-- ============================================================
+
+class "UIZoneChat" (CUIScriptWnd)
+
+function UIZoneChat:__init() super()
+    self.built = false
+    local rect = make_rect(0, 0, 1024, 768)
+    if rect then pcall(function() self:SetWndRect(rect) end) end
+    pcall(function() self:Enable(true) end)
+    pcall(function()
+        local xml = CScriptXmlInit()
+        xml:ParseFile("zone_ui_chat.xml")
+        self.xml = xml
+        self.bg = xml:InitStatic("bg", self)
+        self.hint = xml:InitStatic("hint", self)
+        self.edit = xml:InitEditBox("edit_chat", self)
+        if self.edit then self:Register(self.edit, "edit_chat") end
+        self.built = true
+    end)
+end
+
+function UIZoneChat:__finalize()
+end
+
+function UIZoneChat:DoSend()
+    local txt = ""
+    pcall(function()
+        if self.edit and self.edit.GetText then txt = self.edit:GetText() or "" end
+    end)
+    close_chat()
+    txt = tostring(txt):gsub("^%s+", ""):gsub("%s+$", "")
+    if txt ~= "" then
+        pcall(function() ZoneNet:SendChatText(txt) end)
+    end
+end
+
+function UIZoneChat:OnKeyboard(dik, action)
+    local res = false
+    pcall(function() res = CUIScriptWnd.OnKeyboard(self, dik, action) end)
+    if action == ui_events.WINDOW_KEY_PRESSED then
+        if dik == DIK_keys.DIK_RETURN or dik == DIK_keys.DIK_NUMPADENTER then
+            self:DoSend()
+            return true
+        elseif dik == DIK_keys.DIK_ESCAPE then
+            close_chat()
+            return true
+        end
+    end
+    return res
+end
+
+local function ensure_chat_window()
+    if chat_window then return chat_window end
+    local ok, w = pcall(function() return UIZoneChat() end)
+    if ok and w and w.built then
+        chat_window = w
+        return chat_window
+    end
+    if not chat_warned then
+        chat_warned = true
+        printf("Zone HUD: chat window unavailable (zone_ui_chat.xml missing or parse failed)")
+    end
+    return nil
+end
+
+local function chat_session_ready()
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+    return connected and (db and db.actor ~= nil)
+end
+
+function open_chat()
+    if chat_open then return end
+    if not chat_session_ready() then return end
+    local w = ensure_chat_window()
+    if not w then return end
+    chat_open = true
+    pcall(function()
+        if w.edit and w.edit.SetText then w.edit:SetText("") end
+        w:ShowDialog(true)
+        w:Show(true)
+        if w.edit and w.edit.CaptureFocus then w.edit:CaptureFocus(true) end
+    end)
+end
+
+function close_chat()
+    chat_open = false
+    if chat_window then
+        pcall(function()
+            if chat_window.edit and chat_window.edit.CaptureFocus then
+                chat_window.edit:CaptureFocus(false)
+            end
+            chat_window:HideDialog()
+            chat_window:Show(false)
+        end)
+    end
+end
+
+function is_chat_open()
+    return chat_open == true
+end
+
+-- kXRR_CHAT action id when the exe exposes it; nil otherwise.
+local function chat_bind_id()
+    local kb = rawget(_G, "key_bindings")
+    if not kb then return nil end
+    local ok, v = pcall(function() return kb.kXRR_CHAT end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
+local function on_before_key_press(dik, bind, dis, flags)
+    pcall(function()
+        if chat_open then
+            -- While typing, swallow game-bound key actions (movement cancels
+            -- and weapon binds included); RETURN/ESC reach the window keyboard.
+            if type(flags) == "table" then flags.ret_value = false end
+            return
+        end
+        local toggle = false
+        local kb_chat = chat_bind_id()
+        if kb_chat ~= nil then
+            toggle = (bind == kb_chat)
+        elseif DIK_keys and dik == DIK_keys.DIK_Y then
+            toggle = true
+        end
+        if toggle then
+            if type(flags) == "table" then flags.ret_value = false end
+            open_chat()
+        end
+    end)
+end
+
+local function on_before_key_hold(dik, bind, dis, flags)
+    if not chat_open then return end
+    pcall(function()
+        if type(flags) == "table" then flags.ret_value = false end
+    end)
+end
+
+local function reset_overlay()
+    pcall(close_chat)
+    chat_window = nil
+    chat_warned = false
+    destroy_panels()
+end
+
+-- ============================================================
 -- actor_on_update Handler
 -- ============================================================
 
@@ -246,6 +908,9 @@ local function on_actor_update()
         update_hud_display(status_text, status_color)
     end
 
+    -- Peer / group / invite / chat-history overlay panels (1 Hz).
+    pcall(update_panels, tg, connected)
+
     -- Connection transition notifications
     if is_dll_loaded() then
         if connected and last_connected ~= true then
@@ -258,6 +923,7 @@ local function on_actor_update()
                     0, 5000, 1
                 )
             end)
+            pcall(push_system_line, tr("ui_zone_connected", "Connected"))
         elseif not connected and last_connected == true then
             last_connected = false
             pcall(function()
@@ -268,6 +934,7 @@ local function on_actor_update()
                     0, 5000, 1
                 )
             end)
+            pcall(push_system_line, tr("ui_zone_failed", "Connection failed"))
         end
     else
         last_connected = false
@@ -298,6 +965,7 @@ function notify_safezone(locked, zone_id)
                     0, 5000, 1
                 )
             end)
+            pcall(push_system_line, enter_text)
         end
         local _, _, _, text, color = get_status_data()
         update_hud_display(text, color)
@@ -313,9 +981,10 @@ function notify_safezone(locked, zone_id)
                     0, 3000, 1
                 )
             end)
+            pcall(push_system_line, "[Safe Zone] You have left the safe zone")
         end
-        local _, _, _, text, color = get_status_data()
-        update_hud_display(text, color)
+        local _, _, _, status_text, status_color = get_status_data()
+        update_hud_display(status_text, status_color)
     end
 end
 
@@ -325,6 +994,7 @@ end
 
 local function on_level_changing()
     clear_hud_static()
+    pcall(reset_overlay)
     last_update_time = 0
     last_connected   = nil
     safe_zone_active = false
@@ -334,6 +1004,7 @@ end
 
 local function on_actor_destroy()
     clear_hud_static()
+    pcall(reset_overlay)
     last_update_time = 0
     last_connected   = nil
     safe_zone_active = false
@@ -345,10 +1016,16 @@ end
 -- on_game_start
 -- ============================================================
 
+local callbacks_registered = false
+
 function on_game_start()
+    if callbacks_registered then return end
+    callbacks_registered = true
     if RegisterScriptCallback then
         RegisterScriptCallback("actor_on_update",      on_actor_update)
         RegisterScriptCallback("actor_on_net_destroy", on_actor_destroy)
         RegisterScriptCallback("on_level_changing",    on_level_changing)
+        RegisterScriptCallback("on_before_key_press",  on_before_key_press)
+        RegisterScriptCallback("on_before_key_hold",   on_before_key_hold)
     end
 end

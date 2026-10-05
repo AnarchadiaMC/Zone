@@ -128,6 +128,10 @@ type SafezoneStatePayload struct {
 	ZoneID [32]byte
 }
 
+// EntityEnterAoI is the OpEntityEnterAoI (0x0012) payload, frozen v3: 132
+// bytes. Field offsets: entityID u32(0), type u8(4), section[64](5),
+// posX f32(69), posY f32(73), posZ f32(77), faction[16](81), health u8(97),
+// gvid u16(98), name[32](100..131).
 type EntityEnterAoI struct {
 	EntityID   uint32
 	EntityType uint8
@@ -138,6 +142,7 @@ type EntityEnterAoI struct {
 	Faction    [16]byte
 	Health     uint8
 	Gvid       uint16
+	Name       [32]byte
 }
 
 type EntityLeaveAoI struct {
@@ -252,6 +257,39 @@ type AIActionPayload struct {
 	TargetID uint32
 }
 
+// GroupInviteNotify is the OpGroupInviteNotify (0x0078) server->client
+// payload: 52 bytes. Sent to the invite target after a successful /invite.
+type GroupInviteNotify struct {
+	InviterSessionID uint32
+	InviterName      [32]byte
+	InviterFaction   [16]byte
+}
+
+// GroupResponse is the OpGroupResponse (0x0079) client->server payload.
+// Accept is 1 to accept the pending invitation, 0 to decline it.
+type GroupResponse struct {
+	Accept uint8
+}
+
+// MaxGroupMembers is the wire capacity of OpGroupState (0x007A).
+const MaxGroupMembers = 8
+
+// GroupStateMember is one member entry of OpGroupState: 49 bytes.
+type GroupStateMember struct {
+	SessionID uint32
+	Name      [32]byte
+	Faction   [16]byte
+	IsLeader  uint8
+}
+
+// GroupState is the OpGroupState (0x007A) server->client payload. The wire
+// form carries MemberCount followed by exactly MemberCount member entries
+// (1 + 49 each); an empty state is a single 0x00 byte.
+type GroupState struct {
+	MemberCount uint8
+	Members     [MaxGroupMembers]GroupStateMember
+}
+
 // EntityAoIPayload notifies a client that an entity entered or left its
 // Area of Interest.
 type EntityAoIPayload struct {
@@ -300,6 +338,14 @@ func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload in
 			if err := writeInventorySync(&buf, p.ItemCount, p.Items[:]); err != nil {
 				return err
 			}
+		case *GroupState:
+			if err := writeGroupState(&buf, p); err != nil {
+				return err
+			}
+		case GroupState:
+			if err := writeGroupState(&buf, &p); err != nil {
+				return err
+			}
 		default:
 			if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
 				return err
@@ -344,6 +390,47 @@ func writeInventorySync(w io.Writer, itemCount uint8, items []InventoryItemPaylo
 		return nil
 	}
 	return binary.Write(w, binary.LittleEndian, items[:count])
+}
+
+// writeGroupState serialises only the populated member entries instead of the
+// fixed [8] backing array, so the payload is 1 + 49*MemberCount bytes.
+func writeGroupState(w io.Writer, state *GroupState) error {
+	if state == nil {
+		return nil
+	}
+	count := int(state.MemberCount)
+	if count > len(state.Members) {
+		count = len(state.Members)
+	}
+	if count > MaxGroupMembers {
+		count = MaxGroupMembers
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint8(count)); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	return binary.Write(w, binary.LittleEndian, state.Members[:count])
+}
+
+// ReadGroupState decodes an OpGroupState payload with its variable-length
+// member list.
+func ReadGroupState(r io.Reader) (*GroupState, error) {
+	var state GroupState
+	if err := binary.Read(r, binary.LittleEndian, &state.MemberCount); err != nil {
+		return nil, err
+	}
+	count := int(state.MemberCount)
+	if count > len(state.Members) {
+		count = len(state.Members)
+	}
+	for i := 0; i < count; i++ {
+		if err := binary.Read(r, binary.LittleEndian, &state.Members[i]); err != nil {
+			return nil, err
+		}
+	}
+	return &state, nil
 }
 
 func WriteServerSnapshot(w io.Writer, seq uint32, flags uint8, snap *ServerSnapshot) error {

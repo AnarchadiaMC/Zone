@@ -49,6 +49,12 @@ admin_pipe: "\\\\.\\pipe\\zone_server_admin"
 	if cfg.MapName != "l01_escape" {
 		t.Errorf("Expected default MapName 'l01_escape', got %q", cfg.MapName)
 	}
+	if cfg.GroupMaxPlayers != 4 {
+		t.Errorf("Expected default GroupMaxPlayers 4, got %d", cfg.GroupMaxPlayers)
+	}
+	if cfg.InviteTTLSec != 60 {
+		t.Errorf("Expected default InviteTTLSec 60, got %d", cfg.InviteTTLSec)
+	}
 }
 
 func TestConfigV2Keys(t *testing.T) {
@@ -60,6 +66,8 @@ server_name: "Custom Zone"
 map_name: "l05_bar_rostok"
 mode: 3
 locked: true
+group_max_players: 6
+invite_ttl_sec: 30
 `
 	tmpfile, err := os.CreateTemp("", "config_v2_test_*.yaml")
 	if err != nil {
@@ -83,5 +91,11 @@ locked: true
 	}
 	if !cfg.Locked {
 		t.Error("Expected Locked true")
+	}
+	if cfg.GroupMaxPlayers != 6 {
+		t.Errorf("Expected GroupMaxPlayers 6, got %d", cfg.GroupMaxPlayers)
+	}
+	if cfg.InviteTTLSec != 30 {
+		t.Errorf("Expected InviteTTLSec 30, got %d", cfg.InviteTTLSec)
 	}
 }

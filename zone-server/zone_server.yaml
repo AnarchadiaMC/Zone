@@ -9,3 +9,5 @@ server_name: "Zone Online"
 map_name: "l01_escape"
 mode: 0
 locked: false
+group_max_players: 4
+invite_ttl_sec: 60

@@ -120,4 +120,52 @@
     <string id="ui_zone_error_not_connected">
         <text>Not connected to the server.</text>
     </string>
+    <string id="ui_zone_chat_hint">
+        <text>ENTER - send, ESC - close</text>
+    </string>
+    <string id="ui_zone_group_title">
+        <text>Group</text>
+    </string>
+    <string id="ui_zone_group_invite">
+        <text>INVITE: %s (%s) - /accept or /decline</text>
+    </string>
+    <string id="ui_zone_nearby_title">
+        <text>Nearby</text>
+    </string>
+    <string id="ui_zone_no_group">
+        <text>No group</text>
+    </string>
+    <string id="ui_zone_chat_help">
+        <text>Chat commands: /invite &lt;nick&gt;, /accept, /decline, /leave, /group</text>
+    </string>
+    <string id="ui_zone_sort_hint">
+        <text>Click a column header to sort</text>
+    </string>
+    <string id="ui_zone_filter_hint">
+        <text>Filter</text>
+    </string>
+    <string id="ui_zone_state_stale">
+        <text>Stale</text>
+    </string>
+    <string id="ui_zone_state_offline">
+        <text>Offline</text>
+    </string>
+    <string id="ui_zone_proto_mismatch">
+        <text>proto mismatch</text>
+    </string>
+    <string id="ui_zone_scan_progress">
+        <text>Scanning</text>
+    </string>
+    <string id="ui_zone_online_count">
+        <text>Online</text>
+    </string>
+    <string id="ui_zone_offline_count">
+        <text>Offline</text>
+    </string>
+    <string id="ui_zone_col_proto">
+        <text>Proto</text>
+    </string>
+    <string id="ui_zone_col_tick">
+        <text>Tick</text>
+    </string>
 </string_table>
