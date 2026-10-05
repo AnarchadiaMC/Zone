@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"testing"
+
+	"zone-online/zone-server/internal/protocol"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -97,5 +99,29 @@ invite_ttl_sec: 30
 	}
 	if cfg.InviteTTLSec != 30 {
 		t.Errorf("Expected InviteTTLSec 30, got %d", cfg.InviteTTLSec)
+	}
+}
+
+// group_max_players is clamped to [1, protocol.MaxGroupMembers], default 4.
+func TestGroupMaxPlayersClampedToProtocolCap(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{-5, 4},
+		{0, 4},
+		{1, 1},
+		{4, 4},
+		{6, 6},
+		{protocol.MaxGroupMembers, protocol.MaxGroupMembers},
+		{protocol.MaxGroupMembers + 1, protocol.MaxGroupMembers},
+		{100, protocol.MaxGroupMembers},
+	}
+	for _, tc := range cases {
+		cfg := &Config{GroupMaxPlayers: tc.in}
+		cfg.SetDefaults()
+		if cfg.GroupMaxPlayers != tc.want {
+			t.Errorf("GroupMaxPlayers %d clamped to %d, want %d", tc.in, cfg.GroupMaxPlayers, tc.want)
+		}
 	}
 }

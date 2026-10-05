@@ -118,11 +118,11 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 	a.mu.Unlock()
 
 	var sec [64]byte
-	copy(sec[:], info.Section)
+	copyNulTerm(sec[:], info.Section)
 	var fac [16]byte
-	copy(fac[:], info.Faction)
+	copyNulTerm(fac[:], info.Faction)
 	var name [32]byte
-	copy(name[:], info.Name)
+	copyNulTerm(name[:], info.Name)
 
 	pkt := protocol.EntityEnterAoI{
 		EntityID:   info.ID,

@@ -14,10 +14,11 @@ import (
 // Sentinel errors returned by GroupManager operations. The server maps them
 // onto system chat replies to the affected player.
 var (
-	ErrGroupFull       = errors.New("group full")
-	ErrGroupNoInvite   = errors.New("no pending group invite")
-	ErrGroupAlreadyIn  = errors.New("already in a group")
-	ErrGroupSelfInvite = errors.New("cannot invite yourself")
+	ErrGroupFull          = errors.New("group full")
+	ErrGroupNoInvite      = errors.New("no pending group invite")
+	ErrGroupAlreadyIn     = errors.New("already in a group")
+	ErrGroupSelfInvite    = errors.New("cannot invite yourself")
+	ErrGroupInvitePending = errors.New("target already has a pending invite")
 )
 
 // Group is one in-memory party. Members is join-ordered; Members[0] is not
@@ -70,9 +71,10 @@ func NewGroupManager(maxMembers int, inviteTTL time.Duration) *GroupManager {
 	}
 }
 
-// Invite records a pending invitation from inviter to target. An existing
-// invitation for the target is replaced. Capacity is enforced when the target
-// accepts, so the invite target receives the group-full reply.
+// Invite records a pending invitation from inviter to target. A new invitation
+// is rejected while an unexpired one is already pending for the target;
+// expired entries are replaced. Capacity is enforced when the target accepts,
+// so the invite target receives the group-full reply.
 func (gm *GroupManager) Invite(inviter, target *network.PlayerSession) error {
 	if inviter == nil || target == nil {
 		return ErrGroupNoInvite
@@ -89,13 +91,17 @@ func (gm *GroupManager) Invite(inviter, target *network.PlayerSession) error {
 		return ErrGroupSelfInvite
 	}
 
+	now := time.Now()
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
+	if existing, ok := gm.invites[targetID]; ok && now.Before(existing.ExpiresAt) {
+		return ErrGroupInvitePending
+	}
 	gm.invites[targetID] = &GroupInvite{
 		InviterID:  inviterID,
 		TargetID:   targetID,
 		TargetName: targetName,
-		ExpiresAt:  time.Now().Add(gm.inviteTTL),
+		ExpiresAt:  now.Add(gm.inviteTTL),
 	}
 	return nil
 }
@@ -298,8 +304,8 @@ func (gm *GroupManager) StatePayload(groupID uint32, sessions *network.SessionMa
 		}
 		sess.Lock()
 		state.Members[count].SessionID = sess.SessionID
-		copy(state.Members[count].Name[:], sess.Name)
-		copy(state.Members[count].Faction[:], sess.Faction)
+		copyNulTerm(state.Members[count].Name[:], sess.Name)
+		copyNulTerm(state.Members[count].Faction[:], sess.Faction)
 		if sess.SessionID == leaderID {
 			state.Members[count].IsLeader = 1
 		}
@@ -371,6 +377,8 @@ func (s *Server) handleChatCommand(sess *network.PlayerSession, text string) {
 				s.SendChatToSession(sess, "Your group is full.")
 			} else if errors.Is(err, ErrGroupSelfInvite) {
 				s.SendChatToSession(sess, "You cannot invite yourself.")
+			} else if errors.Is(err, ErrGroupInvitePending) {
+				s.SendChatToSession(sess, fmt.Sprintf("%s already has a pending invite.", sessionName(target)))
 			} else {
 				s.SendChatToSession(sess, "Group invitation failed.")
 			}
@@ -450,8 +458,8 @@ func (s *Server) sendGroupInvite(target, inviter *network.PlayerSession) {
 	var pkt protocol.GroupInviteNotify
 	inviter.Lock()
 	pkt.InviterSessionID = inviter.SessionID
-	copy(pkt.InviterName[:], inviter.Name)
-	copy(pkt.InviterFaction[:], inviter.Faction)
+	copyNulTerm(pkt.InviterName[:], inviter.Name)
+	copyNulTerm(pkt.InviterFaction[:], inviter.Faction)
 	inviter.Unlock()
 	s.SendToSession(target, protocol.OpGroupInviteNotify, protocol.FlagReliable, pkt)
 }

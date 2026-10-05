@@ -1,5 +1,14 @@
 package database
 
+import "strings"
+
+// normalizeFactionKey lowercases, trims and strips the optional "actor_"
+// prefix used by vanilla community ids, so rows written by operators match
+// the normalized lookup keys.
+func normalizeFactionKey(faction string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(faction)), "actor_")
+}
+
 // FactionRelation is one (faction, other) -> value cell of the faction
 // relations matrix. Values match vanilla Anomaly game_relations.ltx:
 // -2000 enemy, 0 neutral, 300 ally (2000 for the two allied coalition
@@ -120,16 +129,10 @@ func DefaultFactionRelations() []FactionRelation {
 	return out
 }
 
-// SeedFactionRelations inserts the built-in matrix when the table is empty.
-// Operator-edited rows are never overwritten.
+// SeedFactionRelations inserts every canonical matrix row that is missing and
+// never overwrites existing rows (operator edits win). Unlike a whole-table
+// count gate, this repairs a partially seeded or partially deleted table.
 func (d *DB) SeedFactionRelations() error {
-	var count int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM faction_relations").Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		return nil
-	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -141,15 +144,21 @@ func (d *DB) SeedFactionRelations() error {
 	}
 	defer stmt.Close()
 	for _, r := range DefaultFactionRelations() {
-		if _, err := stmt.Exec(r.Faction, r.Other, r.Value); err != nil {
+		faction := normalizeFactionKey(r.Faction)
+		other := normalizeFactionKey(r.Other)
+		if faction == "" || other == "" {
+			continue
+		}
+		if _, err := stmt.Exec(faction, other, r.Value); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// LoadFactionRelations seeds defaults when empty, then returns the full
-// symmetric matrix keyed by faction.
+// LoadFactionRelations seeds missing defaults, then returns the full symmetric
+// matrix keyed by normalized faction. Rows are normalized on load so raw
+// operator rows such as "actor_Stalker" resolve through RelationBetween.
 func (d *DB) LoadFactionRelations() (map[string]map[string]int, error) {
 	if err := d.SeedFactionRelations(); err != nil {
 		return nil, err
@@ -165,6 +174,11 @@ func (d *DB) LoadFactionRelations() (map[string]map[string]int, error) {
 		var value int
 		if err := rows.Scan(&faction, &other, &value); err != nil {
 			return nil, err
+		}
+		faction = normalizeFactionKey(faction)
+		other = normalizeFactionKey(other)
+		if faction == "" || other == "" {
+			continue
 		}
 		if out[faction] == nil {
 			out[faction] = make(map[string]int)

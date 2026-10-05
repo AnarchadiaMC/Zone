@@ -78,6 +78,7 @@ type Server struct {
 	dbQueue               chan *database.DBWriteJob
 	udp                   *network.UDPListener
 	udpMu                 sync.RWMutex
+	nickMu                sync.Mutex
 	sessions              *network.SessionManager
 	grid                  *SpatialGrid
 	events                *EventManager
@@ -279,6 +280,51 @@ func sanitizeChatText(raw string) string {
 	return b.String()
 }
 
+// sanitizeNickname strips control characters, trims surrounding whitespace and
+// caps the result at 31 bytes (UTF-8 safe) so it always fits the 32-byte wire
+// field with a trailing NUL. Returns "" when nothing usable remains; callers
+// substitute the default nickname.
+func sanitizeNickname(raw string) string {
+	if !utf8.ValidString(raw) {
+		raw = strings.ToValidUTF8(raw, "")
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if unicode.IsPrint(r) && !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(truncateUTF8(b.String(), 31))
+}
+
+// truncateUTF8 cuts s to at most maxBytes without splitting a multi-byte rune.
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	s = s[:maxBytes]
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// copyNulTerm copies src into a fixed-width destination, guaranteeing at least
+// one trailing NUL byte on overflow. Use for every name/faction wire array.
+func copyNulTerm(dst []byte, src string) {
+	if len(dst) == 0 {
+		return
+	}
+	if len(src) > len(dst)-1 {
+		src = truncateUTF8(src, len(dst)-1)
+	}
+	copy(dst, src)
+}
+
 func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 	if len(data) < 12 {
 		return
@@ -395,7 +441,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 
-			nick := nullTermString(req.Nickname[:])
+			nick := sanitizeNickname(nullTermString(req.Nickname[:]))
 			if nick == "" {
 				nick = "Stalker"
 			}
@@ -478,24 +524,39 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 
 			// Atomic cap enforcement: check-and-insert under ONE mutex hold
 			// (closes TOCTOU across UDP workers). Same-addr reconnects replace
-			// the old entry instead of counting twice.
+			// the old entry instead of counting twice. The nickMu serializes
+			// name-uniqueness resolution with the insert. Evicted sessions get
+			// full disconnect cleanup below so no group/grid ghost survives a
+			// same-address reconnect.
 			maxPlayers := 0
 			if s.cfg != nil {
 				maxPlayers = s.cfg.MaxPlayers
 			}
+			s.nickMu.Lock()
+			var evicted []*network.PlayerSession
+			added := true
 			if maxPlayers > 0 {
-				if !s.sessions.TryAddCapped(sess, maxPlayers) {
-					s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
-					res := protocol.HandshakeRes{
-						Status:    1,
-						WorldTime: uint64(time.Now().Unix()),
-					}
-					tempSess := &network.PlayerSession{UDPAddr: addr}
-					s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
-					return
+				evicted, added = s.sessions.TryAddCapped(sess, maxPlayers)
+				if added {
+					s.sessions.EnsureUniqueName(sess)
 				}
 			} else {
 				s.sessions.AddSession(sess)
+				s.sessions.EnsureUniqueName(sess)
+			}
+			s.nickMu.Unlock()
+			for _, old := range evicted {
+				s.cleanupEvictedSession(old)
+			}
+			if !added {
+				s.logger.Warn("Server full, rejecting handshake", zap.String("addr", addr.String()))
+				res := protocol.HandshakeRes{
+					Status:    1,
+					WorldTime: uint64(time.Now().Unix()),
+				}
+				tempSess := &network.PlayerSession{UDPAddr: addr}
+				s.SendToSession(tempSess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
+				return
 			}
 
 			res := protocol.HandshakeRes{
@@ -510,7 +571,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				res.HasCharacter = 0
 			} else {
 				res.HasCharacter = 1
-				copy(res.Faction[:], charFaction)
+				copyNulTerm(res.Faction[:], charFaction)
 			}
 			binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
 
@@ -768,9 +829,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			zap.Uint32("sender_session", pkt.SenderID),
 			zap.String("text", sanitized),
 		)
-		// Slash commands are consumed server-side and never broadcast.
-		if strings.HasPrefix(sanitized, "/") {
-			s.handleChatCommand(sess, sanitized)
+		// Slash commands are consumed server-side and never broadcast. Leading
+		// whitespace is tolerated so " /invite X" cannot bypass the command
+		// gate and leak into public chat.
+		commandText := strings.TrimLeft(sanitized, " \t\n")
+		if strings.HasPrefix(commandText, "/") {
+			s.handleChatCommand(sess, commandText)
 			return
 		}
 		s.BroadcastChat(pkt.SenderID, sanitized)
@@ -781,6 +845,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 		sess := s.sessions.GetByAddr(addr.String())
 		if sess == nil {
+			return
+		}
+		// Rate-limit group responses with the same token bucket as chat:
+		// spam beyond 5 per 5s is dropped silently, so no reliable failure
+		// replies are enqueued for the flood.
+		if !sess.AllowChat(time.Now()) {
 			return
 		}
 		if resp.Accept == 1 {
@@ -1094,7 +1164,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.sendLoadLevel(sess)
 		s.syncInventoryForLevel(sess)
 		res := protocol.HandshakeRes{Status: 0, SpawnX: -211.3, SpawnY: -20.2, SpawnZ: -145.8, WorldTime: uint64(time.Now().Unix()), EcoTier: 1, HasCharacter: 1}
-		copy(res.Faction[:], faction)
+		copyNulTerm(res.Faction[:], faction)
 		binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
 		s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
 		s.sendSafezoneState(sess)
@@ -1168,8 +1238,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			return
 		}
 		sess.Lock()
+		changed := visual != nullTermString(sess.Visual[:])
 		copy(sess.Visual[:], visual)
 		sess.HasVisual = true
+		if changed {
+			sess.VisualRevision++
+		}
 		sess.Unlock()
 		s.maybeBroadcastEntityEnter(sess)
 	case OpAck:
@@ -1317,7 +1391,7 @@ func (s *Server) sendLoadLevel(sess *network.PlayerSession) {
 	pos := sess.Position
 	level := sess.CurrentLevel
 	var faction [16]byte
-	copy(faction[:], sess.Faction)
+	copyNulTerm(faction[:], sess.Faction)
 	sess.Unlock()
 	if level == "" {
 		level = "l01_escape"
@@ -1457,12 +1531,12 @@ func (s *Server) buildEntityEnter(sess *network.PlayerSession) protocol.EntityEn
 	if visual == "" {
 		visual = DefaultActorVisual
 	}
-	copy(pkt.Section[:], visual)
+	copyNulTerm(pkt.Section[:], visual)
 	pkt.PosX, pkt.PosY, pkt.PosZ = sess.Position[0], sess.Position[1], sess.Position[2]
-	copy(pkt.Faction[:], sess.Faction)
+	copyNulTerm(pkt.Faction[:], sess.Faction)
 	pkt.Health = healthToUint8(sess.Health)
 	pkt.Gvid = sess.Gvid
-	copy(pkt.Name[:], sess.Name)
+	copyNulTerm(pkt.Name[:], sess.Name)
 	sess.Unlock()
 	return pkt
 }
@@ -1475,12 +1549,14 @@ func (s *Server) maybeBroadcastEntityEnter(sess *network.PlayerSession) bool {
 	gvid := sess.Gvid
 	hasVisual := sess.HasVisual
 	level := sess.CurrentLevel
-	already := level != "" && sess.EnterBroadcastLevel == level
+	revision := sess.VisualRevision
+	already := level != "" && sess.EnterBroadcastLevel == level && sess.EnterBroadcastRevision == revision
 	if gvid == 0 || !hasVisual || already {
 		sess.Unlock()
 		return false
 	}
 	sess.EnterBroadcastLevel = level
+	sess.EnterBroadcastRevision = revision
 	sess.Unlock()
 	s.broadcastEntityEnter(sess)
 	return true
@@ -1544,8 +1620,9 @@ func (s *Server) sendExistingPeersToNewcomer(sess *network.PlayerSession) {
 		}
 		other.Lock()
 		sameLevel := other.CurrentLevel == level
+		announceable := other.Gvid != 0 && other.HasVisual
 		other.Unlock()
-		if sameLevel {
+		if sameLevel && announceable {
 			s.SendToSession(sess, protocol.OpEntityEnterAoI, protocol.FlagReliable, s.buildEntityEnter(other))
 		}
 	}
@@ -1601,8 +1678,8 @@ func (s *Server) handleServerQuery(addr *net.UDPAddr) {
 	}
 
 	var res protocol.ServerQueryRes
-	copy(res.Name[:], serverName)
-	copy(res.Map[:], mapName)
+	copyNulTerm(res.Name[:], serverName)
+	copyNulTerm(res.Map[:], mapName)
 	res.Players = uint8(players)
 	res.MaxPlayers = uint8(maxPlayers)
 	res.Mode = uint8(mode)
@@ -1939,6 +2016,35 @@ func (s *Server) sendGroupState(sess *network.PlayerSession) {
 		return
 	}
 	s.SendToSession(sess, protocol.OpGroupState, protocol.FlagReliable, protocol.GroupState{})
+}
+
+// cleanupEvictedSession runs the disconnect-side cleanup for a session that
+// was silently evicted by a same-address reconnect (or same-ID replacement).
+// Without this the evicted session would keep its group membership and grid
+// slot, count toward the player cap and block group invites forever.
+func (s *Server) cleanupEvictedSession(evicted *network.PlayerSession) {
+	if s == nil || evicted == nil {
+		return
+	}
+	evicted.Lock()
+	sessID := evicted.SessionID
+	level := evicted.CurrentLevel
+	addrStr := ""
+	if evicted.UDPAddr != nil {
+		addrStr = evicted.UDPAddr.String()
+	}
+	evicted.Unlock()
+
+	s.removeFromGroup(evicted)
+	s.grid.Remove(sessID)
+	s.aoi.RemoveSession(sessID)
+	s.broadcastEntityLeaveToPeers(sessID, level)
+	if s.ackQueue != nil && addrStr != "" {
+		s.ackQueue.RemoveByAddr(addrStr)
+	}
+	if s.anticheat != nil {
+		s.anticheat.ViolationReset(sessID)
+	}
 }
 
 // removeFromGroup detaches a disconnecting/timed-out session from its party

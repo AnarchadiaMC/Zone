@@ -217,7 +217,7 @@ func TestSecurity_TryAddCappedConcurrent(t *testing.T) {
 			addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:42000")
 			// Distinct port per racer so they are distinct addrs.
 			addr.Port = 42000 + i
-			ok := sm.TryAddCapped(&network.PlayerSession{
+			_, ok := sm.TryAddCapped(&network.PlayerSession{
 				SessionID: uint32(8000 + i),
 				AccountID: "uuid-race",
 				UDPAddr:   addr,
@@ -309,5 +309,82 @@ func TestSecurity_ChatRateLimit(t *testing.T) {
 	}
 	if got := countOpcodePackets(sink, protocol.OpChatText); got != 5 {
 		t.Fatalf("rate limit violated: got %d broadcasts for 6 rapid msgs, want 5", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. OpGroupResponse shares the per-session token bucket (spam dropped)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSecurity_GroupResponseRateLimited(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 41051}
+	s.sessions.AddSession(&network.PlayerSession{
+		SessionID: 9401, AccountID: "user-grp", UDPAddr: addr,
+		Name: "Spammer", CurrentLevel: "l01_escape", LastSeen: time.Now(),
+	})
+	sink.Reset()
+
+	// 6 rapid declines with increasing seq: only 5 system replies may enqueue.
+	for i := 0; i < 6; i++ {
+		resp := protocol.GroupResponse{Accept: 0}
+		s.HandlePacket(buildTestPacket(t, protocol.OpGroupResponse, uint32(70+i), protocol.FlagReliable, resp), addr)
+	}
+	if got := countOpcodePackets(sink, protocol.OpChatText); got != 5 {
+		t.Fatalf("group response rate limit violated: got %d replies for 6 packets, want 5", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Same-address reconnect evicts the old session and cleans its group
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSecurity_ReconnectEvictsGroupGhost(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	s.cfg = &config.Config{MaxPlayers: 10}
+
+	alpha := connectMember(t, s, 47001, "uuid-ghost-a", "Alpha")
+	bravo := connectMember(t, s, 47002, "uuid-ghost-b", "Bravo")
+	sendChatCommand(t, s, alpha.sess, 2, "/invite Bravo")
+	sendChatCommand(t, s, bravo.sess, 2, "/accept")
+
+	if gid, ok := s.groups.GroupID(sessionIDOf(alpha.sess)); !ok || len(s.groups.Members(gid)) != 2 {
+		t.Fatal("test setup: group of two was not formed")
+	}
+	oldID := sessionIDOf(alpha.sess)
+	sink.Reset()
+
+	// Reconnect from the same address with a fresh UUID and session ID.
+	var req protocol.HandshakeReq
+	copy(req.UUID[:], "uuid-ghost-a2")
+	copy(req.Nickname[:], "Alpha")
+	req.ProtocolVer = protocol.ProtocolVer
+	s.HandlePacket(buildTestPacket(t, protocol.OpHandshakeReq, 10, protocol.FlagReliable, req), alpha.addr)
+
+	newSess := s.sessions.GetByAddr(alpha.addr.String())
+	if newSess == nil {
+		t.Fatal("reconnected session missing")
+	}
+	if newSess.SessionID == oldID {
+		t.Fatal("reconnect did not issue a new session ID")
+	}
+	if _, ok := s.groups.GroupID(oldID); ok {
+		t.Fatal("evicted session is still a group member (ghost)")
+	}
+
+	// Same-level peer must be told the old entity left.
+	foundLeave := false
+	for _, raw := range packetsByOpcode(sink, protocol.OpEntityLeaveAoI) {
+		var leave protocol.EntityLeaveAoI
+		if err := binary.Read(bytes.NewReader(packetPayload(t, raw)), binary.LittleEndian, &leave); err != nil {
+			t.Fatalf("read EntityLeaveAoI: %v", err)
+		}
+		if leave.EntityID == oldID {
+			foundLeave = true
+		}
+	}
+	if !foundLeave {
+		t.Fatal("peers did not receive ENTITY_LEAVE for the evicted session")
 	}
 }

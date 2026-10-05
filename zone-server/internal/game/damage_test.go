@@ -305,3 +305,30 @@ func TestDamage_HealthClampingAndDirtyFlag(t *testing.T) {
 		t.Fatalf("expected target.Dirty to be true after taking damage")
 	}
 }
+
+// Self-damage is rejected before any friendly-fire gate.
+func TestDamage_SelfDamageRejected(t *testing.T) {
+	dh := NewDamageHandler()
+	sess := &network.PlayerSession{
+		SessionID: 42,
+		AccountID: "self-uuid",
+		Health:    100.0,
+		Faction:   "stalker",
+		Position:  [3]float32{0, 0, 0},
+	}
+	dmg := &protocol.DamageNotify{AttackerID: 42, TargetID: 42, Damage: 25.0}
+
+	applied, valid, reason := dh.ValidateAndApplyDamage(sess, sess, dmg)
+	if valid || applied != 0 {
+		t.Fatalf("self damage applied: valid=%v applied=%v", valid, applied)
+	}
+	if reason != "self damage rejected" {
+		t.Fatalf("reason = %q, want self damage rejected", reason)
+	}
+	sess.Lock()
+	health := sess.Health
+	sess.Unlock()
+	if health != 100.0 {
+		t.Fatalf("self damage changed health to %f, want 100", health)
+	}
+}

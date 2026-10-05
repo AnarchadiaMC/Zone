@@ -5,6 +5,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"zone-online/zone-server/internal/protocol"
 )
 
 type Config struct {
@@ -40,11 +42,15 @@ func (c *Config) SetDefaults() {
 	if c.MapName == "" {
 		c.MapName = "l01_escape"
 	}
+	// group_max_players is clamped to the protocol wire capacity: values below
+	// 1 fall back to the default 4 and values above protocol.MaxGroupMembers
+	// are capped, so the configured group can never exceed what OpGroupState
+	// can represent.
 	if c.GroupMaxPlayers <= 0 {
 		c.GroupMaxPlayers = 4
 	}
-	if c.GroupMaxPlayers > 8 {
-		c.GroupMaxPlayers = 8
+	if c.GroupMaxPlayers > protocol.MaxGroupMembers {
+		c.GroupMaxPlayers = protocol.MaxGroupMembers
 	}
 	if c.InviteTTLSec <= 0 {
 		c.InviteTTLSec = 60

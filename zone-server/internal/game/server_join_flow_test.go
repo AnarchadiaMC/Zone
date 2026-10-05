@@ -6,7 +6,9 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
+	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
 )
 
@@ -436,5 +438,67 @@ func TestJoinFlow_InventorySyncChunksUnderMTU(t *testing.T) {
 	total, _ := countSyncItems(t, syncs)
 	if total != 20 {
 		t.Errorf("expected 20 total items, got %d", total)
+	}
+}
+
+// A peer that has not yet sent a transform/visual (gvid 0 or no visual) must
+// not be announced to a newcomer; once it has both, it is.
+func TestJoinFlow_NewcomerSkipsPeersWithoutVisual(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-newcomer-vis", "hwid", "Newcomer"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	if err := db.CreateCharacter("uuid-newcomer-vis", "stalker", "medkit:1", 0); err != nil {
+		t.Fatalf("CreateCharacter: %v", err)
+	}
+
+	peerID := uint32(8801)
+	peer := &network.PlayerSession{
+		SessionID:    peerID,
+		AccountID:    "uuid-newcomer-peer",
+		Name:         "Peer",
+		UDPAddr:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31011},
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{0, 0, 0},
+		LastSeen:     time.Now(),
+	}
+	s.sessions.AddSession(peer)
+	sink.Reset()
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31010}
+	doJoinHandshake(t, s, addr, "uuid-newcomer-vis", "Newcomer")
+
+	for _, raw := range packetsByOpcode(sink, protocol.OpEntityEnterAoI) {
+		var enter protocol.EntityEnterAoI
+		if err := binary.Read(bytes.NewReader(packetPayload(t, raw)), binary.LittleEndian, &enter); err != nil {
+			t.Fatalf("read EntityEnterAoI: %v", err)
+		}
+		if enter.EntityID == peerID {
+			t.Fatal("peer without gvid/visual was announced to newcomer")
+		}
+	}
+
+	// After the peer sends a transform with gvid and a visual, the newcomer
+	// sees it when peers are replayed.
+	peer.Lock()
+	peer.Gvid = 0x55
+	peer.HasVisual = true
+	copy(peer.Visual[:], `actors\stalker_neutral\stalker_neutral_1`)
+	peer.Unlock()
+	sink.Reset()
+	s.sendExistingPeersToNewcomer(s.sessions.GetByAddr(addr.String()))
+
+	found := false
+	for _, raw := range packetsByOpcode(sink, protocol.OpEntityEnterAoI) {
+		var enter protocol.EntityEnterAoI
+		if err := binary.Read(bytes.NewReader(packetPayload(t, raw)), binary.LittleEndian, &enter); err != nil {
+			t.Fatalf("read EntityEnterAoI: %v", err)
+		}
+		if enter.EntityID == peerID && enter.Gvid == 0x55 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("newcomer did not receive ENTITY_ENTER for peer with gvid+visual")
 	}
 }

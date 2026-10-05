@@ -88,6 +88,12 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 		return 0, false, "session mismatch"
 	}
 
+	// 2b. Self-damage is never valid; reject before any friendly-fire gate so
+	// a forged packet cannot be laundered as a no-op friendly hit.
+	if attackerID == targetID {
+		return 0, false, "self damage rejected"
+	}
+
 	// 3. Safe zone immunity (both sides):
 	// A player inside a safe zone may neither deal nor receive damage there.
 	// Return (0, false, "safe zone immunity") when either side is protected.

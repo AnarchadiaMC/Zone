@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
@@ -422,5 +423,202 @@ func TestEntityEnterV3_132BytesWithName(t *testing.T) {
 	}
 	if enter.Gvid != 0x0042 {
 		t.Errorf("enter gvid = 0x%04X, want 0x0042", enter.Gvid)
+	}
+}
+
+// A second invite for a target that already has an unexpired invite is
+// rejected with a system reply and does not replace the pending one.
+func TestGroupInvitePendingRejected(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	alpha := connectMember(t, s, 46500, "uuid-pending-a", "Alpha")
+	bravo := connectMember(t, s, 46501, "uuid-pending-b", "Bravo")
+
+	sendChatCommand(t, s, alpha.sess, 2, "/invite Bravo")
+	inv := s.groups.InviteFor(sessionIDOf(bravo.sess))
+	if inv == nil {
+		t.Fatal("first invite was not recorded")
+	}
+	sink.Reset()
+
+	sendChatCommand(t, s, alpha.sess, 3, "/invite Bravo")
+	chats := packetsByOpcode(sink, protocol.OpChatText)
+	if len(chats) != 1 {
+		t.Fatalf("expected one pending-invite reply, got %d chat packets", len(chats))
+	}
+	pkt := parseChatText(t, chats[0])
+	if text := string(pkt.Text[:pkt.Len]); !strings.Contains(strings.ToLower(text), "pending invite") {
+		t.Errorf("reply = %q, want pending-invite notice", text)
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpGroupInviteNotify)); got != 0 {
+		t.Fatalf("second invite notify delivered %d times, want 0", got)
+	}
+	if again := s.groups.InviteFor(sessionIDOf(bravo.sess)); again == nil || again.InviterID != inv.InviterID {
+		t.Fatal("pending invite was replaced by the rejected second invite")
+	}
+}
+
+// Duplicate handshake nicknames get case-insensitive unique suffixes.
+func TestHandshakeDuplicateNicknamesUnique(t *testing.T) {
+	s, _, _ := setupTestServerWithDB(t)
+	first := connectMember(t, s, 46600, "uuid-dupe-1", "Ghost")
+	second := connectMember(t, s, 46601, "uuid-dupe-2", "ghost")
+	third := connectMember(t, s, 46602, "uuid-dupe-3", "ghost")
+
+	got := []string{sessionName(first.sess), sessionName(second.sess), sessionName(third.sess)}
+	want := []string{"Ghost", "ghost~2", "ghost~3"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("name[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// Overlong and multi-byte nicknames are sanitized, capped at 31 bytes and
+// copied into wire arrays with a guaranteed trailing NUL.
+func TestHandshakeNicknameSanitizedAndTruncated(t *testing.T) {
+	s, _, _ := setupTestServerWithDB(t)
+
+	// 32 'A's: no NUL terminator in the request field; must still cap at 31.
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46610}
+	var req protocol.HandshakeReq
+	copy(req.UUID[:], "uuid-nick-long")
+	for i := range req.Nickname {
+		req.Nickname[i] = 'A'
+	}
+	req.ProtocolVer = protocol.ProtocolVer
+	s.HandlePacket(buildTestPacket(t, protocol.OpHandshakeReq, 1, protocol.FlagReliable, req), addr)
+	sess := s.sessions.GetByAddr(addr.String())
+	if sess == nil {
+		t.Fatal("session missing after long-nick handshake")
+	}
+	if name := sessionName(sess); len(name) != 31 {
+		t.Fatalf("long nickname length = %d, want 31", len(name))
+	}
+
+	// Multi-byte nickname cut at a rune boundary: 16 x 'é' is 32 bytes in the
+	// request; sanitizer must stop at 30 bytes (15 runes) rather than split.
+	addr2 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46611}
+	var req2 protocol.HandshakeReq
+	copy(req2.UUID[:], "uuid-nick-utf8")
+	multibyte := strings.Repeat("é", 16)
+	for i := 0; i < len(multibyte) && i < len(req2.Nickname); i++ {
+		req2.Nickname[i] = multibyte[i]
+	}
+	req2.ProtocolVer = protocol.ProtocolVer
+	s.HandlePacket(buildTestPacket(t, protocol.OpHandshakeReq, 2, protocol.FlagReliable, req2), addr2)
+	sess2 := s.sessions.GetByAddr(addr2.String())
+	if sess2 == nil {
+		t.Fatal("session missing after multibyte-nick handshake")
+	}
+	name2 := sessionName(sess2)
+	if !utf8.ValidString(name2) {
+		t.Fatalf("multibyte nickname %q is not valid UTF-8", name2)
+	}
+	if len(name2) > 31 {
+		t.Fatalf("multibyte nickname length = %d, want <= 31", len(name2))
+	}
+
+	// Wire copy: 31-byte name plus NUL in a 32-byte EntityEnter field.
+	sess2.Lock()
+	sess2.Faction = strings.Repeat("F", 16)
+	sess2.Unlock()
+	pkt := s.buildEntityEnter(sess2)
+	if pkt.Name[31] != 0 {
+		t.Errorf("EntityEnter name not NUL-terminated: %q", pkt.Name)
+	}
+	if pkt.Faction[15] != 0 {
+		t.Errorf("EntityEnter faction not NUL-terminated: %q", pkt.Faction)
+	}
+}
+
+// Invites resolve the exact displayed (unique) nickname, case-insensitively.
+func TestInviteResolvesDisplayedUniqueName(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	alpha := connectMember(t, s, 46620, "uuid-resolve-1", "Alpha")
+	bravo := connectMember(t, s, 46621, "uuid-resolve-2", "alpha")
+	charlie := connectMember(t, s, 46622, "uuid-resolve-3", "Charlie")
+
+	if got := sessionName(bravo.sess); got != "alpha~2" {
+		t.Fatalf("duplicate name = %q, want alpha~2", got)
+	}
+
+	sendChatCommand(t, s, charlie.sess, 2, "/invite Alpha")
+	if inv := s.groups.InviteFor(sessionIDOf(alpha.sess)); inv == nil {
+		t.Fatal("/invite Alpha did not resolve the first session")
+	}
+	sendChatCommand(t, s, charlie.sess, 3, "/invite alpha~2")
+	if inv := s.groups.InviteFor(sessionIDOf(bravo.sess)); inv == nil {
+		t.Fatal("/invite alpha~2 did not resolve the suffixed session")
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpGroupInviteNotify)); got != 2 {
+		t.Fatalf("invite notify count = %d, want 2", got)
+	}
+}
+
+// A slash command with leading whitespace is consumed server-side, not
+// broadcast to peers.
+func TestChatCommandLeadingWhitespaceConsumed(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	alpha := connectMember(t, s, 46630, "uuid-ws-a", "Alpha")
+	bravo := connectMember(t, s, 46631, "uuid-ws-b", "Bravo")
+	sink.Reset()
+
+	sendChatCommand(t, s, alpha.sess, 2, " /invite Bravo")
+
+	if inv := s.groups.InviteFor(sessionIDOf(bravo.sess)); inv == nil {
+		t.Fatal("leading-whitespace /invite was not consumed")
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpChatText)); got != 1 {
+		t.Fatalf("chat packets = %d, want 1 (sender system reply only; command must not broadcast)", got)
+	}
+}
+
+// Changing the actor visual after the first ENTITY_ENTER broadcast re-emits
+// ENTITY_ENTER to same-level peers with the new section.
+func TestEntityEnterRebroadcastOnVisualChange(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+	ghost := connectMember(t, s, 46640, "uuid-vis-rev", "Ghost")
+	ghost.sess.Lock()
+	ghost.sess.Gvid = 0x42
+	ghost.sess.Unlock()
+
+	peer := &network.PlayerSession{
+		SessionID:    9998,
+		AccountID:    "uuid-vis-rev-peer",
+		Name:         "Peer",
+		UDPAddr:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46641},
+		CurrentLevel: "l01_escape",
+		LastSeen:     time.Now(),
+	}
+	s.sessions.AddSession(peer)
+	sink.Reset()
+
+	var pv1 protocol.PlayerVisualPayload
+	copy(pv1.Visual[:], `actors\stalker_neutral\stalker_neutral_1`)
+	s.HandlePacket(buildTestPacket(t, protocol.OpPlayerVisual, 2, protocol.FlagReliable, pv1), ghost.addr)
+	if got := len(packetsByOpcode(sink, protocol.OpEntityEnterAoI)); got != 1 {
+		t.Fatalf("first visual broadcast count = %d, want 1", got)
+	}
+
+	const visual2 = `actors\stalker_neutral\stalker_neutral_2`
+	var pv2 protocol.PlayerVisualPayload
+	copy(pv2.Visual[:], visual2)
+	s.HandlePacket(buildTestPacket(t, protocol.OpPlayerVisual, 3, protocol.FlagReliable, pv2), ghost.addr)
+
+	enters := packetsByOpcode(sink, protocol.OpEntityEnterAoI)
+	if len(enters) != 2 {
+		t.Fatalf("visual change rebroadcast count = %d, want 2", len(enters))
+	}
+	raw := enters[len(enters)-1]
+	r := bytes.NewReader(raw)
+	if _, err := protocol.ReadHeader(r); err != nil {
+		t.Fatalf("ReadHeader: %v", err)
+	}
+	var enter protocol.EntityEnterAoI
+	if err := binary.Read(r, binary.LittleEndian, &enter); err != nil {
+		t.Fatalf("EntityEnterAoI read: %v", err)
+	}
+	if got := trimField(enter.Section[:]); got != visual2 {
+		t.Errorf("rebroadcast section = %q, want %q", got, visual2)
 	}
 }
