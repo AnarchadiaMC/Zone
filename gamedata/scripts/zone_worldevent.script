@@ -5,9 +5,47 @@ local active_emission = false
 local emission_timer = 0
 local current_snd = nil
 
+-- Failure notifications are rate-limited per event type so a broken sound or
+-- weather call cannot spam the log or the news feed every packet.
+local NOTIFY_COOLDOWN_MS = 60000
+local last_notify = {}
+
+local function now_ms()
+    local t = 0
+    pcall(function() if time_global then t = time_global() end end)
+    return tonumber(t) or 0
+end
+
+local function tr(id, fallback)
+    local ok, s = pcall(function() return game.translate_string(id) end)
+    if ok and type(s) == "string" and s ~= "" and s ~= id then return s end
+    return fallback or id
+end
+
+-- Returns true when this event type has not reported a failure recently.
+local function notify_ready(kind)
+    local now = now_ms()
+    local prev = last_notify[kind]
+    if prev and (now - prev) < NOTIFY_COOLDOWN_MS then return false end
+    last_notify[kind] = now
+    return true
+end
+
+-- Log + in-game notice for an event that could not be applied. Rate-limited.
+local function notify_failure(kind, msg)
+    if not notify_ready(kind) then return end
+    printf("Zone: world event %s: %s", tostring(kind), tostring(msg))
+    pcall(function()
+        if db and db.actor then
+            db.actor:give_game_news("Zone", tostring(msg), "ui_inGame2_PDA_icon", 0, 6000, 0)
+        end
+    end)
+end
+
 function reset_world_events()
     active_emission = false
     emission_timer = 0
+    last_notify = {}
     if current_snd then
         pcall(function()
             if current_snd:playing() then
@@ -40,15 +78,21 @@ local function handle_emission_warn(timer)
         end
     end)
     -- sound_object is an unverified Anomaly-script global; nil-guard + pcall.
+    local snd_ok = false
     if sound_object then
         local ok, snd = pcall(sound_object, "characters_voice\\scenario\\video\\emission_siren")
         if ok and snd then
             current_snd = snd
-            pcall(function()
+            local play_ok = pcall(function()
                 local s2d = (sound_object and sound_object.s2d) or 0
                 snd:play(db.actor, 0, s2d)
             end)
+            snd_ok = play_ok
         end
+    end
+    if not snd_ok then
+        notify_failure("emission_warn_sound",
+            tr("ui_zone_event_no_sound", "Emission siren sound is unavailable"))
     end
 end
 
@@ -63,9 +107,17 @@ local function handle_emission_active()
     end
     if not started then
         -- Manual fallback
+        local weather_ok = false
         pcall(function()
-            if level and level.set_weather then level.set_weather("emission", true) end
+            if level and level.set_weather then
+                level.set_weather("emission", true)
+                weather_ok = true
+            end
         end)
+        if not weather_ok then
+            notify_failure("emission_active",
+                tr("ui_zone_event_weather_failed", "Failed to apply world event weather"))
+        end
     end
 end
 
@@ -84,25 +136,37 @@ local function handle_emission_clear()
         end
     end)
     if not ended then
+        local weather_ok = false
         pcall(function()
-            if level and level.set_weather then level.set_weather("default", true) end
+            if level and level.set_weather then
+                level.set_weather("default", true)
+                weather_ok = true
+            end
         end)
+        if not weather_ok then
+            notify_failure("emission_clear",
+                tr("ui_zone_event_weather_failed", "Failed to apply world event weather"))
+        end
     end
 end
 
 local function handle_raid_start()
-    if db.actor then
-        pcall(function()
-            db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
-        end)
+    if not db.actor then return end
+    local ok = pcall(function()
+        db.actor:give_game_news("Warning", "MUTANT RAID DETECTED - PREPARE DEFENSES", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+    end)
+    if not ok then
+        notify_failure("raid_start", tr("ui_zone_event_notify_failed", "Could not display the world event notice"))
     end
 end
 
 local function handle_raid_end()
-    if db.actor then
-        pcall(function()
-            db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
-        end)
+    if not db.actor then return end
+    local ok = pcall(function()
+        db.actor:give_game_news("Clear", "Raid repelled", "ui_inGame2_Mutant_hunter", 0, 10000, 0)
+    end)
+    if not ok then
+        notify_failure("raid_end", tr("ui_zone_event_notify_failed", "Could not display the world event notice"))
     end
 end
 
@@ -115,8 +179,11 @@ function on_world_event(pkt, offset)
         state, pos = zone_net.read_uint8(pkt, pos)
         timer, pos = zone_net.read_uint32_le(pkt, pos)
     end)
-    if not ok_parse or not event_type then return end
-    
+    if not ok_parse or not event_type then
+        notify_failure("malformed", tr("ui_zone_event_malformed", "World event data was malformed"))
+        return
+    end
+
     if event_type == 0 then -- Emission (state 1-3)
         if state == 1 then -- Warning
             handle_emission_warn(timer)
@@ -124,6 +191,9 @@ function on_world_event(pkt, offset)
             handle_emission_active()
         elseif state == 3 then -- Clear
             handle_emission_clear()
+        else
+            notify_failure("emission_state_" .. tostring(state),
+                tr("ui_zone_event_malformed", "World event data was malformed"))
         end
     -- NOTE: legacy event_type 1..3 compat removed: collides with future Psi-Storm typing.
     -- Use type 0/state 1-3 for emission; type 4/5 for raids only.
@@ -131,6 +201,12 @@ function on_world_event(pkt, offset)
         handle_raid_start()
     elseif event_type == 5 then -- RAID_END
         handle_raid_end()
+    else
+        -- Unknown future event type: log once per type (rate-limited), no news.
+        local kind = "unknown_" .. tostring(event_type)
+        if notify_ready(kind) then
+            printf("Zone: world event: unknown type %s ignored", tostring(event_type))
+        end
     end
 end
 

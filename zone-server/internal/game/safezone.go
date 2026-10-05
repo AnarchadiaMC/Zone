@@ -109,11 +109,16 @@ func LoadSafeZones(db *sql.DB) error {
 	return nil
 }
 
+// CheckSafeZone returns the safe zone containing (x, y, z) on level, or nil.
+// The returned pointer aliases the immutable in-memory table: LoadSafeZones
+// replaces the slice wholesale (never mutates elements), so callers may use
+// the result after the lock is released. Returning the stored element instead
+// of a local copy keeps this allocation-free on the per-tick path.
 func CheckSafeZone(x, y, z float32, level string) *SafeZone {
 	safeZoneTable.RLock()
 	defer safeZoneTable.RUnlock()
 	for i := range safeZoneTable.zones {
-		sz := safeZoneTable.zones[i]
+		sz := &safeZoneTable.zones[i]
 		if sz.LevelName != level {
 			continue
 		}
@@ -123,7 +128,7 @@ func CheckSafeZone(x, y, z float32, level string) *SafeZone {
 		distSq := dx*dx + dz*dz
 
 		if distSq <= sz.Radius*sz.Radius && math.Abs(float64(y-sz.CenterY)) <= float64(sz.Height)/2 {
-			return &sz
+			return sz
 		}
 	}
 	return nil

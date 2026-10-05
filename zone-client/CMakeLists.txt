@@ -96,3 +96,14 @@ target_compile_definitions(ZoneClient PRIVATE ZO_INJECTABLE)
 # ----------------------------------------------------------------------
 add_executable(ZoneClient_Injector injector/injector_main.cpp)
 target_link_libraries(ZoneClient_Injector PRIVATE psapi rpcrt4)
+
+# ----------------------------------------------------------------------
+# Target 3: ZoneClient_VersionProxy (drop-in version.dll proxy)
+#
+# Shipped as "<Anomaly>\bin\version.dll" next to ZoneClient.dll. Forwards all
+# 15 VERSION.dll exports to System32 and asynchronously loads ZoneClient.dll
+# from its own directory. Static CRT (inherited from the global setting) and
+# no extra dependencies beyond kernel32.
+# ----------------------------------------------------------------------
+add_library(ZoneClient_VersionProxy SHARED src/proxy/version_proxy.cpp)
+set_target_properties(ZoneClient_VersionProxy PROPERTIES OUTPUT_NAME version)

@@ -2,6 +2,8 @@ package game
 
 import (
 	"bytes"
+	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -10,6 +12,23 @@ import (
 )
 
 const AoIRadius float32 = 220.0
+
+// MaxSnapshotEntriesPerClientPerTick optionally caps how many AoI entries one
+// client may receive per tick. 0 means unlimited (default), which is safe for
+// the supported player caps.
+//
+// Worst-case bandwidth at 48 players all inside one AoI (47 neighbours):
+//   entries per tick   = 47
+//   packets per tick   = ceil(47 / 32) = 2
+//   bytes per tick     = 47*22 (entries) + 2*1 (counts) + 2*12 (headers) = 1060
+//   bytes per second   = 1060 * 30 = 31,800 B/s ~= 31.1 KiB/s
+//
+// That is well under a 100 KiB/s budget, so no cap is applied by default.
+// Raising MaxPlayers past ~150 in a single AoI would warrant setting this to
+// ~150 entries (~103 KiB/s with headers) and relying on the nearest-first
+// ordering below. Keep it a compile-time constant so the hot path stays
+// allocation-free; wire it into config if a deployment ever needs tuning.
+const MaxSnapshotEntriesPerClientPerTick = 0
 
 type EntityInfo struct {
 	ID      uint32
@@ -20,6 +39,45 @@ type EntityInfo struct {
 	Health  uint16
 	Gvid    uint16
 	Name    string
+}
+
+// SnapshotSender is the minimal send surface the AoI broadcaster needs.
+// *network.UDPListener satisfies it; tests substitute a capturing sender.
+type SnapshotSender interface {
+	Send(addr *net.UDPAddr, data []byte) error
+}
+
+// neighborRef is one AoI candidate with its payload pre-copied under the peer
+// session's lock and its squared distance to the receiver for nearest-first
+// ordering.
+type neighborRef struct {
+	id        uint32
+	distSq    float32
+	x, y, z   float32
+	yaw       int16
+	pitch     int16
+	animFlags uint8
+	health    uint8
+}
+
+// aoiScratch holds the per-broadcast reusable buffers. One scratch is checked
+// out of the pool per BroadcastSnapshots call (per tick), so snapshot
+// generation performs no per-client heap allocation after warmup.
+type aoiScratch struct {
+	ids  []uint32
+	refs []neighborRef
+	buf  bytes.Buffer
+}
+
+var aoiScratchPool = sync.Pool{
+	New: func() interface{} {
+		s := &aoiScratch{
+			ids:  make([]uint32, 0, 64),
+			refs: make([]neighborRef, 0, 64),
+		}
+		s.buf.Grow(protocol.MaxSafeUDPPacketSize)
+		return s
+	},
 }
 
 type AoIManager struct {
@@ -33,8 +91,29 @@ func NewAoIManager() *AoIManager {
 	}
 }
 
-func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *SpatialGrid, udp *network.UDPListener, seq *atomic.Uint32) {
+// BroadcastSnapshots sends each connected session a nearest-first snapshot of
+// its AoI neighbours. When a client has more than MaxSnapshotEntries
+// neighbours, the set is split across several OpServerSnapshot packets of at
+// most MaxSnapshotEntries entries each so no peer is silently dropped; the Lua
+// client parses every packet independently (zone_dummy.script on_snapshot).
+// Session locks are held only while copying peer fields (and are never held
+// across a socket send).
+func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *SpatialGrid, udp SnapshotSender, seq *atomic.Uint32) {
+	if udp == nil {
+		return
+	}
 	allSessions := sessions.GetAll()
+
+	scratch := aoiScratchPool.Get().(*aoiScratch)
+	defer func() {
+		scratch.ids = scratch.ids[:0]
+		scratch.refs = scratch.refs[:0]
+		scratch.buf.Reset()
+		aoiScratchPool.Put(scratch)
+	}()
+	scratch.buf.Reset()
+
+	var snap protocol.ServerSnapshot
 	for _, sess := range allSessions {
 		sess.Lock()
 		x, z := sess.Position[0], sess.Position[2]
@@ -46,49 +125,85 @@ func (a *AoIManager) BroadcastSnapshots(sessions *network.SessionManager, grid *
 			continue
 		}
 
-		neighbors := grid.GetNeighbors(x, z, AoIRadius)
+		scratch.ids = grid.GetNeighborsInto(scratch.ids[:0], x, z, AoIRadius)
+		refs := scratch.refs[:0]
 
-		var snapshot protocol.ServerSnapshot
-		count := 0
-
-		for _, nID := range neighbors {
+		for _, nID := range scratch.ids {
 			if nID == sessID {
 				continue
 			}
-			// PRODUCTION FIX: Entries is [32]; the old >=64 cap panicked on
-			// index 32..63 with >32 players in radius. Cap at wire capacity.
-			if count >= len(snapshot.Entries) {
-				break
-			}
-
 			peer := sessions.GetByID(nID)
 			if peer == nil {
 				continue
 			}
 
 			peer.Lock()
-			snapshot.Entries[count] = protocol.SnapshotEntry{
-				SessionID: peer.SessionID,
-				PosX:      peer.Position[0],
-				PosY:      peer.Position[1],
-				PosZ:      peer.Position[2],
-				Yaw:       int16(peer.Rotation[0] * 100.0),
-				Pitch:     int16(peer.Rotation[1] * 100.0),
-				AnimFlags: peer.AnimFlags,
-				Health:    uint8(peer.Health),
+			px, py, pz := peer.Position[0], peer.Position[1], peer.Position[2]
+			ref := neighborRef{
+				id:        peer.SessionID,
+				x:         px,
+				y:         py,
+				z:         pz,
+				yaw:       int16(peer.Rotation[0] * 100.0),
+				pitch:     int16(peer.Rotation[1] * 100.0),
+				animFlags: peer.AnimFlags,
+				health:    uint8(peer.Health),
 			}
 			peer.Unlock()
-			count++
+			dx, dz := px-x, pz-z
+			ref.distSq = dx*dx + dz*dz
+			refs = append(refs, ref)
 		}
 
-		if count > 0 {
-			snapshot.Count = uint8(count)
-			var buf bytes.Buffer
-			packetSeq := seq.Add(1)
-			err := protocol.WritePacket(&buf, protocol.OpServerSnapshot, packetSeq, protocol.FlagUnreliable, &snapshot)
-			if err == nil {
-				_ = udp.Send(udpAddr, buf.Bytes())
+		// Nearest-first ordering; the session-ID tie-break keeps output
+		// deterministic when distances match.
+		slices.SortFunc(refs, func(a, b neighborRef) int {
+			switch {
+			case a.distSq < b.distSq:
+				return -1
+			case a.distSq > b.distSq:
+				return 1
+			case a.id < b.id:
+				return -1
+			case a.id > b.id:
+				return 1
+			default:
+				return 0
 			}
+		})
+
+		if MaxSnapshotEntriesPerClientPerTick > 0 && len(refs) > MaxSnapshotEntriesPerClientPerTick {
+			refs = refs[:MaxSnapshotEntriesPerClientPerTick]
+		}
+		scratch.refs = refs
+
+		for start := 0; start < len(refs); start += protocol.MaxSnapshotEntries {
+			end := start + protocol.MaxSnapshotEntries
+			if end > len(refs) {
+				end = len(refs)
+			}
+			chunk := refs[start:end]
+			snap.Count = uint8(len(chunk))
+			for i := range chunk {
+				r := &chunk[i]
+				snap.Entries[i] = protocol.SnapshotEntry{
+					SessionID: r.id,
+					PosX:      r.x,
+					PosY:      r.y,
+					PosZ:      r.z,
+					Yaw:       r.yaw,
+					Pitch:     r.pitch,
+					AnimFlags: r.animFlags,
+					Health:    r.health,
+				}
+			}
+
+			scratch.buf.Reset()
+			packetSeq := seq.Add(1)
+			if err := protocol.WritePacket(&scratch.buf, protocol.OpServerSnapshot, packetSeq, protocol.FlagUnreliable, &snap); err != nil {
+				continue
+			}
+			_ = udp.Send(udpAddr, scratch.buf.Bytes())
 		}
 	}
 }

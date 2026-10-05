@@ -29,6 +29,14 @@ type PacketRecorder interface {
 
 var activeSink PacketRecorder
 
+// packetBufferPool reuses packet serialisation buffers on the 30Hz send path.
+// Buffers are only borrowed for the duration of one Send: every consumer
+// (UDP send, ack-queue enqueue, PacketRecorder) copies the bytes before the
+// buffer is returned to the pool.
+var packetBufferPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
 // LeaveAoI carries entity leave notification payload.
 type LeaveAoI struct {
 	SessionID uint32
@@ -1688,8 +1696,10 @@ func (s *Server) handleServerQuery(addr *net.UDPAddr) {
 	res.TickRateHz = uint8(tickRate)
 
 	seq := s.seq.Add(1)
-	var buf bytes.Buffer
-	if err := protocol.WritePacket(&buf, protocol.OpServerQueryRes, seq, protocol.FlagUnreliable, res); err != nil {
+	buf := packetBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer packetBufferPool.Put(buf)
+	if err := protocol.WritePacket(buf, protocol.OpServerQueryRes, seq, protocol.FlagUnreliable, res); err != nil {
 		return
 	}
 	data := buf.Bytes()
@@ -1759,8 +1769,10 @@ func (s *Server) Tick(now time.Time) {
 		flagSafe := sess.InSafeZone
 		level := sess.CurrentLevel
 		inCombat := now.Before(sess.InCombatUntil)
+		// addrStr is only needed by the stale-session path; computing it here
+		// (instead of every tick for every session) avoids a per-tick alloc.
 		addrStr := ""
-		if sess.UDPAddr != nil {
+		if stale && sess.UDPAddr != nil {
 			addrStr = sess.UDPAddr.String()
 		}
 		sess.Unlock()
@@ -1874,8 +1886,11 @@ func (s *Server) SendToSession(sess *network.PlayerSession, opcode uint16, flags
 
 	seq := s.seq.Add(1)
 
-	var buf bytes.Buffer
-	if err := protocol.WritePacket(&buf, opcode, seq, flags, payload); err != nil {
+	buf := packetBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer packetBufferPool.Put(buf)
+
+	if err := protocol.WritePacket(buf, opcode, seq, flags, payload); err != nil {
 		s.logger.Error("Failed to write packet", zap.Error(err))
 		return
 	}
@@ -2142,8 +2157,10 @@ func (s *Server) sendStashResponse(addr *net.UDPAddr, resp protocol.StashRespons
 		return
 	}
 	seq := s.seq.Add(1)
-	var buf bytes.Buffer
-	if err := protocol.WritePacket(&buf, protocol.OpStashResponse, seq, protocol.FlagReliable, resp); err != nil {
+	buf := packetBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer packetBufferPool.Put(buf)
+	if err := protocol.WritePacket(buf, protocol.OpStashResponse, seq, protocol.FlagReliable, resp); err != nil {
 		s.logger.Error("sendStashResponse: failed to write packet", zap.Error(err))
 		return
 	}

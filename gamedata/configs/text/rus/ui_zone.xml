@@ -168,4 +168,109 @@
     <string id="ui_zone_col_tick">
         <text>Тик</text>
     </string>
+    <string id="ui_zone_err_banned">
+        <text>Вы забанены на этом сервере</text>
+    </string>
+    <string id="ui_zone_err_server_full">
+        <text>Сервер заполнен</text>
+    </string>
+    <string id="ui_zone_err_version">
+        <text>Несовместимая версия протокола</text>
+    </string>
+    <string id="ui_zone_err_kick">
+        <text>Отключён сервером</text>
+    </string>
+    <string id="ui_zone_err_timeout">
+        <text>Сервер не отвечает</text>
+    </string>
+    <string id="ui_zone_err_handshake">
+        <text>Ошибка рукопожатия с сервером</text>
+    </string>
+    <string id="ui_zone_err_connect_call">
+        <text>Не удалось запустить подключение</text>
+    </string>
+    <string id="ui_zone_drop_prefix">
+        <text>Соединение разорвано</text>
+    </string>
+    <string id="ui_zone_drop_generic">
+        <text>Связь с сервером потеряна</text>
+    </string>
+    <string id="ui_zone_level_change_unsupported">
+        <text>Смена уровня сервером в игре не поддерживается. Переподключитесь из главного меню.</text>
+    </string>
+    <string id="ui_zone_join_start_failed">
+        <text>Не удалось запустить игру для уровня сервера</text>
+    </string>
+    <string id="ui_zone_inv_sync_incomplete">
+        <text>Синхронизация инвентаря неполная: не создано предметов %d из %d</text>
+    </string>
+    <string id="ui_zone_inv_sync_malformed">
+        <text>Данные синхронизации инвентаря повреждены; часть предметов может отсутствовать</text>
+    </string>
+    <string id="ui_zone_status_no_module">
+        <text>Модуль ZoneNet не загружен — браузер серверов недоступен</text>
+    </string>
+    <string id="ui_zone_status_busy">
+        <text>Активна другая сетевая сессия</text>
+    </string>
+    <string id="ui_zone_identity_missing">
+        <text>Идентификация клиента недоступна — подключение невозможно</text>
+    </string>
+    <string id="ui_zone_failed_retry_hint">
+        <text>проверьте адрес и нажмите «Подключиться» для повтора</text>
+    </string>
+    <string id="ui_zone_scan_none_online">
+        <text>Сканирование завершено: серверы не в сети</text>
+    </string>
+    <string id="ui_zone_scan_all_timed_out">
+        <text>все запросы истекли по таймауту</text>
+    </string>
+    <string id="ui_zone_scan_all_offline">
+        <text>серверы недоступны</text>
+    </string>
+    <string id="ui_zone_scan_zero_targets">
+        <text>Нет сохранённых серверов — добавьте на вкладке «Прямое подключение»</text>
+    </string>
+    <string id="ui_zone_favorites_write_failed">
+        <text>Не удалось сохранить избранное: файл идентификации недоступен для записи</text>
+    </string>
+    <string id="ui_zone_row_fail_timeout">
+        <text>таймаут</text>
+    </string>
+    <string id="ui_zone_row_fail_refused">
+        <text>отказ</text>
+    </string>
+    <string id="ui_zone_row_fail_bad">
+        <text>плохой ответ</text>
+    </string>
+    <string id="ui_zone_last_error">
+        <text>Последняя ошибка</text>
+    </string>
+    <string id="ui_zone_error_loadout_config">
+        <text>Конфигурация снаряжения отсутствует или недоступна</text>
+    </string>
+    <string id="ui_zone_error_loadout_build">
+        <text>Не удалось собрать снаряжение</text>
+    </string>
+    <string id="ui_zone_error_loadout_oversize">
+        <text>Снаряжение слишком велико для сервера (%d/%d байт)</text>
+    </string>
+    <string id="ui_zone_error_zone_module">
+        <text>Сетевой модуль недоступен — нельзя отправить персонажа</text>
+    </string>
+    <string id="ui_zone_error_identity">
+        <text>Идентификация клиента отсутствует — нельзя создать персонажа</text>
+    </string>
+    <string id="ui_zone_event_no_sound">
+        <text>Звук сирены выброса недоступен</text>
+    </string>
+    <string id="ui_zone_event_weather_failed">
+        <text>Не удалось применить погоду мирового события</text>
+    </string>
+    <string id="ui_zone_event_malformed">
+        <text>Данные мирового события повреждены</text>
+    </string>
+    <string id="ui_zone_event_notify_failed">
+        <text>Не удалось показать уведомление мирового события</text>
+    </string>
 </string_table>

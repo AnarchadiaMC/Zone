@@ -125,3 +125,21 @@ func TestGroupMaxPlayersClampedToProtocolCap(t *testing.T) {
 		}
 	}
 }
+
+// Validate accepts the supported 48/64 player caps and rejects non-positive
+// values, so the handshake full-path can rely on MaxPlayers being sane.
+func TestValidate_MaxPlayers48And64(t *testing.T) {
+	for _, max := range []int{48, 64} {
+		cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: max}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("max_players %d: Validate returned %v, want nil", max, err)
+		}
+	}
+
+	for _, max := range []int{0, -1} {
+		cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: max}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("max_players %d: Validate returned nil, want error", max)
+		}
+	}
+}

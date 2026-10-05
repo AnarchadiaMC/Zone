@@ -129,21 +129,43 @@ func (g *SpatialGrid) Update(id uint32, x, z float32) {
 // It queries only the candidate cells intersecting [x-radius, x+radius] x [z-radius, z+radius]
 // and verifies exact Euclidean distance (dx^2 + dz^2 <= radius^2).
 func (g *SpatialGrid) GetNeighbors(x, z float32, radius float32) []uint32 {
+	return g.GetNeighborsInto(nil, x, z, radius)
+}
+
+// GetNeighborsInto is GetNeighbors with caller-provided storage: the result is
+// appended to dst[:0] and reused when it has capacity, so hot callers can
+// avoid per-query allocations. No dedupe map is needed because every entity
+// lives in exactly one cell, and each candidate cell is visited once.
+func (g *SpatialGrid) GetNeighborsInto(dst []uint32, x, z float32, radius float32) []uint32 {
+	if radius < 0 {
+		return dst[:0]
+	}
+
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	if radius < 0 {
-		return []uint32{}
-	}
+	dst = dst[:0]
 
 	minCellX := int32(math.Floor(float64((x - radius) / g.cellSize)))
 	maxCellX := int32(math.Floor(float64((x + radius) / g.cellSize)))
 	minCellZ := int32(math.Floor(float64((z - radius) / g.cellSize)))
 	maxCellZ := int32(math.Floor(float64((z + radius) / g.cellSize)))
 
+	// Pre-size a fresh result so a dense query does not grow the slice
+	// repeatedly. Reused caller storage (AoI scratch) is left untouched.
+	if cap(dst) == 0 {
+		spanX := int64(maxCellX-minCellX) + 1
+		spanZ := int64(maxCellZ-minCellZ) + 1
+		hint := spanX * spanZ
+		if hint > 64 {
+			hint = 64
+		}
+		if hint > 0 {
+			dst = make([]uint32, 0, int(hint))
+		}
+	}
+
 	radiusSq := radius * radius
-	neighbors := make([]uint32, 0)
-	seen := make(map[uint32]struct{})
 
 	for cx := minCellX; cx <= maxCellX; cx++ {
 		for cz := minCellZ; cz <= maxCellZ; cz++ {
@@ -152,9 +174,6 @@ func (g *SpatialGrid) GetNeighbors(x, z float32, radius float32) []uint32 {
 				continue
 			}
 			for id := range cell {
-				if _, alreadySeen := seen[id]; alreadySeen {
-					continue
-				}
 				coords, ok := g.entityCoords[id]
 				if !ok {
 					continue
@@ -162,14 +181,13 @@ func (g *SpatialGrid) GetNeighbors(x, z float32, radius float32) []uint32 {
 				dx := coords[0] - x
 				dz := coords[1] - z
 				if dx*dx+dz*dz <= radiusSq {
-					seen[id] = struct{}{}
-					neighbors = append(neighbors, id)
+					dst = append(dst, id)
 				}
 			}
 		}
 	}
 
-	return neighbors
+	return dst
 }
 
 // Count returns the total number of tracked entities in the grid.

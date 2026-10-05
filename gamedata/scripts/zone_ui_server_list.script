@@ -71,6 +71,30 @@ local function tr_or(id, fallback)
     return s
 end
 
+-- DLL/handshake error -> localized message (single source: zone_net mapper).
+local function localize_net_error(raw)
+    if type(raw) ~= "string" or raw == "" then return raw end
+    local out = raw
+    pcall(function()
+        if ZoneNet and type(ZoneNet.LocalizeError) == "function" then
+            out = ZoneNet:LocalizeError(raw) or raw
+        end
+    end)
+    return out
+end
+
+-- Classify a probe failure for per-row display.
+local function probe_failure_kind(reason)
+    local low = tostring(reason or ""):lower()
+    if low:find("timed out", 1, true) or low:find("timeout", 1, true) then
+        return "ui_zone_row_fail_timeout"
+    end
+    if low:find("refused", 1, true) or low:find("reject", 1, true) then
+        return "ui_zone_row_fail_refused"
+    end
+    return "ui_zone_row_fail_bad"
+end
+
 -- Identity gate: zone_main owns zone_identity.ltx. Returns the config table
 -- with a real uuid/hwid, or nil when no identity could be established. The
 -- browser must never connect with the shared "anonymous" placeholder.
@@ -394,6 +418,12 @@ function UIZoneServerList:__init(owner)
     self.scan_fail_reason = nil
     self.last_fail_reason = nil
     self.last_retry_service = 0
+    -- Post-scan summary and persistent-failure reporting.
+    self.scan_ok = 0
+    self.scan_timeouts = 0
+    self.scan_summary = nil
+    self.persist_error = nil
+    self.module_error_logged = false
 
     -- Row model widgets keyed by ip:port, and their view indices.
     self.row_widgets = {}
@@ -423,6 +453,9 @@ end
 
 function UIZoneServerList:__finalize()
     self:AbortScan()
+    -- Never let keyboard capture outlive the window.
+    pcall(function() self:ReleaseEditFocus() end)
+    self.filter_editing = false
     _server_browser_dlg = nil
 end
 
@@ -709,13 +742,39 @@ function UIZoneServerList:IsDirectTab()
     return self.tab_id == TAB_DIRECT
 end
 
+-- Persistence failure is surfaced once in the status footer and kept there
+-- until a save succeeds; never spam per entry.
+function UIZoneServerList:ReportPersistError()
+    if self.persist_error then return end
+    self.persist_error = tr("ui_zone_favorites_write_failed")
+    printf("Zone UI Error: identity file not writable")
+    self:UpdateStatus()
+end
+
+-- External error surface used by zone_net (drop reasons, join failures).
+-- Only rewrites the visible footer while the browser is actually shown.
+function UIZoneServerList:ReportError(msg)
+    msg = tostring(msg or "")
+    if msg == "" then return end
+    self.last_fail_reason = msg
+    local shown = false
+    pcall(function() shown = self:IsShown() and true or false end)
+    if shown then
+        self:SetState(STATE_FAILED, msg)
+    end
+end
+
 function UIZoneServerList:LoadFavorites()
     self.favorites = {}
     self.history = {}
     self.sel_entry = nil
 
     local path = get_identity_path()
-    local ok_open, file = pcall(io.open, path, "r")
+    local ok_open, file, open_err = pcall(io.open, path, "r")
+    if ok_open and not file and type(open_err) == "string"
+        and open_err:lower():find("denied", 1, true) then
+        self:ReportPersistError()
+    end
     if ok_open and file then
         local current_section = ""
         local legacy_buffer = {}
@@ -848,7 +907,7 @@ function UIZoneServerList:SaveFavorites()
         end)
         pcall(function() file:close() end)
         if not ok_lines then
-            printf("Zone UI Error: failed reading identity file")
+            self:ReportPersistError()
             return false
         end
     end
@@ -880,9 +939,10 @@ function UIZoneServerList:SaveFavorites()
     lines[#lines + 1] = "[" .. LEGACY_SEC .. "]"
 
     if not write_lines_atomic(target_path, lines) then
-        printf("Zone UI Error: failed writing identity file")
+        self:ReportPersistError()
         return false
     end
+    self.persist_error = nil
     return true
 end
 
@@ -1094,6 +1154,11 @@ function UIZoneServerList:FillRow(w, entry, index)
             elseif offline then
                 c = DIM
             end
+        elseif (stale or offline) and entry.fail_reason_id then
+            -- Show the failure kind instead of a bare "-" so a dead row says
+            -- why it is dead (timeout / refused / bad response).
+            ping_txt = clip_text(tr(entry.fail_reason_id), 10)
+            c = stale and AMBER or DIM
         end
         pcall(function()
             w.ping:SetText(ping_txt)
@@ -1364,6 +1429,9 @@ function UIZoneServerList:UpdateDetails()
     if e.state == "stale" or e.state == "offline" then
         local state_id = (e.state == "offline") and "ui_zone_state_offline" or "ui_zone_state_stale"
         lines[#lines + 1] = tr(state_id) .. " (" .. age_text(e.last_ok or e.lastSeen) .. ")"
+        if e.fail_reason_id then
+            lines[#lines + 1] = field_text("ui_zone_last_error", tr(e.fail_reason_id))
+        end
     end
     lines[#lines + 1] = field_text("ui_zone_last_seen", age_text(e.last_ok or e.lastSeen))
     set_widget_text(self.details_body, table.concat(lines, "\\n"), nil)
@@ -1401,10 +1469,10 @@ function UIZoneServerList:UpdateStatus()
     elseif state == STATE_FAILED then
         text, color, lamp = tr("ui_zone_failed"), RED, LAMP_RED
     else
-        if self:NetAvailable() then
-            text, color, lamp = tr("ui_zone_status_ready"), AMBER, LAMP_OFF
+        if not self:NetAvailable() or not self:ClientLoaded() then
+            text, color, lamp = tr("ui_zone_status_no_module"), RED, LAMP_RED
         else
-            text, color, lamp = tr("ui_zone_status_offline"), RED, LAMP_RED
+            text, color, lamp = tr("ui_zone_status_ready"), AMBER, LAMP_OFF
         end
     end
 
@@ -1413,21 +1481,41 @@ function UIZoneServerList:UpdateStatus()
             text = text .. ": " .. self.state_detail
         end
     end
+    if state == STATE_FAILED then
+        text = text .. " - " .. tr("ui_zone_failed_retry_hint")
+    end
 
-    if state == STATE_IDLE or state == STATE_FAILED then
+    if state == STATE_IDLE then
         local online, offline = self:CountStates()
-        if online + offline > 0 then
+        local summary = self.scan_summary
+        local total = summary and tonumber(summary.total) or 0
+        local timed_out = summary and tonumber(summary.timed_out) or 0
+        if summary and total == 0 and online + offline == 0 then
+            text = tr("ui_zone_scan_zero_targets")
+        elseif online + offline > 0 then
             text = tr("ui_zone_online_count") .. ": " .. tostring(online)
                 .. " / " .. tr("ui_zone_offline_count") .. ": " .. tostring(offline)
-            if self.last_fail_reason and self.last_fail_reason ~= "" and offline > 0 then
-                text = text .. " (" .. clip_text(self.last_fail_reason, 28) .. ")"
+            if online == 0 then
+                if total > 0 and timed_out >= total then
+                    text = text .. " - " .. tr("ui_zone_scan_all_timed_out")
+                elseif self.last_fail_reason and self.last_fail_reason ~= "" then
+                    text = text .. " (" .. clip_text(self.last_fail_reason, 28) .. ")"
+                end
             end
-        elseif state == STATE_IDLE then
+        elseif total > 0 then
+            text = tr("ui_zone_scan_none_online") .. " - "
+                .. ((timed_out >= total) and tr("ui_zone_scan_all_timed_out")
+                    or tr("ui_zone_scan_all_offline"))
+        else
             text = tr("ui_zone_sort_hint")
         end
         if self.filter_editing then
             text = tr("ui_zone_filter_hint") .. " " .. (self.filter_text or "")
         end
+    end
+
+    if self.persist_error and self.persist_error ~= "" then
+        text = text .. " | " .. self.persist_error
     end
 
     set_widget_text(self.status_label, text, color)
@@ -1557,7 +1645,7 @@ function UIZoneServerList:UpsertHistory(ip, port)
     return entry
 end
 
-function UIZoneServerList:MarkFailure(entry)
+function UIZoneServerList:MarkFailure(entry, reason)
     if not entry then return end
     entry.fail_count = (entry.fail_count or 0) + 1
     if entry.fail_count >= 2 then
@@ -1565,20 +1653,31 @@ function UIZoneServerList:MarkFailure(entry)
     else
         entry.state = "stale"
     end
+    if type(reason) == "string" and reason ~= "" then
+        entry.fail_reason = reason
+        entry.fail_reason_id = probe_failure_kind(reason)
+    end
     local idx = entry.fail_count
     if idx > #RETRY_BACKOFF then idx = #RETRY_BACKOFF end
     entry.retry_at = now_timestamp() + RETRY_BACKOFF[idx]
 end
 
+-- DLL/module missing is a distinct state from "no server answered": report it
+-- once in the log and always in the footer.
+function UIZoneServerList:ReportModuleMissing()
+    local msg = tr("ui_zone_status_no_module")
+    if not self.module_error_logged then
+        self.module_error_logged = true
+        printf("Zone UI: %s", msg)
+    end
+    self:SetState(STATE_FAILED, msg)
+end
+
 function UIZoneServerList:StartScan(reset_backoff)
     if self.scan_active or self.state == STATE_CONNECTING then return end
     if self:IsDirectTab() then return end
-    if not self:NetAvailable() then
-        self:SetState(STATE_IDLE)
-        return
-    end
-    if not self:ClientLoaded() then
-        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+    if not self:NetAvailable() or not self:ClientLoaded() then
+        self:ReportModuleMissing()
         return
     end
 
@@ -1586,6 +1685,9 @@ function UIZoneServerList:StartScan(reset_backoff)
     self.scan_prev_connected = (self.state == STATE_CONNECTED)
     self.broadcast_hit = nil
     self.last_scan_step = 0
+    self.scan_summary = nil
+    self.scan_ok = 0
+    self.scan_timeouts = 0
 
     if not self.async_ok then
         -- Blocking fallback (DLL without ZN_QueryStart): legacy 450 ms probes
@@ -1602,22 +1704,31 @@ function UIZoneServerList:StartScan(reset_backoff)
                 e.fail_count = 0
                 e.retry_at = 0
             end
-            queue[#queue + 1] = { ip = e.ip, port = e.port }
+            queue[#queue + 1] = { ip = e.ip, port = e.port, scan = true }
         end
         for _, e in ipairs(self.favorites) do push(e) end
         for _, e in ipairs(self.history) do push(e) end
         if self.tab_id == TAB_LAN then
             local port = self:CurrentPort()
             for _ = 1, LAN_PROBE_COUNT do
-                queue[#queue + 1] = { ip = BROADCAST_ADDR, port = port, broadcast = true }
+                queue[#queue + 1] = { ip = BROADCAST_ADDR, port = port, broadcast = true, scan = true }
             end
         end
 
         self.scan_queue = queue
         self.scan_index = 1
+        self.scan_total = #queue
+        self.scan_done = 0
         self.scan_active = (#queue > 0)
-        if self.scan_active and not self.scan_prev_connected then
-            self:SetState(STATE_SCANNING)
+        if self.scan_active then
+            if not self.scan_prev_connected then
+                self:SetState(STATE_SCANNING)
+            end
+        else
+            -- Nothing to probe: say so instead of leaving a bare footer.
+            self.scan_summary = { total = 0, ok = 0, timed_out = 0 }
+            if not self.scan_prev_connected then self:SetState(STATE_IDLE) end
+            self:UpdateStatus()
         end
         return
     end
@@ -1677,12 +1788,19 @@ function UIZoneServerList:StartScan(reset_backoff)
     end
 
     self.scan_active = (self.scan_total > 0)
-    if self.scan_active and not self.scan_prev_connected then
-        self:SetState(STATE_SCANNING)
+    if self.scan_active then
+        if not self.scan_prev_connected then
+            self:SetState(STATE_SCANNING)
+        end
+        self:PumpQueries()
+        self:UpdateStatus()
+        self:CheckScanFinished()
+    else
+        -- Nothing to probe: say so instead of leaving a bare footer.
+        self.scan_summary = { total = 0, ok = 0, timed_out = 0 }
+        if not self.scan_prev_connected then self:SetState(STATE_IDLE) end
+        self:UpdateStatus()
     end
-    self:PumpQueries()
-    self:UpdateStatus()
-    self:CheckScanFinished()
 end
 
 function UIZoneServerList:AbortScan()
@@ -1693,6 +1811,7 @@ function UIZoneServerList:AbortScan()
     self.scan_queue = nil
     self.scan_index = nil
     self.scan_prev_connected = false
+    self.scan_summary = nil
     self.queue_internet = {}
     self.queue_lan = {}
     local had_inflight = (self.query_inflight and next(self.query_inflight) ~= nil)
@@ -1805,6 +1924,8 @@ function UIZoneServerList:ApplyQuery(probe, info)
     entry.state = (tonumber(info.locked or 0) ~= 0) and "locked" or "online"
     entry.fail_count = 0
     entry.retry_at = 0
+    entry.fail_reason = nil
+    entry.fail_reason_id = nil
     entry.lastSeen = now_timestamp()
     entry.last_ok = entry.lastSeen
     if not entry.added or entry.added <= 0 then entry.added = entry.lastSeen end
@@ -1822,11 +1943,11 @@ function UIZoneServerList:ApplyQuery(probe, info)
     return entry
 end
 
-function UIZoneServerList:ApplyOffline(probe)
+function UIZoneServerList:ApplyOffline(probe, reason)
     if probe.broadcast then return nil end
     local entry = self:FindEntry(probe.ip, probe.port)
     if not entry then return nil end
-    self:MarkFailure(entry)
+    self:MarkFailure(entry, reason)
     return entry
 end
 
@@ -1835,6 +1956,7 @@ function UIZoneServerList:OnProbeSuccess(probe, info)
     local entry = self:ApplyQuery(probe, info)
     if probe.scan then
         self.scan_done = (self.scan_done or 0) + 1
+        self.scan_ok = (self.scan_ok or 0) + 1
     end
     if entry then
         self:UpdateRowInPlace(entry)
@@ -1849,13 +1971,16 @@ function UIZoneServerList:OnProbeFailure(probe, reason)
     end
     if probe.scan then
         self.scan_done = (self.scan_done or 0) + 1
+        if probe_failure_kind(reason) == "ui_zone_row_fail_timeout" then
+            self.scan_timeouts = (self.scan_timeouts or 0) + 1
+        end
     end
     if not probe.broadcast then
         self.last_fail_reason = reason or ""
         if probe.scan then self.scan_fail_reason = reason or "" end
         local entry = self:FindEntry(probe.ip, probe.port)
         if entry then
-            self:MarkFailure(entry)
+            self:MarkFailure(entry, reason)
             self:UpdateRowInPlace(entry)
         end
     end
@@ -1868,6 +1993,11 @@ function UIZoneServerList:CheckScanFinished()
     if next(self.query_inflight) ~= nil then return end
 
     self.scan_active = false
+    self.scan_summary = {
+        total = tonumber(self.scan_total) or 0,
+        ok = tonumber(self.scan_ok) or 0,
+        timed_out = tonumber(self.scan_timeouts) or 0,
+    }
     if self.scan_discoveries then
         self.scan_discoveries = false
         pcall(function() self:SaveFavorites() end)
@@ -1941,6 +2071,11 @@ function UIZoneServerList:ScanStep()
     local probe = self.scan_queue and self.scan_queue[self.scan_index]
     if not probe then
         self.scan_active = false
+        self.scan_summary = {
+            total = tonumber(self.scan_total) or 0,
+            ok = tonumber(self.scan_ok) or 0,
+            timed_out = tonumber(self.scan_timeouts) or 0,
+        }
         if self.scan_discoveries then
             self.scan_discoveries = false
             pcall(function() self:SaveFavorites() end)
@@ -1953,24 +2088,26 @@ function UIZoneServerList:ScanStep()
         end
         self.view_dirty = true
         pcall(function() self:RefreshList() end)
+        self:UpdateStatus()
         return
     end
     self.scan_index = self.scan_index + 1
 
-    local info = nil
+    local info, err = nil, nil
     pcall(function()
-        local r = ZoneNet:QueryServer(probe.ip, probe.port, SCAN_TIMEOUT_MS)
-        if type(r) == "table" then info = r end
+        local r, e = ZoneNet:QueryServer(probe.ip, probe.port, SCAN_TIMEOUT_MS)
+        if type(r) == "table" then
+            info = r
+        else
+            err = e
+        end
     end)
 
-    local entry = nil
     if info then
-        entry = self:ApplyQuery(probe, info)
+        self:OnProbeSuccess(probe, info)
     else
-        entry = self:ApplyOffline(probe)
-    end
-    if entry then
-        pcall(function() self:UpdateRowInPlace(entry) end)
+        -- Never drop the reason: the row and the footer must say why.
+        self:OnProbeFailure(probe, err or "no response")
     end
 end
 
@@ -1986,11 +2123,16 @@ function UIZoneServerList:PollConnect()
     end)
 
     if connected then
+        pcall(function()
+            if ZoneNet and ZoneNet.ClearPreservedError then ZoneNet:ClearPreservedError() end
+        end)
         for _, list in ipairs({ self.favorites, self.history }) do
             for _, e in ipairs(list) do
                 if e.ip == self.connect_ip and e.port == self.connect_port then
                     e.state = "online"
                     e.lastSeen = now_timestamp()
+                    e.fail_reason = nil
+                    e.fail_reason_id = nil
                 end
             end
         end
@@ -1999,18 +2141,43 @@ function UIZoneServerList:PollConnect()
         return
     end
 
-    if now - (self.connect_start or now) >= CONNECT_TIMEOUT_MS then
-        local reason = ""
+    -- Early failure: the DLL sets GetLastError for handshake rejections
+    -- (full/banned/version), invalid address and server kicks before the local
+    -- timeout elapses. Surface that immediately instead of waiting 16 s.
+    local raw = ""
+    pcall(function()
+        if ZoneNet and ZoneNet.GetLastError then raw = ZoneNet:GetLastError() or "" end
+    end)
+    local failed = false
+    if type(raw) == "string" and raw ~= "" then
+        failed = true
+    elseif now - (self.connect_start or now) >= CONNECT_TIMEOUT_MS then
+        failed = true
         pcall(function()
-            if ZoneNet and ZoneNet.GetLastError then reason = ZoneNet:GetLastError() or "" end
+            if ZoneNet and ZoneNet.GetPreservedError then raw = ZoneNet:GetPreservedError() or "" end
+        end)
+        if raw == "" then raw = "timeout" end
+    end
+
+    if failed then
+        local shown = localize_net_error(raw)
+        printf("Zone UI: connect to %s:%s failed: %s",
+            tostring(self.connect_ip), tostring(self.connect_port), tostring(raw))
+        pcall(function()
+            if ZoneNet and ZoneNet.ClearPreservedError then ZoneNet:ClearPreservedError() end
         end)
         for _, list in ipairs({ self.favorites, self.history }) do
             for _, e in ipairs(list) do
-                if e.ip == self.connect_ip and e.port == self.connect_port then e.state = "offline" end
+                if e.ip == self.connect_ip and e.port == self.connect_port then
+                    e.state = "offline"
+                    e.fail_reason = raw
+                    e.fail_reason_id = probe_failure_kind(raw)
+                end
             end
         end
         self.connect_start = 0
-        self:SetState(STATE_FAILED, reason)
+        self.last_fail_reason = raw
+        self:SetState(STATE_FAILED, shown)
         self:RefreshList()
     end
 end
@@ -2157,12 +2324,12 @@ function UIZoneServerList:OnConnect()
         end
     end)
     if busy then
-        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        self:SetState(STATE_FAILED, tr("ui_zone_status_busy"))
         return
     end
 
     if not self:NetAvailable() or not self:ClientLoaded() then
-        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        self:ReportModuleMissing()
         return
     end
 
@@ -2172,7 +2339,7 @@ function UIZoneServerList:OnConnect()
         connect_called = true
     end)
     if not connect_called then
-        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        self:SetState(STATE_FAILED, tr("ui_zone_err_connect_call"))
         return
     end
 
@@ -2299,19 +2466,33 @@ function UIZoneServerList:OnShow()
             detail = string.format("%s:%d", tostring(self.connect_ip), tonumber(self.connect_port) or 0)
         end
         self:SetState(STATE_CONNECTED, detail)
-    elseif self.state ~= STATE_CONNECTING then
+    elseif self.state ~= STATE_CONNECTING and self.state ~= STATE_FAILED then
         self:SetState(STATE_IDLE)
     end
 
     self:RefreshList()
-    self:StartScan(true)
+    if self.state ~= STATE_FAILED then
+        self:StartScan(true)
+    else
+        -- Keep the failure reason visible; the user retries with Connect or
+        -- Refresh from the same dialog.
+        self:UpdateStatus()
+    end
+end
+
+-- Single close path for Back/ESC and external callers. Always cancels probes,
+-- drops the edit-box keyboard capture and hides the dialog, so focus can never
+-- persist after the window is gone.
+function UIZoneServerList:Close()
+    self:AbortScan()
+    self:ReleaseEditFocus()
+    self.filter_editing = false
+    self:HideDialog()
+    CUIScriptWnd.Show(self, false)
 end
 
 function UIZoneServerList:OnBack()
-    self:AbortScan()
-    self:ReleaseEditFocus()
-    self:HideDialog()
-    CUIScriptWnd.Show(self, false)
+    self:Close()
     if self.owner then
         pcall(function() self.owner:ShowDialog(true) end)
         pcall(function() self.owner:Show(true) end)
@@ -2560,6 +2741,13 @@ function UIZoneServerList:OnKeyboard(dik, keyboard_action)
 end
 
 function open_server_browser(owner)
+    -- One keyboard owner at a time: never leave the chat edit box focused
+    -- under the browser.
+    pcall(function()
+        if zone_hud and type(zone_hud.close_chat) == "function" then
+            zone_hud.close_chat("server_browser")
+        end
+    end)
     if not _server_browser_dlg then
         local dlg = UIZoneServerList(owner)
         local ok = dlg:InitControls()

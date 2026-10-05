@@ -4,6 +4,33 @@
 local config = {}
 local input_callbacks_registered = false
 
+-- xrRazom dormancy gate. True only while a co-op session is live: hosting or
+-- connected as a peer. Every predicate is pcall/nil-safe because the raw
+-- Xrr* globals come from xrr_core (absent when xrRazom is not installed) and
+-- XrrNet is DLL-provided, so either can be missing or throw.
+local function xrr_overlay_active()
+    local active = false
+    pcall(function()
+        if type(_G.XrrIsConnected) == "function" and _G.XrrIsConnected() then active = true end
+        if type(_G.XrrIsHosted) == "function" and _G.XrrIsHosted() then active = true end
+        if not active and _G.XrrNet then
+            local gm = _G.XrrNet()
+            if gm then
+                if gm.IsConnected and gm:IsConnected() then active = true end
+                if gm.IsListening and gm:IsListening() then active = true end
+            end
+        end
+    end)
+    return active
+end
+
+-- Public: every other Zone module reads co-op state through this one gate.
+function xrr_is_active()
+    return xrr_overlay_active()
+end
+-- Alias matching the suggested helper name.
+zone_active = xrr_is_active
+
 local function generate_random_uuid()
     math.randomseed(os.time() + (time_global and time_global() or 0))
     local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
@@ -255,12 +282,9 @@ function on_game_start()
     end
 
     -- xrRazom compatibility: never auto-dial Zone when co-op owns the world.
-    local xrr_active = false
-    pcall(function()
-        if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_active = true end
-        if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_active = true end
-    end)
-    if xrr_active then
+    -- Covers both hosting (IsListening) and peer sessions (IsConnected); the
+    -- identity file is not even generated while co-op is live.
+    if xrr_is_active() then
         printf("Zone: xrRazom session active, Zone staying offline")
         return
     end

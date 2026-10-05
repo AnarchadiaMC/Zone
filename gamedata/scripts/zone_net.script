@@ -122,11 +122,105 @@ function is_client_loaded()
     return zone_client ~= nil
 end
 
+-- Error surfacing ------------------------------------------------------------
+-- No failure may stay silent. Every message is logged and routed to whichever
+-- player-visible surface is up: game news in-game, the faction dialog or the
+-- server browser status line in the menu.
+local last_preserved_error = ""
+local dispatch_logged = {}
+local inv_parse_notified = false
+
+local function tr(id, fallback)
+    local ok, s = pcall(function() return game.translate_string(id) end)
+    if ok and type(s) == "string" and s ~= "" and s ~= id then return s end
+    return fallback or id
+end
+
+local function log_dispatch_once(key, fmt, ...)
+    if dispatch_logged[key] then return end
+    dispatch_logged[key] = true
+    printf(fmt, ...)
+end
+
+-- Handler isolation: a throwing consumer must not kill the packet pump, but it
+-- must not vanish either - log the first failure per opcode/handler.
+local function safe_call(key, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        log_dispatch_once("handler_" .. tostring(key),
+            "Zone: packet handler %s failed: %s", tostring(key), tostring(err))
+    end
+    return ok
+end
+
+-- Map raw DLL error strings onto localized ids. Falls back to the raw text.
+local function localize_net_error(raw)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local low = raw:lower()
+    if low:find("banned", 1, true) then return tr("ui_zone_err_banned", raw) end
+    if low:find("full", 1, true) then return tr("ui_zone_err_server_full", raw) end
+    if low:find("version", 1, true) or low:find("proto", 1, true) then
+        return tr("ui_zone_err_version", raw)
+    end
+    if low:find("kick", 1, true) then return tr("ui_zone_err_kick", raw) end
+    if low:find("timed out", 1, true) or low:find("timeout", 1, true) then
+        return tr("ui_zone_err_timeout", raw)
+    end
+    if low:find("handshake", 1, true) then return tr("ui_zone_err_handshake", raw) end
+    return raw
+end
+
+local function peer_faction_dialog()
+    local dlg = nil
+    pcall(function()
+        if type(_G.get_peer_faction_dialog) == "function" then
+            dlg = _G.get_peer_faction_dialog()
+        end
+        if not dlg and zone_ui_peer_faction
+            and type(zone_ui_peer_faction.get_peer_faction_dialog) == "function" then
+            dlg = zone_ui_peer_faction.get_peer_faction_dialog()
+        end
+    end)
+    return dlg
+end
+
+local function surface_message(msg)
+    msg = tostring(msg or "")
+    if msg == "" then return end
+    printf("Zone: %s", msg)
+    local shown = false
+    pcall(function()
+        if db and db.actor then
+            db.actor:give_game_news("Zone", msg, "ui_inGame2_PDA_icon", 0, 6000, 0)
+            shown = true
+        end
+    end)
+    if shown then return end
+    -- Menu context: the faction dialog or the server browser is the surface.
+    pcall(function()
+        local dlg = peer_faction_dialog()
+        if dlg and dlg.IsShown and dlg:IsShown() and dlg.OnServerError then
+            dlg:OnServerError(msg)
+        end
+    end)
+    pcall(function()
+        local dlg = nil
+        if zone_ui_server_list and type(zone_ui_server_list.get_dialog) == "function" then
+            dlg = zone_ui_server_list.get_dialog()
+        end
+        if dlg and dlg.ReportError then dlg:ReportError(msg) end
+    end)
+end
+
 -- Tracks co-op-takeover cleanup so dormant-branch release runs once.
 local xrr_was_active = false
 
 -- L-06: Exported reset_state for reconnecting
 function reset_state()
+    -- Preserve the last DLL error across the reset so a rejection reason is
+    -- never lost before the UI has had a chance to display it.
+    local prev = ZoneNet and ZoneNet.GetLastError and ZoneNet:GetLastError() or ""
+    if type(prev) == "string" and prev ~= "" then last_preserved_error = prev end
     last_tick = 0
     xrr_was_active = false
     was_connected = false
@@ -141,6 +235,7 @@ function reset_state()
     last_applied_inventory_fingerprint = nil
     apply_inventory_pending = false
     level_start_issued = false
+    inv_parse_notified = false
     if clear_pending_join then pcall(clear_pending_join) end
 end
 
@@ -309,6 +404,17 @@ function ZoneNet:GetLastError()
     end
     return ""
 end
+-- Last error preserved across reset_state (connect/disconnect). Lets the UI
+-- show a handshake rejection even after a fast retry cleared the DLL error.
+function ZoneNet:GetPreservedError()
+    return last_preserved_error
+end
+function ZoneNet:ClearPreservedError()
+    last_preserved_error = ""
+end
+function ZoneNet:LocalizeError(raw)
+    return localize_net_error(raw)
+end
 function ZoneNet:IsClientLoaded()
     return is_client_loaded()
 end
@@ -406,7 +512,11 @@ end
 -- parse the v3 layout natively.
 
 function dispatch_packet(pkt)
-    if not pkt or string.len(pkt) < 12 then return end
+    local plen = (type(pkt) == "string") and string.len(pkt) or 0
+    if plen < 12 then
+        log_dispatch_once("short_header", "Zone: dropped short packet (%d bytes)", plen)
+        return
+    end
     
     -- Parse Header (12 bytes)
     -- 2(magic) + 1(proto) + 1(flags) + 4(seq) + 2(opcode) + 2(paylen)
@@ -419,11 +529,17 @@ function dispatch_packet(pkt)
     
     -- L-10: Validate magic == 0x5A4F and proto == 1
     if magic ~= 0x5A4F or proto ~= 1 then
+        log_dispatch_once("bad_header",
+            "Zone: dropped packet with bad header (magic 0x%04X proto %d)",
+            tonumber(magic) or 0, tonumber(proto) or 0)
         return
     end
     
     -- L-02: Validate payload length (drop truncated packets)
-    if string.len(pkt) < 12 + paylen then
+    if plen < 12 + paylen then
+        log_dispatch_once(string.format("trunc_%04X", opcode),
+            "Zone: dropped truncated packet opcode 0x%04X (have %d bytes, need %d)",
+            opcode, plen, 12 + paylen)
         return
     end
     
@@ -431,62 +547,70 @@ function dispatch_packet(pkt)
     
     if opcode == 0x0011 then
         if zone_dummy and zone_dummy.on_snapshot then
-            pcall(zone_dummy.on_snapshot, pkt, offset)
+            safe_call("snapshot", zone_dummy.on_snapshot, pkt, offset)
         end
     elseif opcode == 0x0012 then
         -- Fan out to BOTH player proxies (typ 1) and AI puppets (typ 0/2/3);
         -- each handler filters by type and parses the v3 payload layout.
         if zone_dummy and zone_dummy.on_entity_enter then
-            pcall(zone_dummy.on_entity_enter, pkt, offset)
+            safe_call("entity_enter_dummy", zone_dummy.on_entity_enter, pkt, offset)
         end
         if zone_ai_proxy and zone_ai_proxy.on_entity_enter then
-            pcall(zone_ai_proxy.on_entity_enter, pkt, offset)
+            safe_call("entity_enter_ai", zone_ai_proxy.on_entity_enter, pkt, offset)
         end
     elseif opcode == 0x0013 then
         if zone_dummy and zone_dummy.on_entity_leave then
-            pcall(zone_dummy.on_entity_leave, pkt, offset)
+            safe_call("entity_leave_dummy", zone_dummy.on_entity_leave, pkt, offset)
         end
         if zone_ai_proxy and zone_ai_proxy.on_entity_leave then
-            pcall(zone_ai_proxy.on_entity_leave, pkt, offset)
+            safe_call("entity_leave_ai", zone_ai_proxy.on_entity_leave, pkt, offset)
         end
     elseif opcode == 0x0041 then
         -- Stash responses have no consumer UI yet (no committed stash sender).
         -- Parse minimally and surface errors; never fatal. Future stash UI
         -- should hook here for full contents display.
-        pcall(function()
+        safe_call("stash_response", function()
             if string.len(pkt) >= offset + 5 - 1 then
                 local stash_id, ppos = read_uint32_le(pkt, offset)
                 local status, _ = read_uint8(pkt, ppos)
                 if status ~= 0 and db.actor then
                     db.actor:give_game_news("Zone", "Stash unavailable.", "ui_inGame2_PDA_icon", 0, 3000, 0)
                 end
+            else
+                log_dispatch_once("short_0041", "Zone: dropped short STASH_RESPONSE packet (%d bytes)", string.len(pkt))
             end
         end)
     elseif opcode == 0x0020 then
         if zone_safezone and zone_safezone.on_safezone_state then
-            pcall(zone_safezone.on_safezone_state, pkt, offset)
+            safe_call("safezone", zone_safezone.on_safezone_state, pkt, offset)
         end
     elseif opcode == 0x0030 then
         if zone_worldevent and zone_worldevent.on_world_event then
-            pcall(zone_worldevent.on_world_event, pkt, offset)
+            safe_call("world_event", zone_worldevent.on_world_event, pkt, offset)
         end
     elseif opcode == 0x0050 then
         -- 4+4+4+1 = 13 bytes; bounds-check before parsing (malicious server safe)
-        pcall(function()
-            if string.len(pkt) < offset + 13 - 1 then return end
+        safe_call("damage_notify", function()
+            if string.len(pkt) < offset + 13 - 1 then
+                log_dispatch_once("short_0050", "Zone: dropped short DAMAGE_NOTIFY packet (%d bytes)", string.len(pkt))
+                return
+            end
             local target_id, ppos = read_uint32_le(pkt, offset)
             local attacker_id, ppos = read_uint32_le(pkt, ppos)
             local damage, ppos = read_float_le(pkt, ppos)
             local bone_id, ppos = read_uint8(pkt, ppos)
             if zone_dummy and zone_dummy.on_damage_notify then
-                pcall(zone_dummy.on_damage_notify, target_id, attacker_id, damage, bone_id)
+                safe_call("damage_notify_dummy", zone_dummy.on_damage_notify, target_id, attacker_id, damage, bone_id)
             end
         end)
     elseif opcode == 0x0060 then
         -- L-03: Chat text: sender ID (4 bytes) + text length (1 byte) + text
         -- Clamp text_len to actual payload to prevent overread on forged packets.
-        pcall(function()
-            if string.len(pkt) < offset + 5 - 1 then return end
+        safe_call("chat_text", function()
+            if string.len(pkt) < offset + 5 - 1 then
+                log_dispatch_once("short_0060", "Zone: dropped short CHAT_TEXT packet (%d bytes)", string.len(pkt))
+                return
+            end
             local sender_id, cpos = read_uint32_le(pkt, offset)
             local text_len, cpos = read_uint8(pkt, cpos)
             local avail = string.len(pkt) - cpos + 1
@@ -498,43 +622,46 @@ function dispatch_packet(pkt)
             end
             -- Chat history overlay (zone_hud) parses the same payload.
             if zone_hud and zone_hud.on_chat_message then
-                pcall(zone_hud.on_chat_message, pkt, offset)
+                safe_call("chat_hud", zone_hud.on_chat_message, pkt, offset)
             end
         end)
     elseif opcode == 0x0070 then
         if zone_ai_proxy and zone_ai_proxy.on_ai_action then
-            pcall(zone_ai_proxy.on_ai_action, pkt, offset)
+            safe_call("ai_action", zone_ai_proxy.on_ai_action, pkt, offset)
         end
     elseif opcode == 0x0071 then
-        pcall(function()
+        safe_call("show_start", function()
             if type(handle_show_start) == "function" then handle_show_start(pkt, offset) end
         end)
     elseif opcode == 0x0072 then
         close_faction_ui()
     elseif opcode == 0x0073 then
-        pcall(function()
+        safe_call("load_level", function()
             if type(on_load_level) == "function" then on_load_level(pkt, offset) end
         end)
     elseif opcode == 0x0076 then
-        pcall(function()
+        safe_call("inventory_sync", function()
             if type(on_inventory_sync) == "function" then on_inventory_sync(pkt, offset) end
         end)
     elseif opcode == 0x0077 then
-        pcall(function()
+        safe_call("server_error", function()
             if type(on_server_error) == "function" then on_server_error(pkt, offset) end
         end)
     elseif opcode == 0x0078 then
         -- OpGroupInviteNotify (S->C): inviterSessionID u32, name[32], faction[16].
         if zone_hud and zone_hud.on_group_invite then
-            pcall(zone_hud.on_group_invite, pkt, offset)
+            safe_call("group_invite", zone_hud.on_group_invite, pkt, offset)
         end
     elseif opcode == 0x007A then
         -- OpGroupState (S->C): memberCount u8, then per member sessionID u32,
         -- name[32], faction[16], isLeader u8. 0x0079 (OpGroupResponse) is
         -- client->server only, sent as chat text (/accept, /decline).
         if zone_hud and zone_hud.on_group_state then
-            pcall(zone_hud.on_group_state, pkt, offset)
+            safe_call("group_state", zone_hud.on_group_state, pkt, offset)
         end
+    else
+        log_dispatch_once(string.format("unknown_%04X", opcode),
+            "Zone: unknown opcode 0x%04X ignored (%d payload bytes)", opcode, paylen)
     end
 end
 
@@ -631,6 +758,12 @@ function pump_menu()
             end
             if opcode and MENU_PUMP_OPCODES[opcode] then
                 pcall(dispatch_packet, pkt)
+            elseif opcode then
+                -- Consumed but intentionally not handled in the menu: log once.
+                log_dispatch_once(string.format("menu_skip_%04X", opcode),
+                    "Zone: menu pump ignored opcode 0x%04X", opcode)
+            else
+                log_dispatch_once("short_header", "Zone: menu pump dropped short packet (%d bytes)", string.len(pkt))
             end
             if level_start_issued then break end
         end
@@ -861,6 +994,13 @@ local function drain_inventory_queue()
         last_applied_inventory_fingerprint = fingerprint
     end
     printf("Zone: inventory sync applied (%d/%d entries)", applied, #queue)
+    local failed = #queue - applied
+    if failed > 0 then
+        local tmpl = tr("ui_zone_inv_sync_incomplete",
+            "Inventory sync incomplete: %d of %d items failed")
+        local msg = string.format(tmpl, failed, #queue)
+        surface_message(msg)
+    end
 end
 
 local function apply_pending_spawn()
@@ -895,7 +1035,10 @@ end
 on_load_level = function(pkt, offset)
     -- LevelLoad payload (30 bytes): level u8, x/y/z f32, faction[16], eco u8.
     local len = string.len(pkt)
-    if len < offset + 30 - 1 then return end
+    if len < offset + 30 - 1 then
+        log_dispatch_once("short_0073", "Zone: dropped short LOAD_LEVEL packet (%d bytes)", len)
+        return
+    end
 
     local level_id, pos = read_uint8(pkt, offset)
     local x, pos = read_float_le(pkt, pos)
@@ -920,13 +1063,8 @@ on_load_level = function(pkt, offset)
             -- vertex ids). Surface it instead of silently doing nothing.
             printf("Zone: server wants level %s but %s is loaded; reconnect from the main menu",
                 tostring(target_level), tostring(cur))
-            if db and db.actor then
-                pcall(function()
-                    db.actor:give_game_news("Zone",
-                        "Server level change is not supported in-game. Reconnect from the main menu.",
-                        "ui_inGame2_PDA_icon", 0, 5000, 0)
-                end)
-            end
+            surface_message(tr("ui_zone_level_change_unsupported",
+                "Server level change is not supported in-game. Reconnect from the main menu."))
         end
         return
     end
@@ -940,6 +1078,8 @@ on_load_level = function(pkt, offset)
             printf("Zone: starting game for level %s", tostring(target_level))
         else
             printf("Zone: failed to start game (console start unavailable)")
+            surface_message(tr("ui_zone_join_start_failed",
+                "Could not start the game for the server level"))
             level_start_issued = false
             -- No VM restart is coming, so the marker would only be a stale
             -- time bomb for a manual new game: disarm it.
@@ -951,7 +1091,10 @@ end
 
 on_inventory_sync = function(pkt, offset)
     local len = string.len(pkt)
-    if len < offset then return end
+    if len < offset then
+        log_dispatch_once("short_0076", "Zone: dropped short INVENTORY_SYNC packet (%d bytes)", len)
+        return
+    end
     local item_count, pos = read_uint8(pkt, offset)
     if not item_count or item_count == 0 then return end
 
@@ -959,6 +1102,11 @@ on_inventory_sync = function(pkt, offset)
     for _ = 1, item_count do
         if pos + 69 > len then
             printf("Zone: inventory sync packet truncated")
+            if not inv_parse_notified then
+                inv_parse_notified = true
+                surface_message(tr("ui_zone_inv_sync_malformed",
+                    "Inventory sync data was malformed; some items may be missing"))
+            end
             return
         end
         local section, p2 = read_string(pkt, pos, 64); pos = p2
@@ -994,45 +1142,31 @@ end
 
 on_server_error = function(pkt, offset)
     local len = string.len(pkt)
-    if len < offset then return end
+    if len < offset then
+        log_dispatch_once("short_0077", "Zone: dropped short ERROR packet (%d bytes)", len)
+        return
+    end
     local code, pos = read_uint8(pkt, offset)
     local msg = ""
     if len >= pos + 96 - 1 then
         msg, pos = read_string(pkt, pos, 96)
         msg = clean_cstring(msg)
     end
-    if msg == "" then
-        msg = string.format("Server rejected the character (code %d).", tonumber(code) or 0)
-    end
 
-    -- Prefer the localized string for known codes.
-    local key = "ui_zone_error_generic"
-    if code == 1 then key = "ui_zone_error_faction"
-    elseif code == 2 then key = "ui_zone_error_loadout"
-    elseif code == 3 then key = "ui_zone_error_create" end
-    pcall(function()
-        local translated = game.translate_string(key)
-        if type(translated) == "string" and translated ~= "" and translated ~= key then
-            msg = translated
-        end
-    end)
+    -- Server message wins (it carries the specific rejection); fall back to a
+    -- localized string for known codes when the payload message is empty.
+    if msg == "" then
+        local key = "ui_zone_error_generic"
+        if code == 1 then key = "ui_zone_error_faction"
+        elseif code == 2 then key = "ui_zone_error_loadout"
+        elseif code == 3 then key = "ui_zone_error_create" end
+        msg = tr(key, string.format("Server rejected the character (code %d).", tonumber(code) or 0))
+    end
 
     printf("Zone: server error: %s", tostring(msg))
-    if db and db.actor then
-        pcall(function()
-            db.actor:give_game_news("Zone", msg, "ui_inGame2_PDA_icon", 0, 5000, 0)
-        end)
-    end
+    surface_message(msg)
 
-    local dlg = nil
-    pcall(function()
-        if type(_G.get_peer_faction_dialog) == "function" then
-            dlg = _G.get_peer_faction_dialog()
-        end
-        if not dlg and zone_ui_peer_faction and zone_ui_peer_faction.get_peer_faction_dialog then
-            dlg = zone_ui_peer_faction.get_peer_faction_dialog()
-        end
-    end)
+    local dlg = peer_faction_dialog()
     if dlg and dlg.OnServerError then
         pcall(function() dlg:OnServerError(msg) end)
     end
@@ -1132,10 +1266,17 @@ function on_tick()
             pcall(function()
                 if zone_safezone and zone_safezone.reset then zone_safezone.reset() end
             end)
+            -- Surface the drop reason captured by the DLL (kick, liveness
+            -- timeout, ...). Never leave a silent disconnect.
+            local raw = (ZoneNet and ZoneNet.GetLastError and ZoneNet:GetLastError()) or ""
+            local reason = localize_net_error(raw)
+                or tr("ui_zone_drop_generic", "Connection to the server was lost")
+            surface_message(tr("ui_zone_drop_prefix", "Disconnected") .. ": " .. reason)
         end
         return
     end
     was_connected = true
+    if last_preserved_error ~= "" then last_preserved_error = "" end
 
     -- Mutual exclusion with xrRazom: do not send Zone telemetry or consume
     -- Zone snapshots while co-op owns the world. On the transition tick,

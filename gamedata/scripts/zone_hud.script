@@ -14,6 +14,19 @@ local last_dev_h       = 0
 -- Persistent HUD static widget
 local hud_static       = nil
 
+-- Co-op dormancy gate. Delegates to zone_main's single helper; nil-safe while
+-- zone_main is not loaded yet.
+local function xrr_is_active()
+    local fn = zone_main and zone_main.xrr_is_active
+    if type(fn) ~= "function" then return false end
+    local ok, res = pcall(fn)
+    return ok and res == true
+end
+
+-- True once the overlay has been torn down for a live co-op session; reset
+-- when the session ends so the 1 Hz overlay rebuilds normally.
+local xrr_dormant = false
+
 -- Color definitions (ARGB)
 local COLOR_CONNECTED    = (GetARGB and GetARGB(220, 80,  220, 80))  or 0xDC50DC50 -- Green
 local COLOR_SAFEZONE     = (GetARGB and GetARGB(220, 80,  160, 255)) or 0xDC50A0FF -- Blue
@@ -251,9 +264,10 @@ local chat_history  = {}
 local group_members = {}
 local panel_widgets = {}
 
-local chat_window = nil
-local chat_open   = false
-local chat_warned = false
+local chat_window  = nil
+local chat_open    = false -- we asked for it to be open
+local chat_focused = false -- edit-box keyboard capture confirmed
+local chat_warned  = false
 
 -- ============================================================
 -- Overlay widget helpers (mirror the status CUIStatic pattern)
@@ -862,22 +876,96 @@ local function chat_session_ready()
     return connected and (db and db.actor ~= nil)
 end
 
+-- True only when the chat window is actually shown. The flag alone can stick
+-- after a failed ShowDialog, an external hide, a level change or a script
+-- error; every key (kUSE included) would then be eaten.
+local function chat_window_shown()
+    if not chat_window then return false end
+    local shown = false
+    pcall(function()
+        if chat_window.IsShown then shown = chat_window:IsShown() and true or false end
+    end)
+    return shown
+end
+
+-- True only while the edit box is expected to own the keyboard. Used to guard
+-- the (belt-and-braces) key swallow: the engine dispatches on_before_key_press
+-- BEFORE UI input (Level_input.cpp:187-192,285), so swallowing outside the
+-- focused edit box would kill movement and UI interaction.
+local function chat_input_active()
+    return chat_open == true and chat_focused == true and chat_window_shown()
+end
+
+-- Mirror of zone_safezone's UI guard: never take keys while a game UI owns
+-- them (inventory/trade/loot/PDA/custom GUI).
+local function ui_input_open()
+    local open = false
+    pcall(function()
+        if actor_menu and type(actor_menu.is_hud_free) == "function" then
+            open = (actor_menu.is_hud_free() ~= true)
+        end
+    end)
+    return open
+end
+
+local function server_browser_visible()
+    local shown = false
+    pcall(function()
+        if zone_ui_server_list and zone_ui_server_list.get_dialog then
+            local d = zone_ui_server_list.get_dialog()
+            if d and d.IsShown then shown = d:IsShown() and true or false end
+        end
+    end)
+    return shown
+end
+
 function open_chat()
+    -- Co-op live: kXRR_CHAT belongs to xrRazom; Zone chat stays closed.
+    if xrr_is_active() then return end
+    -- Recover from a stale open flag before deciding it is already open.
+    if chat_open and not chat_window_shown() then
+        chat_open = false
+        chat_focused = false
+    end
     if chat_open then return end
     if not chat_session_ready() then return end
+    -- One keyboard owner at a time: never open over the browser or any game UI.
+    if server_browser_visible() then return end
+    if ui_input_open() then return end
     local w = ensure_chat_window()
     if not w then return end
-    chat_open = true
+
+    local shown, focused = false, false
     pcall(function()
         if w.edit and w.edit.SetText then w.edit:SetText("") end
         w:ShowDialog(true)
         w:Show(true)
-        if w.edit and w.edit.CaptureFocus then w.edit:CaptureFocus(true) end
+        if w.IsShown then shown = w:IsShown() and true or false end
+        if w.edit and w.edit.CaptureFocus then
+            w.edit:CaptureFocus(true)
+            focused = true
+        end
     end)
+
+    chat_open = shown
+    chat_focused = shown and focused
+    if not chat_open then
+        -- Failed open: never leave focus, registration or visibility behind.
+        chat_focused = false
+        pcall(function()
+            if w.edit and w.edit.CaptureFocus then w.edit:CaptureFocus(false) end
+            if w.HideDialog then w:HideDialog() end
+            if w.Show then w:Show(false) end
+        end)
+    end
 end
 
-function close_chat()
+-- Full close: clears both flags, releases edit focus and removes the window.
+-- Safe to call from any path (ESC/RETURN, level change, actor destroy,
+-- disconnect, watchdog).
+function close_chat(reason)
     chat_open = false
+    chat_focused = false
     if chat_window then
         pcall(function()
             if chat_window.edit and chat_window.edit.CaptureFocus then
@@ -893,6 +981,23 @@ function is_chat_open()
     return chat_open == true
 end
 
+-- External disconnect path (module convention used by the other Zone
+-- modules): never leave the chat window grabbing input after a session drop.
+function on_disconnect()
+    pcall(close_chat, "disconnect")
+end
+
+-- 1 Hz watchdog (called from on_actor_update): a flag that says open while the
+-- window is gone or the session dropped must never survive to eat input.
+local function chat_watchdog(connected)
+    if not chat_open then return end
+    if not connected then
+        close_chat("disconnect")
+    elseif not chat_window_shown() then
+        close_chat("window_not_shown")
+    end
+end
+
 -- kXRR_CHAT action id when the exe exposes it; nil otherwise.
 local function chat_bind_id()
     local kb = rawget(_G, "key_bindings")
@@ -902,14 +1007,32 @@ local function chat_bind_id()
     return nil
 end
 
+-- Guarded swallow: never eat an unbound action, and never eat RETURN/ESC,
+-- which must reach UIZoneChat:OnKeyboard to send or close the chat. The edit
+-- box consumes the remaining keys itself once UI dispatch runs.
+local function swallow_guarded(dik, bind, flags)
+    if type(bind) ~= "number" or bind == 0 then return false end
+    if DIK_keys and (dik == DIK_keys.DIK_RETURN or dik == DIK_keys.DIK_NUMPADENTER
+        or dik == DIK_keys.DIK_ESCAPE) then
+        return false
+    end
+    if type(flags) == "table" then flags.ret_value = false end
+    return true
+end
+
 local function on_before_key_press(dik, bind, dis, flags)
     pcall(function()
-        if chat_open then
-            -- While typing, swallow game-bound key actions (movement cancels
-            -- and weapon binds included); RETURN/ESC reach the window keyboard.
-            if type(flags) == "table" then flags.ret_value = false end
+        -- Co-op live: yield the shared chat key (kXRR_CHAT / DIK_Y fallback)
+        -- to xrRazom and never swallow anything in its place.
+        if xrr_is_active() then return end
+        if chat_input_active() then
+            swallow_guarded(dik, bind, flags)
             return
         end
+        if dis then return end
+        -- Only open when no other UI owns the keyboard.
+        if ui_input_open() then return end
+        if server_browser_visible() then return end
         local toggle = false
         local kb_chat = chat_bind_id()
         if kb_chat ~= nil then
@@ -925,10 +1048,9 @@ local function on_before_key_press(dik, bind, dis, flags)
 end
 
 local function on_before_key_hold(dik, bind, dis, flags)
-    if not chat_open then return end
-    pcall(function()
-        if type(flags) == "table" then flags.ret_value = false end
-    end)
+    if xrr_is_active() then return end
+    if not chat_input_active() then return end
+    pcall(function() swallow_guarded(dik, bind, flags) end)
 end
 
 local function reset_overlay()
@@ -971,7 +1093,24 @@ local function on_actor_update()
     if tg - last_update_time < UPDATE_INTERVAL_MS then return end
     last_update_time = tg
 
+    -- Co-op dormancy: tear the overlay down once and keep it down while
+    -- xrRazom owns the session; no Zone input state survives.
+    if xrr_is_active() then
+        if not xrr_dormant then
+            xrr_dormant = true
+            pcall(close_chat, "xrr_active")
+            pcall(destroy_panels)
+            hide_hud_display()
+        end
+        last_connected = nil
+        return
+    end
+    xrr_dormant = false
+
     local connected, sid, ping, status_text, status_color = get_status_data()
+
+    -- Chat safety watchdog (1 Hz): a stale open flag must never eat input.
+    pcall(chat_watchdog, connected)
 
     -- Hide overlay when NOT connected (offline/singleplayer); 1 Hz check.
     if not connected then
@@ -1073,6 +1212,7 @@ local function on_level_changing()
     safe_zone_active = false
     last_dev_w       = 0
     last_dev_h       = 0
+    xrr_dormant      = false
 end
 
 local function on_actor_destroy()
@@ -1083,6 +1223,7 @@ local function on_actor_destroy()
     safe_zone_active = false
     last_dev_w       = 0
     last_dev_h       = 0
+    xrr_dormant      = false
 end
 
 -- ============================================================

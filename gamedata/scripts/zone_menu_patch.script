@@ -24,6 +24,10 @@ local function install_methods()
     -- dispatched while the main menu is up (actor_on_update does not exist
     -- yet); wrapping the window Update keeps pumping after the browser and
     -- faction dialogs are hidden.
+    -- Chaining contract: we capture whatever Update exists at install time.
+    -- xrRazom (xrr_menu.script:68-109) wraps cls.Update the same way, so the
+    -- two wrappers compose in either install order (zone -> xrr -> engine or
+    -- xrr -> zone -> engine); install_methods runs once per class.
     local orig_update = cls.Update
     if type(orig_update) ~= "function" then orig_update = nil end
     cls.Update = function(self, ...)
@@ -80,10 +84,8 @@ local function install_methods()
             pcall(function() self:Show(false) end)
             return
         end
-        local ok_xrr, xrr_connected = pcall(function() return _G.XrrNet and _G.XrrNet():IsConnected() end)
-        if ok_xrr and xrr_connected then
-            return orig_show_faction_ui(self, ...)
-        end
+        -- xrRazom active: its ShowFactionUI wrapper (peer faction dialog for
+        -- a connected client, base behaviour otherwise) stays in the chain.
         return orig_show_faction_ui(self, ...)
     end
 end
@@ -91,7 +93,11 @@ end
 function on_main_menu_init(menu)
     if not menu then return end
     install_methods()
-    menu:AddCallback("btn_zone_online", ui_events.BUTTON_CLICKED, mm_class.OnButton_zone_online_clicked, menu)
+    -- pcall: a missing injected button (e.g. the XML was cached before this
+    -- callback ran) must never break this menu's init chain.
+    pcall(function()
+        menu:AddCallback("btn_zone_online", ui_events.BUTTON_CLICKED, mm_class.OnButton_zone_online_clicked, menu)
+    end)
     -- Save/load blocking while a session is live is handled by the input veto
     -- path (see the save/load handling used elsewhere). The former
     -- menu.shniaga:SetButtonDisabled("btn_save"/"btn_load") calls were removed:

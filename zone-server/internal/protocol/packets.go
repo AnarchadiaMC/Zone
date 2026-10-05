@@ -5,12 +5,24 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 )
 
 const (
 	MaxSafeUDPPacketSize        = 1200
 	OpAck                uint16 = 0x0005
 )
+
+// MaxSnapshotEntries is the wire capacity of one OpServerSnapshot packet.
+// A client with more AoI neighbours than this must receive several snapshot
+// packets per tick; the AoI broadcaster chunks nearest-first.
+const MaxSnapshotEntries = 32
+
+// SnapshotEntryWireSize is the fixed on-wire size of one SnapshotEntry.
+const SnapshotEntryWireSize = 22
+
+// PacketHeaderWireSize is the fixed on-wire size of PacketHeader.
+const PacketHeaderWireSize = 12
 
 var (
 	ErrPayloadTooLarge   = errors.New("payload exceeds uint16 maximum")
@@ -120,7 +132,7 @@ type SnapshotEntry struct {
 
 type ServerSnapshot struct {
 	Count   uint8
-	Entries [32]SnapshotEntry
+	Entries [MaxSnapshotEntries]SnapshotEntry
 }
 
 type SafezoneStatePayload struct {
@@ -301,35 +313,25 @@ type EntityAoIPayload struct {
 }
 
 func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload interface{}) error {
+	// Snapshots are the 30Hz hot path: encode them directly onto the writer
+	// with fixed stack buffers instead of binary.Write reflection, so no
+	// intermediate bytes.Buffer or per-entry allocations are needed.
+	switch p := payload.(type) {
+	case *ServerSnapshot:
+		if bw, ok := w.(*bytes.Buffer); ok {
+			return writeServerSnapshotBuffer(bw, opcode, seq, flags, p)
+		}
+		return writeServerSnapshot(w, opcode, seq, flags, p)
+	case ServerSnapshot:
+		if bw, ok := w.(*bytes.Buffer); ok {
+			return writeServerSnapshotBuffer(bw, opcode, seq, flags, &p)
+		}
+		return writeServerSnapshot(w, opcode, seq, flags, &p)
+	}
+
 	var buf bytes.Buffer
 	if payload != nil {
 		switch p := payload.(type) {
-		case *ServerSnapshot:
-			if err := binary.Write(&buf, binary.LittleEndian, p.Count); err != nil {
-				return err
-			}
-			count := int(p.Count)
-			if count > len(p.Entries) {
-				count = len(p.Entries)
-			}
-			if count > 0 {
-				if err := binary.Write(&buf, binary.LittleEndian, p.Entries[:count]); err != nil {
-					return err
-				}
-			}
-		case ServerSnapshot:
-			if err := binary.Write(&buf, binary.LittleEndian, p.Count); err != nil {
-				return err
-			}
-			count := int(p.Count)
-			if count > len(p.Entries) {
-				count = len(p.Entries)
-			}
-			if count > 0 {
-				if err := binary.Write(&buf, binary.LittleEndian, p.Entries[:count]); err != nil {
-					return err
-				}
-			}
 		case *InventorySyncPayload:
 			if err := writeInventorySync(&buf, p.ItemCount, p.Items[:]); err != nil {
 				return err
@@ -376,6 +378,105 @@ func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload in
 
 	_, err := w.Write(buf.Bytes())
 	return err
+}
+
+// writeServerSnapshotBuffer is writeServerSnapshot specialised for a concrete
+// bytes.Buffer destination; all encode scratch stays on the stack.
+func writeServerSnapshotBuffer(w *bytes.Buffer, opcode uint16, seq uint32, flags uint8, snap *ServerSnapshot) error {
+	count := 0
+	if snap != nil {
+		count = int(snap.Count)
+		if count > len(snap.Entries) {
+			count = len(snap.Entries)
+		}
+		if count < 0 {
+			count = 0
+		}
+	}
+
+	payloadLen := 1 + count*SnapshotEntryWireSize
+	if payloadLen > MaxSafeUDPPacketSize {
+		return ErrPayloadExceedsMTU
+	}
+
+	var hdr [PacketHeaderWireSize]byte
+	putHeader(hdr[:], opcode, seq, flags, uint16(payloadLen))
+	_, _ = w.Write(hdr[:])
+	_ = w.WriteByte(uint8(count))
+
+	var entry [SnapshotEntryWireSize]byte
+	for i := 0; i < count; i++ {
+		encodeSnapshotEntry(entry[:], &snap.Entries[i])
+		_, _ = w.Write(entry[:])
+	}
+	return nil
+}
+
+// writeServerSnapshot encodes one OpServerSnapshot packet (header + count +
+// count entries) with no heap allocations. It writes at most MaxSnapshotEntries
+// entries; the caller is responsible for splitting larger sets across packets.
+func writeServerSnapshot(w io.Writer, opcode uint16, seq uint32, flags uint8, snap *ServerSnapshot) error {
+	count := 0
+	if snap != nil {
+		count = int(snap.Count)
+		if count > len(snap.Entries) {
+			count = len(snap.Entries)
+		}
+		if count < 0 {
+			count = 0
+		}
+	}
+
+	payloadLen := 1 + count*SnapshotEntryWireSize
+	if payloadLen > MaxSafeUDPPacketSize {
+		return ErrPayloadExceedsMTU
+	}
+	if payloadLen > 65535 {
+		return ErrPayloadTooLarge
+	}
+
+	var hdr [PacketHeaderWireSize]byte
+	putHeader(hdr[:], opcode, seq, flags, uint16(payloadLen))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+
+	var countBuf [1]byte
+	countBuf[0] = uint8(count)
+	if _, err := w.Write(countBuf[:]); err != nil {
+		return err
+	}
+
+	var entry [SnapshotEntryWireSize]byte
+	for i := 0; i < count; i++ {
+		encodeSnapshotEntry(entry[:], &snap.Entries[i])
+		if _, err := w.Write(entry[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// putHeader serialises a PacketHeader into dst (must be PacketHeaderWireSize bytes).
+func putHeader(dst []byte, opcode uint16, seq uint32, flags uint8, payloadLen uint16) {
+	binary.LittleEndian.PutUint16(dst[0:2], HeaderMagic)
+	dst[2] = ProtocolVer
+	dst[3] = flags
+	binary.LittleEndian.PutUint32(dst[4:8], seq)
+	binary.LittleEndian.PutUint16(dst[8:10], opcode)
+	binary.LittleEndian.PutUint16(dst[10:12], payloadLen)
+}
+
+// encodeSnapshotEntry writes one SnapshotEntry into dst (22 bytes).
+func encodeSnapshotEntry(dst []byte, e *SnapshotEntry) {
+	binary.LittleEndian.PutUint32(dst[0:4], e.SessionID)
+	binary.LittleEndian.PutUint32(dst[4:8], math.Float32bits(e.PosX))
+	binary.LittleEndian.PutUint32(dst[8:12], math.Float32bits(e.PosY))
+	binary.LittleEndian.PutUint32(dst[12:16], math.Float32bits(e.PosZ))
+	binary.LittleEndian.PutUint16(dst[16:18], uint16(e.Yaw))
+	binary.LittleEndian.PutUint16(dst[18:20], uint16(e.Pitch))
+	dst[20] = e.AnimFlags
+	dst[21] = e.Health
 }
 
 func writeInventorySync(w io.Writer, itemCount uint8, items []InventoryItemPayload) error {
@@ -438,20 +539,69 @@ func WriteServerSnapshot(w io.Writer, seq uint32, flags uint8, snap *ServerSnaps
 }
 
 func ReadServerSnapshot(r io.Reader) (*ServerSnapshot, error) {
+	if br, ok := r.(*bytes.Reader); ok {
+		return readServerSnapshotReader(br)
+	}
+
 	var snap ServerSnapshot
-	if err := binary.Read(r, binary.LittleEndian, &snap.Count); err != nil {
+	var countBuf [1]byte
+	if _, err := io.ReadFull(r, countBuf[:]); err != nil {
 		return nil, err
 	}
+	snap.Count = countBuf[0]
 	count := int(snap.Count)
 	if count > len(snap.Entries) {
 		count = len(snap.Entries)
 	}
+	var entry [SnapshotEntryWireSize]byte
 	for i := 0; i < count; i++ {
-		if err := binary.Read(r, binary.LittleEndian, &snap.Entries[i]); err != nil {
+		if _, err := io.ReadFull(r, entry[:]); err != nil {
 			return nil, err
 		}
+		snap.Entries[i] = decodeSnapshotEntry(entry[:])
 	}
 	return &snap, nil
+}
+
+// readServerSnapshotReader is ReadServerSnapshot specialised for a concrete
+// bytes.Reader; decode scratch stays on the stack.
+func readServerSnapshotReader(r *bytes.Reader) (*ServerSnapshot, error) {
+	var snap ServerSnapshot
+	b, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	snap.Count = b
+	count := int(b)
+	if count > len(snap.Entries) {
+		count = len(snap.Entries)
+	}
+	var entry [SnapshotEntryWireSize]byte
+	for i := 0; i < count; i++ {
+		n, err := r.Read(entry[:])
+		if err != nil {
+			return nil, err
+		}
+		if n < SnapshotEntryWireSize {
+			return nil, io.ErrUnexpectedEOF
+		}
+		snap.Entries[i] = decodeSnapshotEntry(entry[:])
+	}
+	return &snap, nil
+}
+
+// decodeSnapshotEntry reads one 22-byte SnapshotEntry from src.
+func decodeSnapshotEntry(src []byte) SnapshotEntry {
+	return SnapshotEntry{
+		SessionID: binary.LittleEndian.Uint32(src[0:4]),
+		PosX:      math.Float32frombits(binary.LittleEndian.Uint32(src[4:8])),
+		PosY:      math.Float32frombits(binary.LittleEndian.Uint32(src[8:12])),
+		PosZ:      math.Float32frombits(binary.LittleEndian.Uint32(src[12:16])),
+		Yaw:       int16(binary.LittleEndian.Uint16(src[16:18])),
+		Pitch:     int16(binary.LittleEndian.Uint16(src[18:20])),
+		AnimFlags: src[20],
+		Health:    src[21],
+	}
 }
 
 func ReadHeader(r io.Reader) (*PacketHeader, error) {

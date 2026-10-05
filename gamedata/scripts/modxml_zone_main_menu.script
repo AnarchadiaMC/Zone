@@ -29,6 +29,17 @@ local function inject_list(xml_obj, list_name)
     return true
 end
 
+-- Read an attribute from a raw dxml node. The raw node ({el="<tag ..."}) has
+-- no .attr table; getElement parses it on demand and keeps the source quotes
+-- (e.g. height = '"280"'), so strip non-digits before tonumber.
+local function node_attr_number(xml_obj, el, key)
+    local ok, data = pcall(function() return xml_obj:getElement(el) end)
+    if not ok or type(data) ~= "table" or type(data.attr) ~= "table" then return nil end
+    local raw = data.attr[key]
+    if raw == nil then return nil end
+    return tonumber(tostring(raw):match("%-?%d+"))
+end
+
 -- Coexistence fix: uniquely-named functions + chaining (see on_xml_read below).
 -- Captures any previously-defined SHARED globals before shadowing (shared-_G
 -- loader model; normally nil under X-Ray per-file setfenv isolation).
@@ -50,15 +61,16 @@ function zone_inject_button(xml_file_name, xml_obj)
     -- shniaga_wnd sizing: accommodate BOTH Zone (btn_zone_online) and xrRazom
     -- (btn_multiplayer). Vanilla is y=419 h=280 (8 buttons). Zone alone needs
     -- y=350 h=360 (9 buttons); with xrRazom present we need room for 10, so use
-    -- y=330 h=400. Never shrink an already-taller box set by another mod.
+    -- y=330 h=400. Never shrink or move a box another mod already made taller.
     local shniaga_nodes = xml_obj:query("shniaga_wnd")
     if shniaga_nodes then
         for _, el in ipairs(shniaga_nodes) do
-            local cur_h = el.attr and tonumber(el.attr.height) or 0
+            local cur_h = node_attr_number(xml_obj, el, "height")
+            local cur_y = node_attr_number(xml_obj, el, "y")
             local want_y, want_h = "330", "400"
             if cur_h and cur_h >= 400 then
-                want_y = el.attr.y or want_y
-                want_h = el.attr.height or want_h
+                want_h = tostring(cur_h)
+                if cur_y then want_y = tostring(cur_y) end
             end
             if xml_obj.setElementAttr then
                 pcall(function()

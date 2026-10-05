@@ -168,4 +168,109 @@
     <string id="ui_zone_col_tick">
         <text>Tick</text>
     </string>
+    <string id="ui_zone_err_banned">
+        <text>You are banned from this server</text>
+    </string>
+    <string id="ui_zone_err_server_full">
+        <text>Server is full</text>
+    </string>
+    <string id="ui_zone_err_version">
+        <text>Protocol version mismatch</text>
+    </string>
+    <string id="ui_zone_err_kick">
+        <text>Disconnected by the server</text>
+    </string>
+    <string id="ui_zone_err_timeout">
+        <text>Server did not respond</text>
+    </string>
+    <string id="ui_zone_err_handshake">
+        <text>Connection handshake failed</text>
+    </string>
+    <string id="ui_zone_err_connect_call">
+        <text>Could not start the connection</text>
+    </string>
+    <string id="ui_zone_drop_prefix">
+        <text>Disconnected</text>
+    </string>
+    <string id="ui_zone_drop_generic">
+        <text>Connection to the server was lost</text>
+    </string>
+    <string id="ui_zone_level_change_unsupported">
+        <text>Server level change is not supported in-game. Reconnect from the main menu.</text>
+    </string>
+    <string id="ui_zone_join_start_failed">
+        <text>Could not start the game for the server level</text>
+    </string>
+    <string id="ui_zone_inv_sync_incomplete">
+        <text>Inventory sync incomplete: %d of %d items failed</text>
+    </string>
+    <string id="ui_zone_inv_sync_malformed">
+        <text>Inventory sync data was malformed; some items may be missing</text>
+    </string>
+    <string id="ui_zone_status_no_module">
+        <text>ZoneNet module not loaded - server browser unavailable</text>
+    </string>
+    <string id="ui_zone_status_busy">
+        <text>Another network session is active</text>
+    </string>
+    <string id="ui_zone_identity_missing">
+        <text>Client identity unavailable - cannot connect</text>
+    </string>
+    <string id="ui_zone_failed_retry_hint">
+        <text>check the address and press Connect to retry</text>
+    </string>
+    <string id="ui_zone_scan_none_online">
+        <text>Scan complete: no servers online</text>
+    </string>
+    <string id="ui_zone_scan_all_timed_out">
+        <text>all requests timed out</text>
+    </string>
+    <string id="ui_zone_scan_all_offline">
+        <text>servers unreachable</text>
+    </string>
+    <string id="ui_zone_scan_zero_targets">
+        <text>No saved servers - add one on the Direct Connect tab</text>
+    </string>
+    <string id="ui_zone_favorites_write_failed">
+        <text>Could not save favorites: identity file is not writable</text>
+    </string>
+    <string id="ui_zone_row_fail_timeout">
+        <text>timeout</text>
+    </string>
+    <string id="ui_zone_row_fail_refused">
+        <text>refused</text>
+    </string>
+    <string id="ui_zone_row_fail_bad">
+        <text>bad response</text>
+    </string>
+    <string id="ui_zone_last_error">
+        <text>Last error</text>
+    </string>
+    <string id="ui_zone_error_loadout_config">
+        <text>Loadout configuration is missing or unreadable</text>
+    </string>
+    <string id="ui_zone_error_loadout_build">
+        <text>Could not build the loadout</text>
+    </string>
+    <string id="ui_zone_error_loadout_oversize">
+        <text>Loadout is too large for the server (%d/%d bytes)</text>
+    </string>
+    <string id="ui_zone_error_zone_module">
+        <text>Network module unavailable - cannot send character</text>
+    </string>
+    <string id="ui_zone_error_identity">
+        <text>Client identity is missing - cannot create a character</text>
+    </string>
+    <string id="ui_zone_event_no_sound">
+        <text>Emission siren sound is unavailable</text>
+    </string>
+    <string id="ui_zone_event_weather_failed">
+        <text>Failed to apply world event weather</text>
+    </string>
+    <string id="ui_zone_event_malformed">
+        <text>World event data was malformed</text>
+    </string>
+    <string id="ui_zone_event_notify_failed">
+        <text>Could not display the world event notice</text>
+    </string>
 </string_table>

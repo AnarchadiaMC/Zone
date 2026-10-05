@@ -27,27 +27,62 @@ local enforced = false
 local safe_zone_id = ""
 local weapon_hidden_by_us = false
 
+-- hide_weapon() maps to SetWeaponHideState(INV_STATE_BLOCK_ALL, true), which
+-- increments a per-slot block counter for every inventory slot
+-- (Actor_Weapon.cpp:159-169; Inventory.cpp:1447-1471 and 1529-1552) while
+-- restore_weapon() is a single decrement per slot. A repeated hide without a
+-- matching restore leaves slots blocked forever and trips the <5 VERIFY in
+-- debug builds. Default OFF: safemode + key block + CActor_Fire already
+-- enforce the lock. Enable only for weapons that refuse safemode.
+local ALLOW_HIDE_WEAPON = false
+
 local POLL_INTERVAL_MS = 1000
 local last_poll = 0
 
 -- Offensive binds are discovered lazily; key_bindings may not exist yet when
 -- on_game_start fires. Rebuild on the first key event if still empty.
+--
+-- HARD SAFEGUARD: only names in WEAPON_ONLY may ever enter BLOCKED. The
+-- engine dispatches on_before_key_press BEFORE UI input (level_input.script:
+-- 17-19; Level_input.cpp:187-192 then 285), so eating a UI-relevant key would
+-- make vendor/trade/inventory windows unresponsive. Legacy/modded grenade
+-- names (kGRENADE, kTHROW_GRENADE) are NOT in this engine's key_bindings
+-- (key_binding_registrator_script.cpp:29-127) and are therefore removed.
 local BLOCKED = {}
-local BIND_NAMES = {
+local WEAPON_ONLY = {
     "kWPN_FIRE",    -- fire
     "kWPN_FUNC",    -- under-barrel / grenade launcher fire
-    "kCUSTOM21",    -- UBGL toggle (key_bindings enum; lua_help.script:520)
-    "kGRENADE",     -- grenade throw (modded/legacy bind names)
-    "kTHROW_GRENADE",
+    "kCUSTOM21",    -- UBGL toggle (key_bindings enum)
     "kQUICK_USE_1", -- quick slots (grenades/bolts)
     "kQUICK_USE_2",
     "kQUICK_USE_3",
     "kQUICK_USE_4",
 }
 
+-- Defense-in-depth denylist: even if a future edit adds one of these names to
+-- WEAPON_ONLY, its action id can never be blocked. Absent binds are skipped.
+local NEVER_BLOCK = {
+    "kUSE", "kINVENTORY", "kACTIVE_JOBS", "kBUY", "kDROP",
+    "kQUICK_SAVE", "kQUICK_LOAD", "kPAUSE", "kCONSOLE", "kQUIT",
+    "kCHAT", "kCHAT_TEAM", "kFREELOOK", "kTORCH", "kDETECTOR",
+    -- names used by other engines; honored only when key_bindings exports them
+    "kPDA", "kMAP", "kTALK", "kTRADE",
+}
+local NEVER_BLOCK_IDS = {}
+
 local registered = false
 local fire_hook_installed = false
 local prev_CActor_Fire = nil
+
+-- Co-op dormancy gate. Delegates to zone_main's single helper so all Zone
+-- modules answer "is xrRazom live?" the same way; nil-safe while zone_main is
+-- not loaded yet.
+local function xrr_is_active()
+    local fn = zone_main and zone_main.xrr_is_active
+    if type(fn) ~= "function" then return false end
+    local ok, res = pcall(fn)
+    return ok and res == true
+end
 
 -- AI zone-membership cache. xr_combat_ignore.is_enemy is a hot path, so a
 -- per-object result lives for ~1 s. Wiped on reset/level change.
@@ -147,14 +182,24 @@ end
 
 local function build_blocklist()
     if not key_bindings then return end
+
+    local forbidden = {}
+    for i = 1, #NEVER_BLOCK do
+        local id = key_bindings[NEVER_BLOCK[i]]
+        if type(id) == "number" and id ~= 0 then forbidden[id] = true end
+    end
+    NEVER_BLOCK_IDS = forbidden
+
+    -- Absolute allowlist: an action id enters BLOCKED only when one of the
+    -- explicit weapon-only names resolved to it and it is not forbidden.
     local rebuilt = {}
-    for i = 1, #BIND_NAMES do
-        local bind = key_bindings[BIND_NAMES[i]]
-        if bind ~= nil then rebuilt[bind] = true end
+    for i = 1, #WEAPON_ONLY do
+        local id = key_bindings[WEAPON_ONLY[i]]
+        if type(id) == "number" and id ~= 0 and not forbidden[id] then
+            rebuilt[id] = true
+        end
     end
-    if next(rebuilt) ~= nil then
-        BLOCKED = rebuilt
-    end
+    BLOCKED = rebuilt
 end
 
 local function ensure_blocklist()
@@ -164,15 +209,33 @@ local function ensure_blocklist()
 end
 
 local function fire_hook(...)
-    if enforced then return false end
+    -- Co-op live: never veto fire; keep chaining the saved handler.
+    if xrr_is_active() then
+        if prev_CActor_Fire then return prev_CActor_Fire(...) end
+        return true
+    end
+    -- Stale-state guard: enforcement only applies while a live actor exists.
+    -- reset() clears enforced on level change / actor destroy / disconnect, so
+    -- a leftover flag on the menu can never block fire.
+    if enforced and db and db.actor then return false end
     if prev_CActor_Fire then return prev_CActor_Fire(...) end
     return true
 end
 
+-- Idempotent and self-healing: if another script (or a script reload)
+-- replaced _G.CActor_Fire after us, re-install our wrapper. Only the FIRST
+-- install chains the pre-existing base function; a later replacement is
+-- deliberately dropped because it may itself wrap us, and chaining it would
+-- create a wrapper loop (ours -> replacement -> ours -> ...).
+-- While xrRazom co-op is live, never wrap and never fight a foreign wrapper:
+-- the wrapper resumes installing after the session ends.
 local function install_fire_hook()
-    if fire_hook_installed then return end
-    local prev = rawget(_G, "CActor_Fire")
-    prev_CActor_Fire = (type(prev) == "function") and prev or nil
+    if xrr_is_active() then return end
+    local current = rawget(_G, "CActor_Fire")
+    if fire_hook_installed and current == fire_hook then return end
+    if not fire_hook_installed and type(current) == "function" and current ~= fire_hook then
+        prev_CActor_Fire = current
+    end
     _G.CActor_Fire = fire_hook
     fire_hook_installed = true
 end
@@ -205,12 +268,11 @@ local function set_weapon_locked(locked)
     end)
 
     if locked then
-        -- Safemode is refused for weapons whose m_bCanBeLowered is false
-        -- (level_script.cpp:2100-2109), so hide_weapon stays as a last resort.
-        -- Re-evaluated on every tick by enforce_weapon_lock instead of being
-        -- trusted as a permanent flag; the flag below only records ownership
-        -- so exit never restores a weapon another system hid.
-        if not actor_weapon_lowered() then
+        -- Opt-in last resort (see ALLOW_HIDE_WEAPON): called at most once per
+        -- hidden episode, only when safemode actually failed to lower the
+        -- weapon. Never re-called on later ticks, so block counters stay
+        -- balanced against the single restore below.
+        if ALLOW_HIDE_WEAPON and not weapon_hidden_by_us and not actor_weapon_lowered() then
             pcall(function() db.actor:hide_weapon() end)
             weapon_hidden_by_us = true
         end
@@ -250,6 +312,10 @@ local combat_ignore_reinstall_logged = false
 local COMBAT_IGNORE_REINSTALL_CAP = 16
 
 local function install_combat_ignore_hook()
+    -- While co-op is live: no fresh install and no re-install (never fight a
+    -- wrapper xrRazom installed over ours; its apply() wraps this symbol at
+    -- xrr_patch_common.script:232-256).
+    if xrr_is_active() then return end
     if type(xr_combat_ignore) ~= "table" then return end
     local current = xr_combat_ignore.is_enemy
 
@@ -273,6 +339,14 @@ local function install_combat_ignore_hook()
     if type(current) ~= "function" then return end
     orig_combat_is_enemy = current
     installed_combat_wrapper = function(obj, enemy, no_memory)
+        -- Dormant wrapper: while co-op is live the saved chain is called
+        -- untouched, so neither Zone's veto nor xrRazom's own wrapper
+        -- composition is disturbed.
+        if xrr_is_active() then
+            local ok_orig, result = pcall(orig_combat_is_enemy, obj, enemy, no_memory)
+            if ok_orig then return result end
+            return true
+        end
         local ok_zone, blocked = pcall(safezone_pair_blocked, obj, enemy)
         if ok_zone and blocked then return false end
         local ok, result = pcall(orig_combat_is_enemy, obj, enemy, no_memory)
@@ -290,6 +364,9 @@ end
 -- xrr_patch_common.script:237-246 (flags.override / flags.result).
 local function on_enemy_eval(obj, enemy, flags)
     pcall(function()
+        -- While co-op is live, never clobber the enemy evaluation; xrRazom
+        -- drives its own override convention (xrr_patch_common.script:237-246).
+        if xrr_is_active() then return end
         if type(flags) ~= "table" then return end
         if not safezone_pair_blocked(obj, enemy) then return end
         flags.override = true
@@ -313,6 +390,12 @@ local enemy_cb_installed = {}
 local enemy_cb_count = 0
 
 local function monster_useful_enemy(monster, enemy)
+    -- Callback contract (enemy_manager.cpp:101,109): the engine invokes
+    -- m_useful_callback(monster_lua_go, enemy_lua_go) and treats a missing
+    -- callback as `true`. Return true = "useful, keep default hostility";
+    -- false = drop the target. While co-op is live this callback must be
+    -- neutral, so report the engine default.
+    if xrr_is_active() then return true end
     local ok, blocked = pcall(safezone_pair_blocked, monster, enemy)
     if ok and blocked then return false end
     return true
@@ -320,6 +403,9 @@ end
 
 local function on_monster_net_spawn(monster, se_obj)
     pcall(function()
+        -- Never install ours while co-op is live; already-installed callbacks
+        -- stay neutral via monster_useful_enemy's dormancy check.
+        if xrr_is_active() then return end
         if not (monster and monster.set_enemy_callback) then return end
         local id = nil
         pcall(function() id = monster:id() end)
@@ -369,7 +455,9 @@ local function apply_exit()
 end
 
 local function refresh_enforcement()
-    local locked = packet_locked or auth_locked
+    -- Co-op live: never enter enforcement, whatever the (stale) packet/atomic
+    -- state says; the next active tick resets the remaining flags.
+    local locked = (packet_locked or auth_locked) and not xrr_is_active()
     if locked == enforced then return end
     enforced = locked
     if locked then
@@ -424,9 +512,21 @@ local function on_actor_update()
     if type(tg) ~= "number" then return end
     if tg - last_poll < POLL_INTERVAL_MS then return end
     last_poll = tg
+
+    -- Co-op dormancy: release any local Zone state once, then leave input,
+    -- fire, hit and AI hooks alone for as long as the session lives.
+    if xrr_is_active() then
+        if enforced or packet_locked or auth_locked or safe_zone_id ~= "" then
+            pcall(reset)
+        end
+        return
+    end
+
     pcall(poll_authoritative)
     pcall(enforce_weapon_lock)
     pcall(install_combat_ignore_hook)
+    -- Re-install the fire veto if another script replaced _G.CActor_Fire.
+    pcall(install_fire_hook)
 end
 
 -- Hard damage cancel when either the victim or (for direct hits) the
@@ -439,6 +539,8 @@ end
 local function apply_hit_block(victim, s_hit, bone_id, flags)
     if not s_hit then return end
     pcall(function()
+        -- Co-op live: never cancel damage; xrRazom owns hit arbitration.
+        if xrr_is_active() then return end
         local draftsman = nil
         pcall(function() draftsman = s_hit.draftsman end)
 
@@ -470,7 +572,8 @@ local function on_monster_before_hit(obj, s_hit, bone_id, flags)
 end
 
 -- Cheap guard: while the Zone chat edit box is capturing text, do not treat
--- keystrokes as offensive input (zone_hud already suppresses the binds).
+-- keystrokes as offensive input (the edit box owns the keyboard through the
+-- UI, not through this block list).
 local function chat_input_open()
     local open = false
     pcall(function()
@@ -479,21 +582,56 @@ local function chat_input_open()
     return open
 end
 
+-- actor_menu.is_hud_free() is the base game's canonical "no UI owns input"
+-- predicate (actor_menu.script:21-23: actor-menu mode 0, PDA dialog closed,
+-- no registered custom GUI). While it is false (inventory/trade/loot/PDA/
+-- custom UI), NEVER consume a key: the engine dispatches on_before_key_press
+-- before UI input, so an eaten key would also be dead for the open window.
+local function ui_input_open()
+    local open = false
+    pcall(function()
+        if actor_menu and type(actor_menu.is_hud_free) == "function" then
+            open = (actor_menu.is_hud_free() ~= true)
+        end
+    end)
+    return open
+end
+
+-- dis is g_bDisableAllInput (level.disable_input()), set by scripts -- NOT a
+-- UI-open flag. When set, the engine discards the key after this callback
+-- anyway (Level_input.cpp:194-198,283), so never eat it either.
 local function on_before_key_press(dik, bind, dis, flags)
+    if type(flags) ~= "table" then return end
+    -- Co-op live: never consume a key (xrRazom binds, e.g. kXRR_CHAT, must
+    -- reach the engine untouched).
+    if xrr_is_active() then return end
+    if dis then return end
     if chat_input_open() then return end
+    if ui_input_open() then return end
     pcall(function()
         if not enforced then return end
         ensure_blocklist()
-        if flags and BLOCKED[bind] then flags.ret_value = false end
+        -- Allowlist floor: only real, explicitly weapon-only action ids can be
+        -- blocked; the never-block set wins even if BLOCKED is corrupted.
+        if type(bind) ~= "number" or bind == 0 then return end
+        if NEVER_BLOCK_IDS[bind] == true then return end
+        if BLOCKED[bind] == true then flags.ret_value = false end
     end)
 end
 
 local function on_before_key_hold(dik, bind, dis, flags)
+    if type(flags) ~= "table" then return end
+    -- Co-op live: never consume a held key.
+    if xrr_is_active() then return end
+    if dis then return end
     if chat_input_open() then return end
+    if ui_input_open() then return end
     pcall(function()
         if not enforced then return end
         ensure_blocklist()
-        if flags and BLOCKED[bind] then flags.ret_value = false end
+        if type(bind) ~= "number" or bind == 0 then return end
+        if NEVER_BLOCK_IDS[bind] == true then return end
+        if BLOCKED[bind] == true then flags.ret_value = false end
     end)
 end
 

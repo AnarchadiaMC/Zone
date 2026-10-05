@@ -3,12 +3,28 @@
 -- xrr_ui_peer_faction.script: faction grid + new_game_loadouts.ltx only.
 -- Layout: ui_mm_zone_peer_faction.xml.
 
-local ini_itm = ini_file("items\\settings\\new_game_loadouts.ltx")
+local ini_itm = nil
+pcall(function()
+  ini_itm = ini_file("items\\settings\\new_game_loadouts.ltx")
+end)
 
 -- CharacterSelect.items is a 256-byte buffer in the native client
 -- (protocol/packets.h: char items[256]); udp_client.cpp memcpy-truncates at
 -- 255 bytes, so the joined loadout must be validated before sending.
 local MAX_LOADOUT_BYTES = 255
+
+local function tr(id, fallback)
+  local ok, s = pcall(function() return game.translate_string(id) end)
+  if ok and type(s) == "string" and s ~= "" and s ~= id then return s end
+  return fallback or id
+end
+
+local function format_tr(id, fallback, ...)
+  local tmpl = tr(id, fallback)
+  local ok, out = pcall(string.format, tmpl, ...)
+  if ok and type(out) == "string" then return out end
+  return string.format(fallback, ...)
+end
 
 local function zone_eco_tier()
   local ok, tier = pcall(function()
@@ -46,9 +62,18 @@ function UIZonePeerFaction:__init(owner) super()
 
   self.selected_faction = "stalker"
   self.selected_money   = nil
-  self.points_left      = ini_itm:r_float_ex("points", "total_points_eco_" .. zone_eco_tier()) or 1000
+  self.points_left      = 1000
+  pcall(function()
+    if ini_itm then
+      self.points_left = ini_itm:r_float_ex("points", "total_points_eco_" .. zone_eco_tier()) or 1000
+    end
+  end)
   self.points_used      = 0
   self.access           = true
+  self.config_error     = (ini_itm == nil)
+  self.loadout_error    = false
+  self.error_surfaced   = false
+  self.connect_lost     = false
 
   self:SetWndRect(Frect():set(0, 0, 1024, 768))
   self:Enable(true)
@@ -174,6 +199,38 @@ function UIZonePeerFaction:Update()
     end
   end)
 
+  -- Connection watchdog: a dropped handshake/session must not leave this
+  -- dialog silently dead. Report the reason once per disconnect.
+  local connected = false
+  pcall(function()
+    if ZoneNet and ZoneNet.IsConnected then
+      connected = ZoneNet:IsConnected() and true or false
+    end
+  end)
+  if connected then
+    self.connect_lost = false
+  elseif not self.connect_lost then
+    self.connect_lost = true
+    local reason = ""
+    pcall(function()
+      if ZoneNet and ZoneNet.GetLastError then reason = ZoneNet:GetLastError() or "" end
+      if reason == "" and ZoneNet and ZoneNet.GetPreservedError then
+        reason = ZoneNet:GetPreservedError() or ""
+      end
+    end)
+    local shown = reason
+    if reason ~= "" then
+      pcall(function()
+        if ZoneNet and type(ZoneNet.LocalizeError) == "function" then
+          shown = ZoneNet:LocalizeError(reason) or reason
+        end
+      end)
+    else
+      shown = tr("ui_zone_error_not_connected", "Not connected to the server.")
+    end
+    self:ShowError(shown)
+  end
+
   if not self.access then
     self.hint_wnd:Update()
     return
@@ -195,6 +252,13 @@ end
 function UIZonePeerFaction:Show(state)
   if state then
     self:Refresh()
+    if (self.config_error or self.loadout_error) and not self.error_surfaced then
+      self.error_surfaced = true
+      local id = self.config_error and "ui_zone_error_loadout_config" or "ui_zone_error_loadout_build"
+      local fb = self.config_error and "Loadout configuration is missing or unreadable"
+        or "Could not build the loadout"
+      self:ShowError(tr(id, fb))
+    end
   end
   CUIScriptWnd.Show(self, state)
 end
@@ -281,54 +345,61 @@ function UIZonePeerFaction:LoadFaction(faction)
 end
 
 function UIZonePeerFaction:LoadLoadout()
-  local eco_idxs = zone_eco_tier()
-  self.points_used = 0
-  self.points_left = ini_itm:r_float_ex("points", "total_points_eco_" .. eco_idxs) or 1000
-  self.text_points_used:SetText(tostring(self.points_used))
-  self.text_points_left:SetText(tostring(self.points_left))
+  local ok = pcall(function()
+    local eco_idxs = zone_eco_tier()
+    self.points_used = 0
+    self.points_left = ini_itm and ini_itm:r_float_ex("points", "total_points_eco_" .. eco_idxs) or 1000
+    self.text_points_used:SetText(tostring(self.points_used))
+    self.text_points_left:SetText(tostring(self.points_left))
 
-  local t_inv, t_loadout, p_inv, p_loadout = {}, {}, {}, {}
-  local size_inv, size_loadout = 0, 0
-  local n = ini_itm:line_count(self.selected_faction .. "_loadout") or 0
-  for i = 0, n - 1 do
-    local result, sec, value = ini_itm:r_line(self.selected_faction .. "_loadout", i, "", "")
-    if ini_sys:section_exist(sec) then
-      local t = str_explode(value, ",")
-      if (not t[4]) or (t[4] and (tonumber(eco_idxs) <= tonumber(t[4]))) then
-        if t[1] == "false" then
-          for j = 1, tonumber(t[2]) do
-            size_inv = size_inv + 1
-            t_inv[size_inv] = sec
-            p_inv[size_inv] = 0
-          end
-        elseif t[1] == "true" then
-          for j = 1, tonumber(t[2]) do
-            size_loadout = size_loadout + 1
-            t_loadout[size_loadout] = sec
-            p_loadout[size_loadout] = tonumber(t[3])
+    local t_inv, t_loadout, p_inv, p_loadout = {}, {}, {}, {}
+    local size_inv, size_loadout = 0, 0
+    local n = (ini_itm and ini_itm:line_count(self.selected_faction .. "_loadout")) or 0
+    for i = 0, n - 1 do
+      local result, sec, value = ini_itm:r_line(self.selected_faction .. "_loadout", i, "", "")
+      if ini_sys and ini_sys:section_exist(sec) then
+        local t = str_explode(value, ",")
+        if (not t[4]) or (t[4] and (tonumber(eco_idxs) <= tonumber(t[4]))) then
+          if t[1] == "false" then
+            for j = 1, tonumber(t[2]) do
+              size_inv = size_inv + 1
+              t_inv[size_inv] = sec
+              p_inv[size_inv] = 0
+            end
+          elseif t[1] == "true" then
+            for j = 1, tonumber(t[2]) do
+              size_loadout = size_loadout + 1
+              t_loadout[size_loadout] = sec
+              p_loadout[size_loadout] = tonumber(t[3])
+            end
           end
         end
       end
     end
-  end
 
-  self.CC["inventory"]:Reinit(t_inv, p_inv)
-  for idx, ci in pairs(self.CC["inventory"].cell) do
-    if ci:IsShown() then
-      local val = ci.flags.info or 0
-      ci.flags.value = val
-      ci.flags.value_str = game.translate_string("st_mm_new_game_points") .. ": " .. val
+    self.CC["inventory"]:Reinit(t_inv, p_inv)
+    for idx, ci in pairs(self.CC["inventory"].cell) do
+      if ci:IsShown() then
+        local val = ci.flags.info or 0
+        ci.flags.value = val
+        ci.flags.value_str = game.translate_string("st_mm_new_game_points") .. ": " .. val
+      end
     end
-  end
 
-  self.CC["loadout"]:Reinit(t_loadout, p_loadout)
-  for idx, ci in pairs(self.CC["loadout"].cell) do
-    if ci:IsShown() then
-      local val = ci.flags.info or 0
-      ci.flags.value = val
-      ci.flags.value_str = game.translate_string("st_mm_new_game_points") .. ": " .. val
+    self.CC["loadout"]:Reinit(t_loadout, p_loadout)
+    for idx, ci in pairs(self.CC["loadout"].cell) do
+      if ci:IsShown() then
+        local val = ci.flags.info or 0
+        ci.flags.value = val
+        ci.flags.value_str = game.translate_string("st_mm_new_game_points") .. ": " .. val
+      end
     end
+  end)
+  if not ok then
+    printf("Zone: faction loadout build failed (missing config or data)")
+    return false
   end
+  return true
 end
 
 
@@ -338,7 +409,7 @@ end
 function UIZonePeerFaction:UpdateAll()
   self:LoadFaction(self.selected_faction)
   self:UpdateDescr()
-  self:LoadLoadout()
+  self.loadout_error = not self:LoadLoadout()
 end
 
 function UIZonePeerFaction:UpdateFaction()
@@ -439,7 +510,10 @@ function UIZonePeerFaction:OnQuit()
   if not self.access then return end
 
   if ZoneNet and ZoneNet.IsConnected and ZoneNet:IsConnected() then
-    pcall(function() ZoneNet:Disconnect() end)
+    local ok = pcall(function() ZoneNet:Disconnect() end)
+    if not ok then
+      printf("Zone: disconnect failed while leaving faction select")
+    end
   end
 
   self:CloseToMenu()
@@ -501,28 +575,61 @@ function UIZonePeerFaction:OnStartGame()
   if not self.access then return end
   if self.submitted then return end
   if not (ZoneNet and ZoneNet.IsConnected and ZoneNet:IsConnected()) then
-    self:ShowError(game.translate_string("ui_zone_error_not_connected"))
+    self:ShowError(tr("ui_zone_error_not_connected", "Not connected to the server."))
     return
+  end
+  if ZoneNet.IsClientLoaded and not ZoneNet:IsClientLoaded() then
+    self:ShowError(tr("ui_zone_error_zone_module",
+      "Network module unavailable - cannot send character"))
+    return
+  end
+
+  -- Identity gate: only enforced when zone_main exposes the identity API.
+  -- Never send a character select for the shared "anonymous" placeholder.
+  local have_identity_api = false
+  local cfg = nil
+  pcall(function()
+    if zone_main and type(zone_main.ensure_identity) == "function" then
+      have_identity_api = true
+      cfg = zone_main.ensure_identity()
+    elseif zone_main and type(zone_main.get_config) == "function" then
+      have_identity_api = true
+      cfg = zone_main.get_config()
+    end
+  end)
+  if have_identity_api then
+    local bad = (type(cfg) ~= "table")
+      or (type(cfg.client_uuid) ~= "string" or cfg.client_uuid == ""
+          or cfg.client_uuid == "anonymous")
+      or (not tonumber(cfg.hwid_hash))
+    if bad then
+      self:ShowError(tr("ui_zone_error_identity",
+        "Client identity is missing - cannot create a character"))
+      return
+    end
   end
 
   self:SaveCoopOptions()
 
   local faction  = self.selected_faction or "stalker"
   local money    = math.floor(self.selected_money or 0)
-  local items_str = self:BuildLoadoutItems()
-  if type(items_str) ~= "string" then items_str = "" end
+
+  local build_ok, items_str = pcall(self.BuildLoadoutItems, self)
+  if not build_ok or type(items_str) ~= "string" then
+    self:ShowError(tr("ui_zone_error_loadout_build", "Could not build the loadout"))
+    return
+  end
   if #items_str > MAX_LOADOUT_BYTES then
-    local msg = game.translate_string("ui_zone_error_loadout")
-    if type(msg) ~= "string" or msg == "" or msg == "ui_zone_error_loadout" then
-      msg = "Loadout is too large for the server."
-    end
-    self:ShowError(string.format("%s (%d/%d)", msg, #items_str, MAX_LOADOUT_BYTES))
+    self:ShowError(format_tr("ui_zone_error_loadout_oversize",
+      "Loadout is too large for the server (%d/%d bytes)", #items_str, MAX_LOADOUT_BYTES))
     return
   end
 
-  local sent = ZoneNet:SendCharacterSelect(faction, money, items_str)
-  if not sent then
-    self:ShowError(game.translate_string("ui_zone_error_send"))
+  local send_ok, sent = pcall(function()
+    return ZoneNet:SendCharacterSelect(faction, money, items_str)
+  end)
+  if not send_ok or not sent then
+    self:ShowError(tr("ui_zone_error_send", "Failed to send the selection to the server."))
     return
   end
 
@@ -541,6 +648,13 @@ function UIZonePeerFaction:ShowError(msg)
   if self.text_error then
     pcall(function()
       self.text_error:SetText("%c[0,220,70,70]" .. msg)
+    end)
+  else
+    -- No label in the layout: fall back to game news so the reason is visible.
+    pcall(function()
+      if db and db.actor then
+        db.actor:give_game_news("Zone", msg, "ui_inGame2_PDA_icon", 0, 6000, 0)
+      end
     end)
   end
   printf("Zone: faction dialog error: %s", msg)
