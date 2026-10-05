@@ -18,18 +18,116 @@ local function generate_random_hwid()
     return math.random(100000000, 999999999)
 end
 
-local function save_identity_config(cfg, path)
+local CANONICAL_SECTION = "zone_identity"
+local LEGACY_SECTION = "identity"
+local IDENTITY_KEYS = {
+    client_uuid = true, uuid = true,
+    hwid_hash = true, hwid = true,
+    nickname = true, server_ip = true, server_port = true,
+}
+
+local function read_file_lines(path)
+    local lines = {}
+    local file = io.open(path, "r")
+    if not file then return lines end
+    pcall(function()
+        for line in file:lines() do lines[#lines + 1] = line end
+    end)
+    pcall(function() file:close() end)
+    return lines
+end
+
+local function write_lines_to_file(path, lines)
     local file = io.open(path, "w")
-    if file then
-        file:write("[identity]\n")
-        file:write(string.format("client_uuid = %s\n", cfg.client_uuid or ""))
-        file:write(string.format("hwid_hash = %d\n", cfg.hwid_hash or 0))
-        file:write(string.format("nickname = %s\n", cfg.nickname or "Stalker"))
-        file:write(string.format("server_ip = %s\n", cfg.server_ip or "127.0.0.1"))
-        file:write(string.format("server_port = %d\n", cfg.server_port or 27015))
-        file:close()
-        printf("Zone: Generated and saved identity to %s", path)
+    if not file then return false end
+    local ok = pcall(function()
+        for _, line in ipairs(lines) do file:write(line .. "\n") end
+    end)
+    pcall(function() file:close() end)
+    return ok
+end
+
+-- Atomic persistence: write a temp file next to the target, then rename via
+-- os.rename (remove the destination once and retry, since Windows refuses
+-- rename-over-existing); fall back to a direct write when os.rename is
+-- unavailable or keeps failing.
+local function write_lines_atomic(path, lines)
+    if type(os.rename) ~= "function" then
+        return write_lines_to_file(path, lines)
     end
+    local tmp = path .. ".tmp"
+    if not write_lines_to_file(tmp, lines) then
+        pcall(os.remove, tmp)
+        return write_lines_to_file(path, lines)
+    end
+    local moved = false
+    pcall(function() moved = (os.rename(tmp, path) == true) end)
+    if not moved then
+        pcall(os.remove, path)
+        pcall(function() moved = (os.rename(tmp, path) == true) end)
+    end
+    if moved then return true end
+    pcall(os.remove, tmp)
+    return write_lines_to_file(path, lines)
+end
+
+-- Rewrite only the zone identity keys, in the canonical [zone_identity]
+-- section (the section the injected DLL reads). Every other line - including
+-- [zone_favorites]/[zone_history] and any unknown section written by the
+-- server browser or future tools - is preserved verbatim. Legacy [identity]
+-- sections are migrated in place: the header is normalized and legacy
+-- uuid=/hwid= aliases are replaced by the canonical keys. A file without an
+-- identity section gets one appended. Write is atomic when os.rename exists.
+local function save_identity_config(cfg, path)
+    local source = read_file_lines(path)
+    local out = {}
+    local inserted = false
+    local current_section = nil
+
+    local function canonical_lines()
+        return {
+            "[" .. CANONICAL_SECTION .. "]",
+            string.format("client_uuid = %s", cfg.client_uuid or ""),
+            string.format("hwid_hash = %d", tonumber(cfg.hwid_hash) or 0),
+            string.format("nickname = %s", cfg.nickname or "Stalker"),
+            string.format("server_ip = %s", cfg.server_ip or "127.0.0.1"),
+            string.format("server_port = %d", tonumber(cfg.server_port) or 27015),
+        }
+    end
+
+    for _, line in ipairs(source) do
+        local sec = string.match(line, "^%s*%[([^%]]+)%]")
+        if sec then
+            current_section = string.lower(sec)
+            if current_section == CANONICAL_SECTION or current_section == LEGACY_SECTION then
+                if not inserted then
+                    inserted = true
+                    for _, l in ipairs(canonical_lines()) do out[#out + 1] = l end
+                end
+            else
+                out[#out + 1] = line
+            end
+        elseif current_section == CANONICAL_SECTION or current_section == LEGACY_SECTION then
+            local key = string.match(line, "^%s*([%w_]+)%s*=")
+            if not (key and IDENTITY_KEYS[string.lower(key)]) then
+                out[#out + 1] = line
+            end
+        else
+            out[#out + 1] = line
+        end
+    end
+
+    if not inserted then
+        if #out > 0 and out[#out] ~= "" then out[#out + 1] = "" end
+        for _, l in ipairs(canonical_lines()) do out[#out + 1] = l end
+    end
+
+    if not write_lines_atomic(path, out) then
+        printf("Zone: [ERROR] Failed to save identity to %s", path)
+        return false
+    end
+    printf("Zone: Saved identity to %s", path)
+    return true
 end
 
 local function load_config()
@@ -52,13 +150,30 @@ local function load_config()
         return true
     end
     
+    -- Section-aware read: identity keys are only honored inside the canonical
+    -- [zone_identity] section, the legacy [identity] section, or before the
+    -- first section header (sectionless legacy files). Keys inside
+    -- [zone_favorites]/[zone_history]/[server_history] are ignored.
+    local current_section = ""
     for line in file:lines() do
-        local key, val = string.match(line, "^%s*([%w_]+)%s*=%s*(.+)%s*$")
-        if key and val then
-            if key == "hwid_hash" or key == "server_port" then
-                config[key] = tonumber(val)
-            else
-                config[key] = val
+        local sec = string.match(line, "^%s*%[([^%]]+)%]")
+        if sec then
+            current_section = string.lower(sec)
+        elseif current_section == CANONICAL_SECTION or current_section == LEGACY_SECTION or current_section == "" then
+            local key, val = string.match(line, "^%s*([%w_]+)%s*=%s*(.+)%s*$")
+            if key and val then
+                key = string.lower(key)
+                if key == "client_uuid" or key == "uuid" then
+                    config.client_uuid = val
+                elseif key == "hwid_hash" or key == "hwid" then
+                    config.hwid_hash = tonumber(val)
+                elseif key == "nickname" then
+                    config.nickname = val
+                elseif key == "server_ip" then
+                    config.server_ip = val
+                elseif key == "server_port" then
+                    config.server_port = tonumber(val)
+                end
             end
         end
     end
@@ -102,8 +217,9 @@ function on_game_start()
     end)
 
     -- Register the save/load veto callbacks (declared in axr_main.script:217-218).
-    -- The engine dispatch honours flags.ret_value=false; a plain bool return is
-    -- ignored, so the veto must go through flags.
+    -- Save is dispatched as (flags, source, text) and load as (dik, bind, flags);
+    -- both are vetoed by setting flags.ret = true, not flags.ret_value
+    -- (level_input.script:55-57 and 109-111, ui_main_menu.script:168-170).
     if RegisterScriptCallback and not input_callbacks_registered then
         input_callbacks_registered = true
         pcall(RegisterScriptCallback, "on_before_save_input", on_before_save_input)
@@ -190,11 +306,20 @@ function ensure_identity()
     pcall(function()
         local f = io.open(path, "r")
         if not f then return end
+        local section = ""
         for line in f:lines() do
-            local v = string.match(line, "^%s*client_uuid%s*=%s*(.+)%s*$")
-            if v and v == uuid then
-                persisted = true
-                break
+            local sec = string.match(line, "^%s*%[([^%]]+)%]")
+            if sec then
+                section = string.lower(sec)
+            elseif section == CANONICAL_SECTION or section == LEGACY_SECTION or section == "" then
+                local k, v = string.match(line, "^%s*([%w_]+)%s*=%s*(.+)%s*$")
+                if k and v and v == uuid then
+                    k = string.lower(k)
+                    if k == "client_uuid" or k == "uuid" then
+                        persisted = true
+                        break
+                    end
+                end
             end
         end
         f:close()
@@ -245,20 +370,24 @@ local function zone_is_connected()
     end)
     return connected
 end
-function on_before_save_input(dik, action, flags)
-    if type(flags) ~= "table" then return true end
-    if zone_is_connected() then flags.ret_value = false end
-    return flags.ret_value
+-- Veto convention verified against the base scripts: the save dispatchers
+-- call SendScriptCallback("on_before_save_input", flags, n, text) and abort
+-- when flags.ret == true (level_input.script:53-59, ui_main_menu.script:166-172,
+-- ui_main_menu.script:309-313); quick load calls
+-- SendScriptCallback("on_before_load_input", dik, bind, flags) with the same
+-- flags.ret veto (level_input.script:108-113).
+function on_before_save_input(flags, typ, text)
+    if type(flags) ~= "table" then return end
+    if zone_is_connected() then flags.ret = true end
 end
-function on_before_load_input(dik, action, flags)
-    if type(flags) ~= "table" then return true end
+function on_before_load_input(dik, bind, flags)
+    if type(flags) ~= "table" then return end
     if zone_is_connected() then
         pcall(function()
             if db and db.actor then db.actor:give_game_news("Zone", "Disconnect before loading.", "ui_inGame2_PDA_icon", 0, 3000, 0) end
         end)
-        flags.ret_value = false
+        flags.ret = true
     end
-    return flags.ret_value
 end
 function get_server_spawn()
     local x, y, z = 0, 0, 0

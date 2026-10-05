@@ -39,28 +39,32 @@
         </button>
     </tabs>
 
-    <col_name x="214" y="150" width="128" height="16">
+    <btn_col_name x="214" y="150" width="128" height="16">
+        <texture>ui_button_ordinary</texture>
         <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_name</text>
-    </col_name>
-    <col_map x="342" y="150" width="78" height="16">
+    </btn_col_name>
+    <btn_col_map x="342" y="150" width="78" height="16">
+        <texture>ui_button_ordinary</texture>
         <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_map</text>
-    </col_map>
-    <col_players x="420" y="150" width="52" height="16">
+    </btn_col_map>
+    <btn_col_players x="420" y="150" width="52" height="16">
+        <texture>ui_button_ordinary</texture>
         <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_players</text>
-    </col_players>
-    <col_ping x="472" y="150" width="46" height="16">
+    </btn_col_players>
+    <btn_col_ping x="472" y="150" width="46" height="16">
+        <texture>ui_button_ordinary</texture>
         <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_ping</text>
-    </col_ping>
-    <col_mode x="518" y="150" width="70" height="16">
+    </btn_col_ping>
+    <btn_col_mode x="518" y="150" width="70" height="16">
+        <texture>ui_button_ordinary</texture>
         <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_mode</text>
-    </col_mode>
+    </btn_col_mode>
 
     <list_frame x="180" y="166" width="430" height="436">
         <texture>ui_inGame2_servers_list_frame</texture>
     </list_frame>
     <list x="180" y="166" width="430" height="436" item_height="26" always_show_scroll="1" can_select="1">
         <font font="letterica16" r="225" g="225" b="215"/>
-        <list_font font="letterica16" r="225" g="225" b="215"/>
     </list>
 
     <empty_title x="180" y="340" width="430" height="24">

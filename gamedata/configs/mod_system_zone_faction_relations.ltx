@@ -4,6 +4,8 @@
 ; Values: -2000 = enemy, 0 = neutral, 300 = ally, 2000 = coalition ally.
 ; The matrix is symmetric; server defaults are embedded in the Go build and
 ; seeded into the faction_relations database table when it is empty.
+; The mod_system_* name lets the engine merge this section into system_ini;
+; zone_hud.script also parses the file directly when the merge is absent.
 
 [faction_relations]
 stalker = bandit:-2000, monolith:-2000, killer:-2000, army:-2000, renegade:-2000, greh:-2000, zombied:-2000, dolg:0, freedom:0, ecolog:0, csky:0, isg:0

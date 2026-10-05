@@ -521,11 +521,14 @@ function UIZoneServerList:InitControls()
     self.tabs = xml_init(xml, "InitTab", "tabs", self)
     if self.tabs then self:Register(self.tabs, "tabs") end
 
-    self.col_name = xml_init(xml, "InitStatic", "col_name", self)
-    self.col_map = xml_init(xml, "InitStatic", "col_map", self)
-    self.col_players = xml_init(xml, "InitStatic", "col_players", self)
-    self.col_ping = xml_init(xml, "InitStatic", "col_ping", self)
-    self.col_mode = xml_init(xml, "InitStatic", "col_mode", self)
+    -- Sortable column headers are real 3tButtons: CUIStatic never emits
+    -- WINDOW_LBUTTON_DOWN in this engine, so click handling must ride on
+    -- BUTTON_CLICKED (bound in InitCallBacks).
+    self.col_name = xml_init(xml, "Init3tButton", "btn_col_name", self)
+    self.col_map = xml_init(xml, "Init3tButton", "btn_col_map", self)
+    self.col_players = xml_init(xml, "Init3tButton", "btn_col_players", self)
+    self.col_ping = xml_init(xml, "Init3tButton", "btn_col_ping", self)
+    self.col_mode = xml_init(xml, "Init3tButton", "btn_col_mode", self)
 
     self.list_frame = xml_init(xml, "InitFrame", "list_frame", self)
     self.list_servers = xml_init(xml, "InitListBox", "list", self)
@@ -574,6 +577,12 @@ function UIZoneServerList:InitControls()
     if self.btn_refresh then self:Register(self.btn_refresh, "btn_refresh") end
     if self.btn_back then self:Register(self.btn_back, "btn_back") end
 
+    if self.col_name then self:Register(self.col_name, "btn_col_name") end
+    if self.col_map then self:Register(self.col_map, "btn_col_map") end
+    if self.col_players then self:Register(self.col_players, "btn_col_players") end
+    if self.col_ping then self:Register(self.col_ping, "btn_col_ping") end
+    if self.col_mode then self:Register(self.col_mode, "btn_col_mode") end
+
     if self.edit_ip and self.edit_port and self.edit_ip.SetNextFocusCapturer then
         pcall(function() self.edit_ip:SetNextFocusCapturer(self.edit_port) end)
     end
@@ -620,19 +629,18 @@ function UIZoneServerList:InitCallBacks()
             self:AddCallback("server_list", ui_events.WINDOW_LBUTTON_DB_CLICK, self.OnConnect, self)
         end
     end
-    -- Sortable column headers: the header controls exist in the dialog XML;
-    -- clicking one selects that column (Mode cycles Mode/Proto/Lock).
-    if ui_events.WINDOW_LBUTTON_DOWN then
+    -- Sortable column headers: clicking a header button selects that column
+    -- (Mode cycles Mode/Proto/Lock).
+    if ui_events.BUTTON_CLICKED then
         local function header_cb(ctrl, name, fn)
             if not ctrl then return end
-            self:Register(ctrl, name)
-            self:AddCallback(name, ui_events.WINDOW_LBUTTON_DOWN, fn, self)
+            self:AddCallback(name, ui_events.BUTTON_CLICKED, fn, self)
         end
-        header_cb(self.col_name, "col_name", self.OnSortName)
-        header_cb(self.col_map, "col_map", self.OnSortMap)
-        header_cb(self.col_players, "col_players", self.OnSortPlayers)
-        header_cb(self.col_ping, "col_ping", self.OnSortPing)
-        header_cb(self.col_mode, "col_mode", self.OnSortMode)
+        header_cb(self.col_name, "btn_col_name", self.OnSortName)
+        header_cb(self.col_map, "btn_col_map", self.OnSortMap)
+        header_cb(self.col_players, "btn_col_players", self.OnSortPlayers)
+        header_cb(self.col_ping, "btn_col_ping", self.OnSortPing)
+        header_cb(self.col_mode, "btn_col_mode", self.OnSortMode)
     end
 end
 

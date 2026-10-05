@@ -372,18 +372,75 @@ local function destroy_panels()
 end
 
 -- ============================================================
--- Faction relations (configs/zone_faction_relations.ltx)
+-- Faction relations (configs/mod_system_zone_faction_relations.ltx)
 -- section [faction_relations]: faction = other:value, other:value, ...
--- Missing file / unreadable row => all neutral.
+-- The file ships with the DLTX-style mod_system_* name so the engine merges
+-- it into system_ini. When the merge is absent (older engine or missing FS
+-- cache entry), the file is parsed directly; engine path aliases work with
+-- io.open. Missing file / unreadable row => all neutral.
 -- ============================================================
 
+local RELATIONS_SEC = "faction_relations"
+local RELATIONS_PATH = "$game_config$\\mod_system_zone_faction_relations.ltx"
+local RELATIONS_RETRY_MS = 15000
+
 local relation_cache = {}
+-- Whole parsed file table (faction -> { other -> value }); nil = not loaded.
+local relations_file = nil
+local relations_file_retry_at = 0
 
 local function normalize_faction(f)
     f = tostring(f or ""):lower()
     f = f:gsub("^%s+", ""):gsub("%s+$", "")
     if f:sub(1, 6) == "actor_" then f = f:sub(7) end
     return f
+end
+
+local function parse_relation_payload(raw, map)
+    if type(raw) ~= "string" or raw == "" then return end
+    for token in string.gmatch(raw, "([^,]+)") do
+        local name, val = string.match(token, "^%s*([%w_]+)%s*:%s*(-?%d+)%s*$")
+        if name and val then
+            map[normalize_faction(name)] = tonumber(val) or 0
+        end
+    end
+end
+
+-- Direct file fallback. Returns faction -> relation table, or nil when the
+-- file is missing/unreadable. Comments, blank lines and other sections are
+-- ignored; the prefix match on the first non-space character skips them.
+local function load_relations_file()
+    local ok_open, file = pcall(io.open, RELATIONS_PATH, "r")
+    if not ok_open or not file then return nil end
+    local parsed = {}
+    local ok_read = pcall(function()
+        local in_section = false
+        for line in file:lines() do
+            local head = line:match("^%s*(.)")
+            if head == ";" or head == "#" or head == nil then
+                -- comment or blank line
+            else
+                local sec = line:match("^%s*%[([^%]]+)%]")
+                if sec then
+                    in_section = (sec:lower() == RELATIONS_SEC)
+                elseif in_section then
+                    local key, val = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+                    if key and val then
+                        key = normalize_faction(key)
+                        local map = parsed[key]
+                        if not map then
+                            map = {}
+                            parsed[key] = map
+                        end
+                        parse_relation_payload(val, map)
+                    end
+                end
+            end
+        end
+    end)
+    pcall(function() file:close() end)
+    if not ok_read then return nil end
+    return parsed
 end
 
 local function current_local_faction()
@@ -404,27 +461,43 @@ end
 
 local function load_relation_row(faction)
     if faction == "" then return {} end
-    local cached = relation_cache[faction]
     local now = 0
     pcall(function() now = time_global() end)
-    -- Retry an empty (missing-file) row every 15 s so a late config is picked up.
-    if cached and (next(cached.map) ~= nil or (now - cached.t) < 15000) then
+    -- Retry an empty (missing-config) row every 15 s so a late file is picked up.
+    local cached = relation_cache[faction]
+    if cached and (next(cached.map) ~= nil or (now - cached.t) < RELATIONS_RETRY_MS) then
         return cached.map
     end
-    local map = {}
+
+    local map = nil
+
+    -- Preferred source: system_ini, which the engine populates when the
+    -- mod_system_* override is merged.
     pcall(function()
         local ini = system_ini()
         if not ini or not ini.section_exist then return end
-        if not ini:section_exist("faction_relations") then return end
-        local raw = ini:r_string("faction_relations", faction)
+        if not ini:section_exist(RELATIONS_SEC) then return end
+        local raw = ini:r_string(RELATIONS_SEC, faction)
         if type(raw) ~= "string" or raw == "" then return end
-        for token in string.gmatch(raw, "([^,]+)") do
-            local name, val = string.match(token, "^%s*([%w_]+)%s*:%s*(-?%d+)%s*$")
-            if name and val then
-                map[normalize_faction(name)] = tonumber(val) or 0
+        map = {}
+        parse_relation_payload(raw, map)
+    end)
+
+    -- Fallback: parse the file directly. Cache it; while it is missing, do not
+    -- touch the disk more than once per RELATIONS_RETRY_MS.
+    if map == nil then
+        if relations_file == nil and now >= relations_file_retry_at then
+            relations_file = load_relations_file()
+            if relations_file == nil then
+                relations_file_retry_at = now + RELATIONS_RETRY_MS
             end
         end
-    end)
+        if relations_file ~= nil then
+            map = relations_file[faction] or {}
+        end
+    end
+
+    if map == nil then map = {} end
     relation_cache[faction] = { map = map, t = now }
     return map
 end

@@ -46,6 +46,12 @@ static bool FileExists(const std::wstring& path)
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+static bool DirectoryExists(const std::wstring& path)
+{
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
 static std::wstring GetFullPath(const std::wstring& relPath);
 
 static void EnsureDir(const std::wstring& dir)
@@ -72,9 +78,17 @@ static void EnsureDir(const std::wstring& dir)
     CreateDirectoryW(dir.c_str(), nullptr);
 }
 
+// Complete pre-launch asset manifest. Keep this list in sync with MOD_FILES in
+// zone-client/tools/generate_embedded_assets.py (the DLL-side embedded-asset
+// manifest used by AssetProvisioner::EnsureAssets). If a file is added or
+// removed in one list, do the same in the other.
 static const wchar_t* kProvisionedFiles[] = {
     L"gamedata\\configs\\mod_system_zone_online.ltx",
+    L"gamedata\\configs\\system.ltx_patch.ltx",
+    L"gamedata\\configs\\mod_system_zone_faction_relations.ltx",
     L"gamedata\\configs\\ui\\zone_ui_server_list.xml",
+    L"gamedata\\configs\\ui\\ui_mm_zone_peer_faction.xml",
+    L"gamedata\\configs\\ui\\zone_ui_chat.xml",
     L"gamedata\\configs\\text\\eng\\ui_zone.xml",
     L"gamedata\\configs\\text\\rus\\ui_zone.xml",
     L"gamedata\\scripts\\modxml_zone_main_menu.script",
@@ -82,6 +96,7 @@ static const wchar_t* kProvisionedFiles[] = {
     L"gamedata\\scripts\\zone_net.script",
     L"gamedata\\scripts\\zone_main.script",
     L"gamedata\\scripts\\zone_ui_server_list.script",
+    L"gamedata\\scripts\\zone_ui_peer_faction.script",
     L"gamedata\\scripts\\zone_ai_proxy.script",
     L"gamedata\\scripts\\zone_dummy.script",
     L"gamedata\\scripts\\zone_hud.script",
@@ -90,6 +105,42 @@ static const wchar_t* kProvisionedFiles[] = {
 };
 static const size_t kProvisionedFileCount = sizeof(kProvisionedFiles) / sizeof(kProvisionedFiles[0]);
 
+// Locate the source gamedata directory shipped next to the injector (dist
+// layout: dist/zone-online-vX.Y.Z/{client,gamedata}). Probes in order and
+// stops at the first candidate that holds a gamedata directory or an
+// fsgame.ltx marker.
+static std::wstring FindSourceGamedata(const std::wstring& injDir)
+{
+    const std::wstring candidates[] = {
+        injDir + L"\\gamedata\\",
+        injDir + L"\\..\\gamedata\\",
+        injDir + L"\\..\\..\\gamedata\\",
+        injDir + L"\\..\\..\\..\\gamedata\\",
+    };
+
+    for (const auto& cand : candidates)
+    {
+        const std::wstring full = GetFullPath(cand);
+        const bool hasGamedata = DirectoryExists(full);
+        const bool hasFsgame = FileExists(GetFullPath(cand + L"..\\fsgame.ltx"));
+        std::wcout << L"[*] Asset source probe: " << full
+                   << (hasGamedata ? L" [gamedata dir found]"
+                                   : (hasFsgame ? L" [fsgame.ltx found]" : L" [not found]"))
+                   << L"\n";
+        if (hasGamedata || hasFsgame)
+        {
+            return full;
+        }
+    }
+    return L"";
+}
+
+// Pre-provision the mod's gamedata assets before launching the game.
+//
+// NOTE: this runs only for --launch. In --wait/--pid mode the engine is
+// already running and has cached its filesystem mounts (fsgame.ltx), so any
+// file copied now would not be seen until the game is restarted. We document
+// that here and deliberately do not attempt a live filesystem rescan.
 static void PreProvisionAssets(const std::wstring& gameRoot, const std::wstring& injectorDir)
 {
     if (gameRoot.empty())
@@ -112,28 +163,22 @@ static void PreProvisionAssets(const std::wstring& gameRoot, const std::wstring&
     {
         return;
     }
-    const std::wstring kProbe = L"configs\\ui\\zone_ui_server_list.xml";
-    std::wstring srcBase;
-    const std::wstring kCand0 = injDir + L"\\..\\..\\gamedata\\";
-    const std::wstring kCand1 = injDir + L"\\..\\..\\..\\gamedata\\";
-    if (FileExists(GetFullPath(kCand0 + kProbe)))
-    {
-        srcBase = GetFullPath(kCand0);
-    }
-    else if (FileExists(GetFullPath(kCand1 + kProbe)))
-    {
-        srcBase = GetFullPath(kCand1);
-    }
+
+    std::wstring srcBase = FindSourceGamedata(injDir);
     if (srcBase.empty())
     {
         std::wcout << L"[*] Asset pre-provision skipped (no source gamedata found).\n";
         return;
     }
-    if (!srcBase.empty() && srcBase.back() != L'\\' && srcBase.back() != L'/')
+    if (srcBase.back() != L'\\' && srcBase.back() != L'/')
     {
         srcBase += L"\\";
     }
+    std::wcout << L"[*] Provisioning from: " << srcBase << L"\n";
+
     int copied = 0;
+    int skipped = 0;
+    int failed = 0;
     for (size_t i = 0; i < kProvisionedFileCount; ++i)
     {
         std::wstring relW(kProvisionedFiles[i]);
@@ -152,13 +197,26 @@ static void PreProvisionAssets(const std::wstring& gameRoot, const std::wstring&
         if (CopyFileW(src.c_str(), dst.c_str(), FALSE))
         {
             ++copied;
+            std::wcout << L"[+] Provisioned: " << relW << L"\n";
         }
         else
         {
-            std::wcout << L"[!] Pre-provision copy failed: " << src << L" -> " << dst << L" (error " << GetLastError() << L")\n";
+            DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            {
+                ++skipped;
+                std::wcout << L"[=] Skipped (source missing): " << relW << L"\n";
+            }
+            else
+            {
+                ++failed;
+                std::wcout << L"[!] Pre-provision copy failed: " << src << L" -> " << dst
+                           << L" (error " << err << L")\n";
+            }
         }
     }
-    std::wcout << L"[*] Asset pre-provision copied " << copied << L" files.\n";
+    std::wcout << L"[*] Asset pre-provision: " << copied << L" provisioned, "
+               << skipped << L" skipped, " << failed << L" failed.\n";
 }
 
 static int PurgeProvisionedFiles(const std::wstring& gameRoot)
@@ -263,6 +321,78 @@ static std::wstring DefaultDllPath()
     }
     path += L"\\ZoneClient.dll";
     return GetFullPath(path);
+}
+
+// ---------------------------------------------------------------------------
+// Utility: resolve the target process image directory
+// ---------------------------------------------------------------------------
+static std::wstring GetProcessImageDir(HANDLE hProcess)
+{
+    wchar_t buf[32768] = {};
+    DWORD size = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!QueryFullProcessImageNameW(hProcess, 0, buf, &size) || size == 0)
+    {
+        return L"";
+    }
+    std::wstring path(buf, size);
+    size_t lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash == std::wstring::npos)
+    {
+        return L"";
+    }
+    return path.substr(0, lastSlash);
+}
+
+static bool PathsEqualNoCase(const std::wstring& a, const std::wstring& b)
+{
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Deploy ZoneClient.dll next to the target game executable.
+//
+// zone_net.script resolves the DLL with ffi.load("ZoneClient"), i.e. plain
+// LoadLibrary search, whose first hit is the game exe directory. The injector
+// therefore stages a copy as <exeDir>\ZoneClient.dll and injects THAT path.
+// Returns the path to inject: the staged copy on success, the original path
+// (with a warning) when staging fails.
+// ---------------------------------------------------------------------------
+static std::wstring DeployDllBesideTarget(HANDLE hProcess, const std::wstring& rawDllPath)
+{
+    std::wstring dllPath = GetFullPath(rawDllPath);
+    if (!FileExists(dllPath))
+    {
+        return dllPath; // InjectDLL reports the missing DLL.
+    }
+
+    const std::wstring exeDir = GetProcessImageDir(hProcess);
+    if (exeDir.empty())
+    {
+        std::wcout << L"[!] Could not resolve target image directory; injecting original DLL path.\n"
+                   << L"    ffi.load(\"ZoneClient\") may fail: Connect needs ZoneClient.dll next to the game exe.\n";
+        return dllPath;
+    }
+
+    const std::wstring stagedPath = exeDir + L"\\ZoneClient.dll";
+    if (PathsEqualNoCase(stagedPath, dllPath))
+    {
+        std::wcout << L"[*] DLL already next to target exe: " << stagedPath << L"\n";
+        return dllPath;
+    }
+
+    // Overwrite unconditionally: the copy next to the exe must match this
+    // injector build; a stale DLL there is the common Connect-fails cause.
+    if (CopyFileW(dllPath.c_str(), stagedPath.c_str(), TRUE))
+    {
+        std::wcout << L"[*] Deployed DLL next to target exe: " << stagedPath << L"\n";
+        return stagedPath;
+    }
+
+    DWORD err = GetLastError();
+    std::wcout << L"[!] WARNING: failed to copy DLL to " << stagedPath << L" (error " << err << L").\n"
+               << L"    Injecting the original path instead. ffi.load(\"ZoneClient\") may fail and Connect will not work\n"
+               << L"    until ZoneClient.dll can be placed next to the game executable.\n";
+    return dllPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,42 +515,10 @@ static bool TargetHasMainWindow(DWORD pid)
     return state.found;
 }
 
-static bool ModuleNameIndicatesEngineReady(const std::wstring& baseName)
-{
-    std::wstring lower = baseName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-    return (lower.find(L"lua") != std::wstring::npos); // covers lua51.dll, luajit, lua5.1
-}
-
-static bool TargetHasEngineModules(HANDLE hProcess)
-{
-    HMODULE mods[512] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(hProcess, mods, sizeof(mods), &needed))
-    {
-        return false;
-    }
-    size_t count = needed / sizeof(HMODULE);
-    if (count > 512)
-    {
-        count = 512;
-    }
-    wchar_t name[MAX_PATH] = {};
-    for (size_t i = 0; i < count; ++i)
-    {
-        if (GetModuleBaseNameW(hProcess, mods[i], name, MAX_PATH) > 0)
-        {
-            if (ModuleNameIndicatesEngineReady(name))
-            {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Bounded readiness gate: poll for LuaJIT/lua51 module presence OR a visible
-// main window (engine init) instead of a fixed Sleep. Times out gracefully.
+// Bounded readiness gate. xray-monolith links LuaJIT statically, so there is
+// no LuaJIT.dll / lua51.dll module to detect at runtime; module-name heuristics
+// are useless here. Poll for a visible main window (engine init) instead, and
+// proceed after the timeout with a clear log line rather than blocking forever.
 static void WaitForTargetReady(HANDLE hProcess)
 {
     const DWORD kTimeoutMs = 30000;
@@ -430,7 +528,7 @@ static void WaitForTargetReady(HANDLE hProcess)
     DWORD elapsed = 0;
     while (elapsed < kTimeoutMs)
     {
-        if (TargetHasEngineModules(hProcess) || TargetHasMainWindow(pid))
+        if (TargetHasMainWindow(pid))
         {
             return;
         }
@@ -439,7 +537,7 @@ static void WaitForTargetReady(HANDLE hProcess)
     }
 
     std::wcout << L"[*] Engine-readiness wait timed out after " << (kTimeoutMs / 1000)
-               << L"s (no LuaJIT/lua51 module or main window observed); proceeding with injection anyway.\n";
+               << L"s (no main window observed yet); proceeding with injection anyway.\n";
     OutputDebugStringW(L"[Injector] Engine-readiness gate timed out; proceeding.\n");
 }
 
@@ -467,8 +565,12 @@ static bool InjectDLL(HANDLE hProcess, const std::wstring& rawDllPath)
         }
     }
 
-    // (b) Readiness gate: bounded poll for LuaJIT/lua51 or main-window/engine
-    // init instead of a fixed Sleep. Runs before any remote allocation/thread.
+    // (b) Stage the DLL next to the target exe so ffi.load("ZoneClient")
+    // resolves it via the LoadLibrary exe-directory search.
+    dllPath = DeployDllBesideTarget(hProcess, dllPath);
+
+    // (c) Readiness gate: bounded poll for a main window instead of a fixed
+    // Sleep. Runs before any remote allocation/thread.
     WaitForTargetReady(hProcess);
 
     const size_t pathBytes = (dllPath.length() + 1) * sizeof(wchar_t);
@@ -587,19 +689,19 @@ static int ModeWait(const std::wstring& dllPath)
     const std::vector<std::wstring> targetExes = {
         L"AnomalyDX11.exe",
         L"AnomalyDX11AVX.exe",
-        L"VerifiedDX11.exe",
         L"AnomalyDX10.exe",
         L"AnomalyDX10AVX.exe",
         L"AnomalyDX9.exe",
         L"AnomalyDX9AVX.exe",
-        L"VerifiedDX9.exe",
         L"AnomalyDX8.exe",
         L"AnomalyDX8AVX.exe",
         L"xrEngine.exe"
     };
 
     std::wcout << L"[*] Mode: WAIT - polling for Anomaly processes...\n";
-    std::wcout << L"    Monitored targets: AnomalyDX11.exe, AnomalyDX11AVX.exe, VerifiedDX11.exe, xrEngine.exe\n";
+    std::wcout << L"    Monitored targets: AnomalyDX11.exe, AnomalyDX11AVX.exe, AnomalyDX10.exe, "
+                  L"AnomalyDX10AVX.exe, AnomalyDX9.exe, AnomalyDX9AVX.exe, AnomalyDX8.exe, "
+                  L"AnomalyDX8AVX.exe, xrEngine.exe\n";
     std::wcout << L"    Press Ctrl+C to cancel.\n\n";
 
     DWORD pid = 0;
@@ -624,7 +726,7 @@ static int ModeWait(const std::wstring& dllPath)
 
     std::wcout << L"[+] Detected target process: " << foundExe << L" (PID: " << pid << L")\n";
     std::wcout << L"[*] Waiting for engine readiness (bounded gate inside InjectDLL)...\n";
-    // No fixed Sleep here; InjectDLL polls for LuaJIT/lua51 or main window.
+    // No fixed Sleep here; InjectDLL polls for the main window.
 
     std::wcout << L"[*] Injecting " << dllPath << L" into PID " << pid << L"...\n";
     if (InjectDLL(pid, dllPath))
@@ -750,7 +852,7 @@ static int ModeLaunch(const std::wstring& rawExePath,
 
     std::wcout << L"[*] Waiting for game engine initialization...\n";
     WaitForInputIdle(pi.hProcess, 5000); // best-effort precursor only; bounded readiness gate runs inside InjectDLL
-    // No fixed Sleep(2000) here; InjectDLL polls for LuaJIT/lua51 or main window.
+    // No fixed Sleep(2000) here; InjectDLL polls for the main window.
 
     // Verify process is still alive before attempting injection
     DWORD procExitCode = 0;

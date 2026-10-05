@@ -25,7 +25,7 @@ local packet_locked = false
 local auth_locked = false
 local enforced = false
 local safe_zone_id = ""
-local weapon_hidden = false
+local weapon_hidden_by_us = false
 
 local POLL_INTERVAL_MS = 1000
 local last_poll = 0
@@ -36,6 +36,7 @@ local BLOCKED = {}
 local BIND_NAMES = {
     "kWPN_FIRE",    -- fire
     "kWPN_FUNC",    -- under-barrel / grenade launcher fire
+    "kCUSTOM21",    -- UBGL toggle (key_bindings enum; lua_help.script:520)
     "kGRENADE",     -- grenade throw (modded/legacy bind names)
     "kTHROW_GRENADE",
     "kQUICK_USE_1", -- quick slots (grenades/bolts)
@@ -179,8 +180,8 @@ end
 local function actor_weapon_lowered()
     local lowered = false
     pcall(function()
-        if level and level.actor_weapon_lowered then
-            lowered = level.actor_weapon_lowered() and true or false
+        if game and game.actor_weapon_lowered then
+            lowered = game.actor_weapon_lowered() and true or false
         end
     end)
     return lowered
@@ -190,44 +191,48 @@ local function set_weapon_locked(locked)
     -- Never touch Actor() when no actor exists (menu / net_destroy / level
     -- change): the engine binding dereferences Actor() without a null check.
     if not (db and db.actor) then
-        if not locked then weapon_hidden = false end
+        weapon_hidden_by_us = false
         return
     end
-    -- level.actor_lower_weapon / level.actor_weapon_lowered are the real
-    -- engine bindings (level_script.cpp:2843-2844 registered into the "level"
-    -- table at level_script.cpp:2486). There is no level.actor_set_safemode,
-    -- no game.actor_lower_weapon and no game.actor_weapon_lowered.
+    -- game.actor_lower_weapon / game.actor_weapon_lowered are the real
+    -- engine bindings (level_script.cpp:2843-2844, registered into
+    -- module(L, "game") opened at level_script.cpp:2778). There is no
+    -- level.actor_lower_weapon and no level.actor_set_safemode.
     pcall(function()
-        if level and level.actor_lower_weapon then
-            level.actor_lower_weapon(locked and true or false)
+        if game and game.actor_lower_weapon then
+            game.actor_lower_weapon(locked and true or false)
         end
     end)
 
     if locked then
+        -- Safemode is refused for weapons whose m_bCanBeLowered is false
+        -- (level_script.cpp:2100-2109), so hide_weapon stays as a last resort.
+        -- Re-evaluated on every tick by enforce_weapon_lock instead of being
+        -- trusted as a permanent flag; the flag below only records ownership
+        -- so exit never restores a weapon another system hid.
         if not actor_weapon_lowered() then
             pcall(function() db.actor:hide_weapon() end)
-            weapon_hidden = true
+            weapon_hidden_by_us = true
         end
-    elseif weapon_hidden then
+    elseif weapon_hidden_by_us then
         pcall(function() db.actor:restore_weapon() end)
-        weapon_hidden = false
+        weapon_hidden_by_us = false
     end
 end
 
 -- Re-holster enforcement: the engine clears safemode on weapon actions
 -- (Weapon.cpp:3195-3196, WeaponMagazined.cpp:1191), so a 1 Hz reconcile plus
--- the actor_on_changed_slot hook (Inventory.cpp:872, forwarded by
--- callbacks_gameobject.script:224-227) keeps the weapon down/hidden.
+-- the actor_item_to_slot hook (bind_stalker_ext.script:381-393 forwards it as
+-- SendScriptCallback("actor_item_to_slot", obj)) keeps the weapon down/hidden.
+-- Re-runs unconditionally while enforced so a stale hide/recover state is
+-- corrected on the next tick.
 local function enforce_weapon_lock()
     if not enforced then return end
-    if weapon_hidden then return end
     if not (db and db.actor) then return end
-    if not actor_weapon_lowered() then
-        set_weapon_locked(true)
-    end
+    set_weapon_locked(true)
 end
 
-local function on_actor_changed_slot(new_slot, new_obj, prev_slot, prev_obj)
+local function on_actor_item_to_slot(obj)
     pcall(function()
         if enforced then set_weapon_locked(true) end
     end)
@@ -239,14 +244,35 @@ end
 -- a safe zone, otherwise chain-calls the original pcall-wrapped.
 local combat_ignore_hooked = false
 local orig_combat_is_enemy = nil
+local installed_combat_wrapper = nil
+local combat_ignore_reinstall_count = 0
+local combat_ignore_reinstall_logged = false
+local COMBAT_IGNORE_REINSTALL_CAP = 16
 
 local function install_combat_ignore_hook()
-    if combat_ignore_hooked then return end
     if type(xr_combat_ignore) ~= "table" then return end
-    local orig = xr_combat_ignore.is_enemy
-    if type(orig) ~= "function" then return end
-    orig_combat_is_enemy = orig
-    xr_combat_ignore.is_enemy = function(obj, enemy, no_memory)
+    local current = xr_combat_ignore.is_enemy
+
+    if combat_ignore_hooked then
+        -- Another script may re-assign is_enemy after startup (load order /
+        -- hot reload). Re-install our wrapper when it is gone; bounded retries
+        -- and a single log line so a script that re-wraps every tick cannot
+        -- cause an endless wrap/log ping-pong.
+        if current == installed_combat_wrapper then return end
+        if type(orig_combat_is_enemy) ~= "function" then return end
+        if combat_ignore_reinstall_count >= COMBAT_IGNORE_REINSTALL_CAP then return end
+        combat_ignore_reinstall_count = combat_ignore_reinstall_count + 1
+        xr_combat_ignore.is_enemy = installed_combat_wrapper
+        if not combat_ignore_reinstall_logged then
+            combat_ignore_reinstall_logged = true
+            printf("[zone_safezone] xr_combat_ignore.is_enemy was replaced; wrapper re-installed")
+        end
+        return
+    end
+
+    if type(current) ~= "function" then return end
+    orig_combat_is_enemy = current
+    installed_combat_wrapper = function(obj, enemy, no_memory)
         local ok_zone, blocked = pcall(safezone_pair_blocked, obj, enemy)
         if ok_zone and blocked then return false end
         local ok, result = pcall(orig_combat_is_enemy, obj, enemy, no_memory)
@@ -255,6 +281,7 @@ local function install_combat_ignore_hook()
         -- fall back to the engine default (hostile).
         return true
     end
+    xr_combat_ignore.is_enemy = installed_combat_wrapper
     combat_ignore_hooked = true
 end
 
@@ -320,6 +347,19 @@ end
 local function apply_enter()
     pcall(install_fire_hook)
     pcall(function() set_weapon_locked(true) end)
+    -- Release a possibly-held fire key so the engine does not keep firing
+    -- while the zone lock is being applied. level.release_action is the
+    -- "level" module binding (level_script.cpp:2662; impl 1201-1207) and
+    -- bind_to_dik maps a key_bindings action to its DIK (returns 0 unbound,
+    -- key_binding_registrator_script.cpp:9-12,26; xr_level_controller.cpp:447-465).
+    pcall(function()
+        if level and level.release_action and bind_to_dik and key_bindings then
+            local dik = bind_to_dik(key_bindings.kWPN_FIRE)
+            if dik ~= nil and dik ~= 0 then
+                level.release_action(dik)
+            end
+        end
+    end)
     notify_hud(true)
 end
 
@@ -391,8 +431,13 @@ end
 
 -- Hard damage cancel when either the victim or (for direct hits) the
 -- draftsman is inside a safe zone, in addition to zeroing the power.
-local function on_before_hit(victim, s_hit, bone_id, flags)
-    if not victim or not s_hit then return end
+-- Actor hits dispatch WITHOUT a victim (CActor__BeforeHitCallback,
+-- _g.script:1221-1238, sends shit/bone_id/flags only), while NPC/monster
+-- hits prepend the victim (_g.script:1243-1254). A single shared handler
+-- therefore never matched the actor path and the pcall swallowed the error,
+-- so actor immunity silently never applied. Separate registrations below.
+local function apply_hit_block(victim, s_hit, bone_id, flags)
+    if not s_hit then return end
     pcall(function()
         local draftsman = nil
         pcall(function() draftsman = s_hit.draftsman end)
@@ -410,6 +455,18 @@ local function on_before_hit(victim, s_hit, bone_id, flags)
             flags.override = true
         end
     end)
+end
+
+local function on_actor_before_hit(s_hit, bone_id, flags)
+    apply_hit_block(db and db.actor or nil, s_hit, bone_id, flags)
+end
+
+local function on_npc_before_hit(obj, s_hit, bone_id, flags)
+    apply_hit_block(obj, s_hit, bone_id, flags)
+end
+
+local function on_monster_before_hit(obj, s_hit, bone_id, flags)
+    apply_hit_block(obj, s_hit, bone_id, flags)
 end
 
 -- Cheap guard: while the Zone chat edit box is capturing text, do not treat
@@ -483,15 +540,15 @@ function on_game_start()
         end)
     end
 
-    reg("actor_on_before_hit", on_before_hit)
-    reg("npc_on_before_hit", on_before_hit)
-    reg("monster_on_before_hit", on_before_hit)
+    reg("actor_on_before_hit", on_actor_before_hit)
+    reg("npc_on_before_hit", on_npc_before_hit)
+    reg("monster_on_before_hit", on_monster_before_hit)
     reg("on_level_changing", on_level_changing)
     reg("actor_on_net_destroy", reset)
     reg("on_before_key_press", on_before_key_press)
     reg("on_before_key_hold", on_before_key_hold)
     reg("actor_on_update", on_actor_update)
     reg("on_enemy_eval", on_enemy_eval)
-    reg("actor_on_changed_slot", on_actor_changed_slot)
+    reg("actor_item_to_slot", on_actor_item_to_slot)
     reg("monster_on_net_spawn", on_monster_net_spawn)
 end

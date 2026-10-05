@@ -107,7 +107,7 @@ function on_ai_action(pkt, offset)
     if obj then
         if action == 4 then -- DEATH
             if obj:alive() then
-                obj:kill(obj)
+                obj:kill(obj, false)
             end
             -- Delay release
             local release_time = time_global() + 5000

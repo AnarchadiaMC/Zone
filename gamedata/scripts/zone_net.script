@@ -71,6 +71,9 @@ local function parse_server_query_response(raw)
     return info
 end
 
+-- ZN_PollEvent contract: `buf` is a caller-owned buffer with a capacity fixed
+-- at 1500 bytes (enforced by the DLL); `len` is out-only - the DLL writes the
+-- byte count, callers must not pre-seed it. g_poll_buf stays 1500 bytes.
 ffi.cdef[[
     typedef union { float f; uint8_t b[4]; } znet_float_cast;
     void ZN_Connect(const char* ip, double port, const char* uuid, double hwid, const char* nick);
@@ -650,7 +653,7 @@ end
 
 local function apply_spawn_position(x, y, z)
     if not (db and db.actor) then return false end
-    local ok = pcall(function() db.actor:set_actor_position(vector():set(x, y, z)) end)
+    local ok = pcall(function() db.actor:set_actor_position(vector():set(x, y, z), false, false) end)
     if not ok then
         ok = pcall(function() db.actor:set_npc_position(vector():set(x, y, z)) end)
     end

@@ -92,17 +92,13 @@ function on_main_menu_init(menu)
     if not menu then return end
     install_methods()
     menu:AddCallback("btn_zone_online", ui_events.BUTTON_CLICKED, mm_class.OnButton_zone_online_clicked, menu)
-    if menu.shniaga then
-        local ok_zone, zone_connected = pcall(function() return ZoneNet and ZoneNet:IsConnected() end)
-        local in_game = false
-        pcall(function() in_game = level.present() end)
-        if ok_zone and zone_connected and in_game then
-            pcall(function() menu.shniaga:SetButtonDisabled("btn_save", true) end)
-            pcall(function() menu.shniaga:SetButtonDisabled("btn_load", true) end)
-        end
-        pcall(function() return _G.XrrNet and _G.XrrNet():IsConnected() end)
-        pcall(function() return _G.XrrIsClient and _G.XrrIsClient() end)
-    end
+    -- Save/load blocking while a session is live is handled by the input veto
+    -- path (see the save/load handling used elsewhere). The former
+    -- menu.shniaga:SetButtonDisabled("btn_save"/"btn_load") calls were removed:
+    -- shniaga has no SetButtonDisabled method in this engine build, so the
+    -- buttons stay enabled and the pcall was silently dead.
+    pcall(function() return _G.XrrNet and _G.XrrNet():IsConnected() end)
+    pcall(function() return _G.XrrIsClient and _G.XrrIsClient() end)
     if type(_prev_global_on_main_menu_init) == "function" and _prev_global_on_main_menu_init ~= on_main_menu_init then
         pcall(_prev_global_on_main_menu_init, menu)
     end

@@ -41,7 +41,11 @@ local function get_latest_sample(proxy)
     return get_history_sample(proxy, proxy.hist_count)
 end
 
--- Resolve entity by ID (attacker lookup: db.actor, remote proxy, or level entity) (L-18)
+-- Resolve entity by ID (attacker lookup: db.actor or remote proxy). Wire IDs
+-- are server-side entity IDs, not local engine IDs: for arbitrary IDs a direct
+-- level.object_by_id(id) lookup is wrong (u16 engine-ID overload fed a wire
+-- u32) and is intentionally skipped; only a spawned proxy's own local
+-- game_id/se_id may be resolved. (L-18)
 local function resolve_entity(id)
     if not id then return nil end
     -- Never touch xrRazom co-op dummies (guarded; absent when co-op not installed).
@@ -59,10 +63,6 @@ local function resolve_entity(id)
             local obj = level.object_by_id(gid)
             if obj then return obj end
         end
-    end
-    if level and level.object_by_id then
-        local obj = level.object_by_id(id)
-        if obj then return obj end
     end
     return nil
 end
@@ -86,7 +86,7 @@ local function try_apply_visual(proxy, obj)
         visual = DEFAULT_PROXY_VISUAL
     end
     local current = nil
-    pcall(function() current = obj:visual() end)
+    pcall(function() current = obj:get_visual_name() end)
     if current and current ~= "" and current == visual then
         proxy.visual_applied = true
         return
@@ -277,7 +277,7 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
         if health <= 0 and obj:alive() then
             -- L-18: Attribute killer to actual attacker entity instead of self
             local killer_obj = resolve_entity(proxy.last_attacker_id) or obj
-            obj:kill(killer_obj)
+            obj:kill(killer_obj, false)
         end
     end
 end
@@ -584,7 +584,7 @@ function on_damage_notify(target_id, attacker_id, damage, bone_id)
         if obj and obj:alive() then
             -- L-18: Attribute killer to actual attacker entity instead of self
             local killer_obj = resolve_entity(attacker_id) or obj
-            obj:kill(killer_obj)
+            obj:kill(killer_obj, false)
         end
     end
 end

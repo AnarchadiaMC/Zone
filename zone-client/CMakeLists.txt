@@ -4,6 +4,11 @@ project(ZoneClient LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Statically link the MSVC C runtime so ZoneClient.dll and the injector run on
+# machines without the Visual C++ redistributable. Must be set before any
+# target is created (VS generator + CMP0091).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_definitions(-DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -56,8 +61,6 @@ target_include_directories(minhook PUBLIC
 # ----------------------------------------------------------------------
 set(ZONE_CLIENT_SOURCES
     src/main.cpp
-    src/hook/lua_hook.cpp
-    src/hook/lua_hook.h
     src/identity/identity.cpp
     src/identity/identity.h
     src/protocol/packets.h
@@ -67,7 +70,6 @@ set(ZONE_CLIENT_SOURCES
     src/lua/zone_bindings.h
     src/provision/asset_provisioner.cpp
     src/provision/asset_provisioner.h
-    3rdparty/lua/lua_bindings.cpp
     ${GEN_CPP}
     ${GEN_H}
 )

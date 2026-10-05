@@ -11,11 +11,16 @@ import argparse
 import os
 import sys
 
+# Keep this manifest in sync with kProvisionedFiles in
+# injector/injector_main.cpp (pre-launch provisioning list). If a file is
+# added or removed in one list, do the same in the other.
 MOD_FILES = [
     "configs/mod_system_zone_online.ltx",
+    "configs/system.ltx_patch.ltx",
+    "configs/mod_system_zone_faction_relations.ltx",
     "configs/ui/zone_ui_server_list.xml",
-    "configs/ui/zone_ui_chat.xml",
     "configs/ui/ui_mm_zone_peer_faction.xml",
+    "configs/ui/zone_ui_chat.xml",
     "configs/text/eng/ui_zone.xml",
     "configs/text/rus/ui_zone.xml",
     "scripts/modxml_zone_main_menu.script",

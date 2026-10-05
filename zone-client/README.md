@@ -3,7 +3,7 @@
 `ZoneClient` is the client-side runtime layer for **Zone**, an authoritative multiplayer survival architecture for *S.T.A.L.K.E.R. Anomaly 1.5.3*.
 
 It consists of two native C++ components:
-1. **`ZoneClient.dll`**: A lightweight runtime DLL that hooks into Anomaly's engine via MinHook, initializes persistent HWID/UUID identity, provisions missing game assets, handles non-blocking binary UDP telemetry, and exposes the `ZoneNet` Lua API directly into Anomaly's LuaJIT environment.
+1. **`ZoneClient.dll`**: A lightweight runtime DLL that initializes persistent HWID/UUID identity, provisions missing game assets, handles non-blocking binary UDP telemetry, and exposes the `ZN_*` C API consumed by Anomaly's LuaJIT scripts through FFI (`ffi.load("ZoneClient")`).
 2. **`ZoneClient_Injector.exe`**: An automated launcher and injector capable of launching modified game executables and injecting `ZoneClient.dll` alongside process initialization, or running in background wait mode.
 
 ---
@@ -25,10 +25,11 @@ Unlike traditional mods that require manual file extraction, directory creation,
   - Opens a native `CUIScriptWnd` server browser dialog (`zone_ui_server_list.script` + XML) with Direct Connect (IP, Port, Callsign) and persistent Favorite Servers.
   - Renders HUD network status and safe zone alerts natively via X-Ray PDA news tips and HUD statics (`zone_hud.script`).
 
-### 3. Dynamic LuaJIT Runtime Hooking
-- Uses **MinHook** to detour `luaL_openlibs` in `LuaJIT.dll` (`src/hook/lua_hook.cpp`, compiled directly into `ZoneClient.dll` via `ZONE_CLIENT_SOURCES` in `CMakeLists.txt`).
-- Uses dynamic runtime symbol resolution via `GetProcAddress` on `LuaJIT.dll` for all Lua C API functions (`lua_push*`, `luaL_check*`, `lua_newtable`, etc.), eliminating external `.lib` file dependencies.
-- Injects the global `ZoneNet` table into `_G` exposing 8 C functions:
+### 3. LuaJIT FFI Integration (`zone_net.script`)
+- Anomaly's xray-monolith engine links LuaJIT **statically** into the game executable: there is no `LuaJIT.dll` / `lua51.dll` module at runtime, so no `luaL_openlibs` detour is possible or needed.
+- `gamedata/scripts/zone_net.script` loads the DLL with `ffi.load("ZoneClient")` and declares the `ZN_*` exports from `src/lua/zone_bindings.cpp`.
+- The injector stages `ZoneClient.dll` next to the game executable before injection so the LoadLibrary search inside `ffi.load` resolves it.
+- The FFI layer exposes the global `ZoneNet` table with these functions:
   - `ZoneNet:Connect(ip, port, uuid, hwid, nick)`
   - `ZoneNet:Disconnect()`
   - `ZoneNet:SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags)`
@@ -51,20 +52,17 @@ Unlike traditional mods that require manual file extraction, directory creation,
 ```
 zone-client/
 ├── 3rdparty/
-│   ├── lua/                # LuaJIT header definitions & dynamic function pointers
+│   ├── lua/                # LuaJIT C API headers (reference only; not compiled)
 │   └── minhook/            # MinHook source & headers (buffer, hook, trampoline, hde64)
 ├── injector/
-│   └── injector_main.cpp   # Automated launcher and Win32 remote thread injector
+│   └── injector_main.cpp   # Automated launcher, DLL staging and Win32 remote thread injector
 ├── src/
-│   ├── hook/
-│   │   ├── lua_hook.h      # Detour interface for luaL_openlibs
-│   │   └── lua_hook.cpp    # MinHook detour implementation (compiled in ZONE_CLIENT_SOURCES)
 │   ├── identity/
 │   │   ├── identity.h      # HWID (FNV-1a) & UUID v4 identity engine
-│   │   └── identity.cpp
+│   │   └── identity.cpp    # zone_identity.ltx merge writer (canonical schema)
 │   ├── lua/
-│   │   ├── zone_bindings.h # ZoneNet Lua C functions declarations
-│   │   └── zone_bindings.cpp
+│   │   ├── zone_bindings.h # ZoneNet Lua C function declarations (legacy reference)
+│   │   └── zone_bindings.cpp # 21 ZN_* FFI exports
 │   ├── net/
 │   │   ├── udp_client.h    # WinSock2 background networking thread
 │   │   └── udp_client.cpp
