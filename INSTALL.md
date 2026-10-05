@@ -32,12 +32,17 @@ GOOS=linux GOARCH=amd64 go build -o zone-server ./cmd/server
 
 ### Server Configuration (`zone_server.yaml`)
 ```yaml
-port: 27015          # UDP port to listen on
-tick_rate_hz: 30     # Game simulation tick rate
-max_players: 64      # Max concurrent stalkers
-db_path: zone_world.db
-log_level: info
+port: 27015                          # UDP port to listen on
+tick_rate_hz: 30                     # Game simulation tick rate
+max_players: 64                      # Max concurrent stalkers
+db_path: "zone_world.db"
+log_level: "info"
 emission_interval_min: 45
+admin_pipe: "\\\\.\\pipe\\zone_admin"
+server_name: "Zone Online"           # Name advertised in the server browser
+map_name: "l01_escape"               # Hosted level (only l01_escape for now)
+mode: 0                              # Server mode
+locked: false                        # true rejects new connections
 ```
 
 The server automatically initializes the embedded SQLite database (`zone_world.db`) with 7 tables and seeds all 12 canonical Zone safe zones (Rookie Village, 100 Rads Bar, Yantar Bunker, Flea Market, etc.).
@@ -96,7 +101,8 @@ The injector detects `AnomalyDX11.exe`, `AnomalyDX11AVX.exe`, `VerifiedDX11.exe`
 - **Direct Connect**: Enter the server IP address (default `127.0.0.1`), Port (`27015`), and your Callsign/Nickname, then click **Connect**.
 - **Favorite Servers**: Save your favorite servers for one-click connection. Favorites are persisted in `%APPDATA%\zone_identity.ltx`.
 - **Double-Click Connect**: Double-clicking any server in your favorites list connects immediately.
-- **Status footer flow (dialog stays open)**: After **Connect**, the browser does NOT auto-close. The footer shows `Status: Connecting to <ip>:<port>...`, then polls `ZoneNet:IsConnected()` (~2 Hz in `zone_ui_server_list.script:Update()`): `Connected to <ip>:<port> - start or load a game` on handshake success, or `Failed - server unreachable, see xray log` after ~16s (matches the DLL 15s/5-try budget in `udp_client.cpp`). Close via **Back** once Connected, then start/load a game.
+- **Status footer flow (dialog stays open)**: After **Connect**, the browser does NOT auto-close. The footer shows `Status: Connecting to <ip>:<port>...`, then polls `ZoneNet:IsConnected()` (~2 Hz in `zone_ui_server_list.script:Update()`): `Connected to <ip>:<port>` on handshake success, or `Failed - server unreachable, see xray log` after ~16s (matches the DLL 15s/5-try budget in `udp_client.cpp`). The browser stays open only while the handshake is pending.
+- **Seamless join (no manual singleplayer load)**: Once connected, a new account receives `SHOW_START` (`0x0071`) and the native faction/loadout dialog opens automatically; a returning account goes straight to its saved spawn. Pick a faction and loadout and click **Start**: the server creates the character and starter inventory in SQLite, then the client starts `l01_escape`, applies the server faction/spawn, and materializes the synced inventory. Only `l01_escape` is hosted for now; arbitrary level loading is tracked in ROADMAP.md.
 - **DLL must be injected first**: The browser gates Connect on `zone_net.is_client_loaded()` (`ffi.load("ZoneClient")` in `zone_net.script`). If `ZoneClient.dll` is not injected, Connect aborts with `DLL missing - inject ZoneClient first`. Always inject (Option A `--launch` or Option B `--wait`) before opening the Zone menu.
 - **Mutual exclusion with xrRazom co-op**: Zone refuses to connect while an xrRazom co-op session is active (`XrrNet():IsConnected()/IsListening()` or `XrrIsConnected()/XrrIsHosted()` in `zone_ui_server_list.script:OnConnect()` and `zone_net.script:on_tick()`), showing `Busy - xrRazom co-op is active`. Disconnect from co-op first; conversely, do not host/join xrRazom while a Zone session is connected. Running both proxy systems at once desyncs alife and double-spawns dummies.
 - **Stale `zone_identity.ltx.tmp` cleanup**: if you see a `zone_identity.ltx.tmp` orphan next to `zone_identity.ltx` in `%APPDATA%`, it is a harmless leftover from the old tmp-then-rename writer (the engine nils `os.remove`/`os.rename`, so that flow could never complete). Current saves write `zone_identity.ltx` directly via `io.*` only — safe to delete the `.tmp` file.
