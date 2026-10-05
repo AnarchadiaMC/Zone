@@ -6,9 +6,10 @@
 
 ## Architecture Overview
 
-Zone uses an **autonomous client injection architecture**:
-- **No Proxy DLLs**: No `dxgi.dll` or proxy loading required. No conflicts with AnomalyFSR or ReShade.
-- **Zero-Touch Asset Provisioning**: In `--launch` mode the injector pre-provisions all 19 Zone gamedata files (configs, UI layouts, scripts, localization) into the game root before the engine starts. On attach, the DLL's embedded `AssetProvisioner` also overwrites scripts, UI layouts, localization and the Zone online DLTX config (`mod_system_zone_online.ltx`) atomically to match the DLL, and writes `mod_system_zone_faction_relations.ltx` / `system.ltx_patch.ltx` only if missing so local edits survive.
+Zone uses an **autonomous client architecture** with two install paths:
+- **Proxy DLL (recommended)**: `version.dll` is a drop-in proxy for `<Anomaly>\bin\`. It forwards all 15 `VERSION.dll` exports to the system DLL and loads `ZoneClient.dll` from its own directory on startup — no `dxgi.dll` rename, no conflicts with AnomalyFSR or ReShade.
+- **Injector (alternative)**: `ZoneClient_Injector.exe` launches the game (`--launch`) or attaches to a running process (`--wait`, `--pid`) and stages `ZoneClient.dll` next to the game executable.
+- **Zero-Touch Asset Provisioning**: The release `gamedata\` tree is copied to the game root (merge) for the proxy path; in `--launch` mode the injector additionally pre-provisions all 19 Zone gamedata files (configs, UI layouts, scripts, localization) before the engine starts. On attach, the DLL's embedded `AssetProvisioner` also overwrites scripts, UI layouts, localization and the Zone online DLTX config (`mod_system_zone_online.ltx`) atomically to match the DLL, and writes `mod_system_zone_faction_relations.ltx` / `system.ltx_patch.ltx` only if missing so local edits survive.
 - **Native X-Ray UI**: A native "Zone" button appears directly on Anomaly's home screen. Clicking it opens a native S.T.A.L.K.E.R. Server Browser with direct IP connect and favorite servers list.
 - **Automated Launcher/Injector**: `ZoneClient_Injector.exe` can launch the modified EXEs and inject simultaneously, or run as a standalone injector.
 
@@ -17,6 +18,17 @@ Zone uses an **autonomous client injection architecture**:
 ## Part 1 — Dedicated Server Setup
 
 ### Windows
+Release packages ship a prebuilt `server\zone-server.exe` — no build step is needed:
+
+```bat
+cd server
+zone-server.exe
+```
+
+Use `zone-server.exe --config path\to\zone_server.yaml` to point at another config file (also `--port`, `--db-path`, `--tick-rate` overrides). The defaults come from `zone_server.yaml` in the working directory (all 13 keys listed below). The game protocol and server queries share the single UDP port **27015**; there is no separate query port in 0.4.0 (`27016` is not used).
+
+Building from source instead:
+
 ```bat
 cd zone-server
 go build -o zone-server.exe ./cmd/server
@@ -64,14 +76,27 @@ cmake --build build --config Release
 Output binaries in `zone-client\build\Release\`:
 - `ZoneClient.dll` — The client DLL.
 - `ZoneClient_Injector.exe` — The automated launcher & injector.
+- `version.dll` — The drop-in VERSION.dll proxy (loads `ZoneClient.dll` from `bin\`).
 
 ---
 
-## Part 3 — Automated Launch & Injection
+## Part 3 — Drag-and-drop install (recommended)
 
-Keep `ZoneClient_Injector.exe`, `ZoneClient.dll` and the shipped `gamedata` tree together (the standard `dist` layout). The injector copies `ZoneClient.dll` next to the game executable automatically before injecting, and in `--launch` mode it also pre-provisions all 19 Zone gamedata files into the game root, so the first run is one command. Always inject BEFORE opening the Zone browser in-game.
+1. Copy `version.dll` and `ZoneClient.dll` from the package `client\` folder into `<Anomaly>\bin\` (the folder that contains `AnomalyDX11.exe`).
+2. Copy the package `gamedata\` folder into `<Anomaly>\` and merge when prompted. This places all 19 Zone files (configs, UI layouts, localization, scripts) under `<Anomaly>\gamedata\`.
+3. Launch the game normally (or through MO2 / your mod organizer). On startup `version.dll` loads `ZoneClient.dll` from `bin\`; the DLL provisions anything missing and stages identity.
+4. In the main menu, both buttons appear: the native **Zone** button, and the xrRazom co-op button if xrRazom is installed.
+5. Zone refuses to connect while an xrRazom co-op session is active (`Busy - xrRazom co-op is active`). Disconnect from co-op first — and do not host/join co-op while a Zone session is connected.
 
-### Option A: Launch & Inject in One Command (Recommended)
+No Visual C++ redistributable is required: all release binaries use the static CRT (`/MT`). The proxy path needs no launcher and survives game updates as long as `version.dll` and `ZoneClient.dll` stay in `bin\`.
+
+---
+
+## Part 4 — Injector install (alternative)
+
+Use this instead of the proxy if you prefer explicit injection (for example, to control exactly when the DLL loads, or to use `--launch` provisioning on a fresh install). Keep `ZoneClient_Injector.exe`, `ZoneClient.dll` and the shipped `gamedata` tree together (the standard `dist` layout). The injector copies `ZoneClient.dll` next to the game executable automatically before injecting, and in `--launch` mode it also pre-provisions all 19 Zone gamedata files into the game root, so the first run is one command. Always inject BEFORE opening the Zone browser in-game.
+
+### Option A: Launch & Inject in One Command
 You can use `ZoneClient_Injector.exe` to launch your modified Anomaly executable and inject `ZoneClient.dll` automatically:
 
 ```bat
@@ -94,7 +119,7 @@ Note: with `--wait` or `--pid` the game is already running, and Anomaly's filesy
 
 ---
 
-## Part 4 — In-Game Usage
+## Part 5 — In-Game Usage
 
 ### Home Screen
 1. When Anomaly opens, look at the main menu.
@@ -107,7 +132,7 @@ Note: with `--wait` or `--pid` the game is already running, and Anomaly's filesy
 - **Double-Click Connect**: Double-clicking any server in your favorites list connects immediately.
 - **Status footer flow (dialog stays open)**: After **Connect**, the browser does NOT auto-close. The footer shows `Status: Connecting to <ip>:<port>...`, then polls `ZoneNet:IsConnected()` (~2 Hz in `zone_ui_server_list.script:Update()`): `Connected to <ip>:<port>` on handshake success, or `Failed - server unreachable, see xray log` after ~16s (matches the DLL 15s/5-try budget in `udp_client.cpp`). The browser stays open only while the handshake is pending.
 - **Seamless join (no manual singleplayer load)**: Once connected, a new account receives `SHOW_START` (`0x0071`) and the native faction/loadout dialog opens automatically; a returning account goes straight to its saved spawn. Pick a faction and loadout and click **Start**: the server creates the character and starter inventory in SQLite, then the client starts `l01_escape`, applies the server faction/spawn, and materializes the synced inventory. Only `l01_escape` is hosted for now; arbitrary level loading is tracked in ROADMAP.md.
-- **DLL must be injected first**: The browser gates Connect on `zone_net.is_client_loaded()` (`ffi.load("ZoneClient")` in `zone_net.script`). If `ZoneClient.dll` is not injected, Connect aborts with `DLL missing - inject ZoneClient first`. Always inject (Option A `--launch` or Option B `--wait`) before opening the Zone menu.
+- **DLL must be loaded first**: The browser gates Connect on `zone_net.is_client_loaded()` (`ffi.load("ZoneClient")` in `zone_net.script`). With the proxy install the DLL is loaded at game startup; with the injector, inject first (Option A `--launch` or Option B `--wait`) before opening the Zone menu. If `ZoneClient.dll` is not loaded, Connect aborts with `DLL missing - inject ZoneClient first`.
 - **Mutual exclusion with xrRazom co-op**: Zone refuses to connect while an xrRazom co-op session is active (`XrrNet():IsConnected()/IsListening()` or `XrrIsConnected()/XrrIsHosted()` in `zone_ui_server_list.script:OnConnect()` and `zone_net.script:on_tick()`), showing `Busy - xrRazom co-op is active`. Disconnect from co-op first; conversely, do not host/join xrRazom while a Zone session is connected. Running both proxy systems at once desyncs alife and double-spawns dummies.
 - **Stale `zone_identity.ltx.tmp` cleanup**: if you see a `zone_identity.ltx.tmp` orphan next to `zone_identity.ltx` in the game's `appdata` folder, it is a harmless leftover from an interrupted write. Both writers are safe: the C++ identity writer merges the canonical `[zone_identity]` keys (`client_uuid`, `hwid_hash`, `nickname`) and writes atomically with Win32 temp + `MoveFileExW`, cleaning stale `.tmp` files at startup; the Lua favorites writer uses temp + rename with a direct-write fallback. Deleting a leftover `.tmp` file by hand is safe, and both writers preserve each other's sections (identity, `[zone_favorites]`, `[zone_history]`).
 

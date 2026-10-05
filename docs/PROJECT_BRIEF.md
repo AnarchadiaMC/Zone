@@ -116,10 +116,12 @@ Six parallel audits cross-checked every engine call, hook, and path:
 ## 5. Known gaps / roadmap highlights
 
 - Two-client **live runtime test** (pending: needs a second player).
-- **Proxy DLL** (`version.dll`) install path — in progress.
-- **xrRazom coexistence** full verification (both menu buttons, key/hook chains) — in progress.
-- **48-player scalability**: snapshot chunking >32 neighbors, per-client send budget,
-  allocation profiling, benchmarks — in progress.
+- **Proxy DLL** (`version.dll`) install path — done (shipped in v0.4.0).
+- **xrRazom coexistence** — verified: both menu buttons preserved, single dormancy gate,
+  callback/key/hook chains compose; remaining risk is live two-mod session testing.
+- **48-player scalability** — done: chunked nearest-first snapshots (no peer drop),
+  pooled buffers, zero-alloc snapshot paths; 48-session tick 0.98 ms (~3% of budget),
+  5 allocs/tick; worst case ~31 KiB/s per client with 48 players in one AoI.
 - **Error handling polish**: every failure surfaced in UI/chat, no silent drops.
 - **Master server** for public server lists (HTTP announce + JSON list).
 - **Arbitrary level hosting** (engine limitation; needs xrRazom-style engine support or

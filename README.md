@@ -5,7 +5,7 @@
 [![Target Engine](https://img.shields.io/badge/Engine-Anomaly%201.5.3%20Modded%20EXEs-orange.svg)](https://github.com/themrdemonized/STALKER-Anomaly-modded-exes)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Zone** is a dedicated survival multiplayer architecture for **S.T.A.L.K.E.R. Anomaly 1.5.3**. It pairs a high-performance, authoritative Golang server with an autonomous, injectable C++ client DLL and native X-Ray UI — no proxy DLLs, no DirectX hooks, no external overlays.
+**Zone** is a dedicated survival multiplayer architecture for **S.T.A.L.K.E.R. Anomaly 1.5.3**. It pairs a high-performance, authoritative Golang server with an autonomous C++ client DLL and native X-Ray UI — no DirectX hooks, no external overlays. The client installs either as a drop-in `version.dll` proxy (recommended) or through the `ZoneClient_Injector.exe` injector.
 
 ---
 
@@ -58,7 +58,7 @@ graph TB
 
 - **Embedded SQLite Persistence** — Zero external DB dependencies (no Postgres, Redis, or Docker). Operates in Write-Ahead Logging (WAL) mode. Async write-behind queue (buffered channel, capacity 1000) is wired into the game loop for non-blocking DB writes.
 
-- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. The injector stages `ZoneClient.dll` next to the game executable (so `ffi.load("ZoneClient")` resolves) and, in `--launch` mode, pre-provisions all 19 Zone gamedata files into the game root before the engine starts. The DLL also contains an embedded `AssetProvisioner` that provisions DLTX configs (`mod_system_zone_online.ltx` is overwritten; `mod_system_zone_faction_relations.ltx` and `system.ltx_patch.ltx` are written only if missing so local edits survive), UI layouts (`zone_ui_server_list.xml`, `ui_mm_zone_peer_faction.xml`, `zone_ui_chat.xml`) and localization (`text/{eng,rus}/ui_zone.xml`) on attach; scripts, the Zone-owned online config, UI XML and text are overwritten atomically (temp + `MoveFileEx`) to match the DLL.
+- **Autonomous Zero-Touch Client (`ZoneClient.dll`)** — Injected into Anomaly via `CreateRemoteThread` + `LoadLibraryW`. The injector stages `ZoneClient.dll` next to the game executable (so `ffi.load("ZoneClient")` resolves) and, in `--launch` mode, pre-provisions all 19 Zone gamedata files into the game root before the engine starts. The DLL also contains an embedded `AssetProvisioner` that provisions DLTX configs (`mod_system_zone_online.ltx` is overwritten; `mod_system_zone_faction_relations.ltx` and `system.ltx_patch.ltx` are written only if missing so local edits survive), UI layouts (`zone_ui_server_list.xml`, `ui_mm_zone_peer_faction.xml`, `zone_ui_chat.xml`) and localization (`text/{eng,rus}/ui_zone.xml`) on attach; scripts, the Zone-owned online config, UI XML and text are overwritten atomically (temp + `MoveFileEx`) to match the DLL. The third client binary, `version.dll`, is a drop-in proxy that forwards all 15 `VERSION.dll` exports to System32 and loads `ZoneClient.dll` from `bin\` at game startup, so no injector is needed.
 
 - **Seamless Join to `l01_escape`** — A new player handshakes, receives `SHOW_START` (`0x0071`), and is taken straight into the native faction/loadout dialog; the server validates the choice, creates the character plus starter inventory in SQLite, then sends `LOAD_LEVEL` (`0x0073`) and `INVENTORY_SYNC` (`0x0076`). The client starts the stock singleplayer level, applies faction, spawn position and inventory, and keeps a pending-join marker across the Lua VM restart. Returning players skip the dialog and go directly to their spawn. Only `l01_escape` is hosted; arbitrary level loading is an engine limitation tracked in [ROADMAP.md](ROADMAP.md).
 
@@ -310,7 +310,7 @@ cmake --build build --config Release
 ```
 
 ### 3. Launch & Connect
-Inject first, then use the in-game browser (the DLL must be loaded before the menu opens):
+Recommended drag-and-drop: copy `version.dll` and `ZoneClient.dll` from the package `client\` into `C:\Anomaly\bin\`, merge the package `gamedata\` into `C:\Anomaly\`, then launch the game normally (the proxy loads the DLL at startup). To inject instead:
 ```bat
 ZoneClient_Injector.exe --launch "C:\Anomaly\bin\AnomalyDX11.exe"
 ```
@@ -344,6 +344,7 @@ Once in the main menu:
 | LuaJIT Interop | No detours are installed: `MH_Initialize()` still runs at DLL startup, but there are no hooks, because the engine links LuaJIT statically and no runtime Lua module exists to hook. The `luaL_openlibs` detour path was removed; the `ZoneNet` table is a Lua-side polyfill in `zone_net.script` that loads the DLL with `ffi.load("ZoneClient")` and binds the 21 `ZN_*` exports. |
 | Thread-Safe UDP Client | Background thread with `std::atomic<uint32_t>` sequence & session IDs, `std::mutex` socket send serialization, 10s server liveness watchdog, 5-retry handshake ceiling, graceful `PKT_DISCONNECT` on unload. |
 | DLL Injection & Protection | 3 modes (--launch, --wait, --pid), CreateRemoteThread + LoadLibraryW, SeDebugPrivilege. Upfront injector/target bitness check + bounded Lua-readiness gate (LuaJIT module or main window, 30s). UAF-safe `VirtualFreeEx` timeout handling, PID preservation avoiding TOCTOU races. |
+| Proxy DLL install (`version.dll`) | Drop-in proxy for `<Anomaly>\bin\`: forwards all 15 `VERSION.dll` exports to System32 and loads `ZoneClient.dll` from its own directory on startup. KERNEL32-only imports, static CRT, no VC++ redistributable. |
 | Identity Persistence | UUID via UuidCreate, HWID via CryptoAPI SHA-256 over MachineGuid + ComputerName, persisted as canonical `[zone_identity]` keys (`client_uuid`, `hwid_hash`, `nickname`) in `<game root>\appdata\zone_identity.ltx` (the engine's `$app_data_root$`), not `%APPDATA%`. Every write merges only those three keys atomically (temp + `MoveFileExW`) and preserves all other content, so server-browser favorites and history survive identity updates. |
 | Asset provisioning | DLTX configs written only if missing; scripts + UI XML overwritten atomically (temp + `MoveFileEx`). Robust `\bin` directory matching preventing over-stripping. |
 | Lock-free SPSC ring buffer | 256 entries x 1500 bytes, atomic head/tail with acquire/release ordering, dropped packet tracking, capacity-checked event polling. |
@@ -376,7 +377,7 @@ Recorded against the current tree:
 - **Go test suite — green.** `go test ./...` passes locally (protocol, config, database, game, network, ai); CI additionally runs `go test -race ./...`.
 - **Lua scripts — 11/11 parse under LuaJIT 2.1.**
 - **XML configs — parse clean** (server browser, faction dialog, chat bar, en/ru localization).
-- **MSVC Release builds — clean** (`ZoneClient.dll` and `ZoneClient_Injector.exe`).
+- **MSVC Release builds — clean** (`ZoneClient.dll`, `ZoneClient_Injector.exe` and `version.dll`).
 - **Research passes — completed** against Unturned (source released 2026), Luanti/Minetest, Valve A2S and DDNet; the findings feed the production backlog in [ROADMAP.md](ROADMAP.md).
 
 ---
