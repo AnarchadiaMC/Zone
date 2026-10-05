@@ -6,7 +6,6 @@ local last_update_time = 0
 local UPDATE_INTERVAL_MS = 1000 -- 1 Hz HUD status polling
 
 local last_connected   = nil    -- nil (uninitialized), true, false
-local last_ping        = -1
 local safe_zone_active = false
 local last_dev_w       = 0
 local last_dev_h       = 0
@@ -156,12 +155,8 @@ local function get_or_create_static()
     -- The ENTIRE creation sequence runs inside one pcall: any single
     -- engine failure returns nil (callers nil-check) instead of a fatal
     -- CTD via CScriptEngine::lua_pcall_failed in actor_on_update.
-    -- ROOT CAUSE of the save-load crash: CUIStatic exposes NO SetFont
-    -- method (see CUIStatic::script_register in UIStatic_script.cpp —
-    -- only CUILines and CUITextWnd bind SetFont), so the old
-    -- s:SetFont(...) call raised "attempt to call method 'SetFont'
-    -- (a nil value)". The engine-correct equivalent is
-    -- s:TextControl():SetFont(...) (CUILines::SetFont binding).
+    -- CUIStatic exposes NO SetFont; only CUILines and CUITextWnd bind it,
+    -- so the font must be set through s:TextControl():SetFont(...).
     local ok, s = pcall(function()
         local st = CUIStatic()
         if not st then error("CUIStatic() returned nil") end
@@ -896,15 +891,29 @@ local function chat_input_active()
     return chat_open == true and chat_focused == true and chat_window_shown()
 end
 
+-- Confirm edit-box focus. The engine's CUICustomEdit binding exposes
+-- CaptureFocus but no IsFocused getter (UIEditBox_script.cpp:11-20), so when
+-- no getter exists the only available proof is that CaptureFocus did not
+-- throw. If a getter is present (other engine builds), it must return true.
+local function edit_focus_confirmed(edit)
+    if not edit then return false end
+    if type(edit.IsFocused) == "function" then
+        local ok, focused = pcall(function() return edit:IsFocused() end)
+        return ok and focused == true
+    end
+    return true
+end
+
 -- Mirror of zone_safezone's UI guard: never take keys while a game UI owns
--- them (inventory/trade/loot/PDA/custom GUI).
+-- them (inventory/trade/loot/PDA/custom GUI). FAIL-SAFE: a missing or throwing
+-- probe means "UI open", so an unknown state never swallows input (this only
+-- costs the chat-open hotkey; all keys still reach the engine).
 local function ui_input_open()
-    local open = false
-    pcall(function()
-        if actor_menu and type(actor_menu.is_hud_free) == "function" then
-            open = (actor_menu.is_hud_free() ~= true)
-        end
-    end)
+    local open = true
+    if actor_menu and type(actor_menu.is_hud_free) == "function" then
+        local ok, free = pcall(actor_menu.is_hud_free)
+        if ok then open = (free ~= true) end
+    end
     return open
 end
 
@@ -943,7 +952,8 @@ function open_chat()
         if w.IsShown then shown = w:IsShown() and true or false end
         if w.edit and w.edit.CaptureFocus then
             w.edit:CaptureFocus(true)
-            focused = true
+            -- Only claim keyboard capture when it actually succeeded.
+            focused = edit_focus_confirmed(w.edit)
         end
     end)
 
@@ -981,12 +991,6 @@ function is_chat_open()
     return chat_open == true
 end
 
--- External disconnect path (module convention used by the other Zone
--- modules): never leave the chat window grabbing input after a session drop.
-function on_disconnect()
-    pcall(close_chat, "disconnect")
-end
-
 -- 1 Hz watchdog (called from on_actor_update): a flag that says open while the
 -- window is gone or the session dropped must never survive to eat input.
 local function chat_watchdog(connected)
@@ -995,6 +999,11 @@ local function chat_watchdog(connected)
         close_chat("disconnect")
     elseif not chat_window_shown() then
         close_chat("window_not_shown")
+    elseif not chat_focused then
+        -- Focus was never captured or was lost: a chat that cannot own the
+        -- keyboard must not stay open (it would leave the user in a modal-like
+        -- state with no key capture).
+        close_chat("focus_lost")
     end
 end
 

@@ -24,11 +24,6 @@ type DamageHandler struct {
 	maxDamagePerHit float32 // e.g. 150.0
 	groups          *GroupManager
 
-	// Anti-lag-switch combat gate. Both are wired by Server; unit tests may
-	// leave them nil to skip those checks.
-	movement  *MovementGuard
-	anticheat *AntiCheatManager
-
 	// Rolling per-attacker damage budget. Guarded by budgetMu because UDP
 	// workers handle damage concurrently.
 	budgetMu         sync.Mutex
@@ -42,17 +37,6 @@ type DamageHandler struct {
 // manager disables the same-group check (used by unit tests).
 func (dh *DamageHandler) SetGroupManager(groups *GroupManager) {
 	dh.groups = groups
-}
-
-// SetMovementGuard wires the movement history used by the burst-after-stall
-// damage gate.
-func (dh *DamageHandler) SetMovementGuard(g *MovementGuard) {
-	dh.movement = g
-}
-
-// SetAntiCheatManager wires lag-switch strike state into the kill-window gate.
-func (dh *DamageHandler) SetAntiCheatManager(ac *AntiCheatManager) {
-	dh.anticheat = ac
 }
 
 // SetDamageBudgetPerS overrides the rolling 1 s damage budget. Values <= 0
@@ -201,28 +185,7 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 		appliedDamage = maxDmg
 	}
 
-	// 5b. Anti-lag-switch kill window: an attacker that just triggered a
-	// stall-teleport strike cannot deal damage for 5 s. This closes the
-	// classic lag-switch-then-shoot exploit without needing geometry.
-	now := time.Now()
-	if dh.now != nil {
-		now = dh.now()
-	}
-	if dh.anticheat != nil && dh.anticheat.HasRecentLagswitchStrike(attackerID, now, 5*time.Second) {
-		return 0, false, "attacker lag-switch window"
-	}
-
-	// 5c. Burst-after-stall: if the accepted transform ring shows displacement
-	// over the last second beyond the speed budget, the attacker teleported
-	// mid-fight (possibly below the per-packet validator); reject the hit.
-	// NOTE: no line-of-sight check exists — the server has no world geometry,
-	// so walls/terrain cannot block a shot here. Range + position history are
-	// the only spatial gates available.
-	if dh.movement != nil && dh.movement.BurstAfterStall(attacker, now) {
-		return 0, false, "movement burst rejected"
-	}
-
-	// 5d. Rolling damage budget: clamp the hit to what remains of the last
+	// 5b. Rolling damage budget: clamp the hit to what remains of the last
 	// second's budget and reject once exhausted. Generous by default (400/s)
 	// so sustained melee/automatic fire stays viable.
 	if dh.damageBudgetPerS > 0 {

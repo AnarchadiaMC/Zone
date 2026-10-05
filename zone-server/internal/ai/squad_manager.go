@@ -1,7 +1,6 @@
 package ai
 
 import (
-	"math"
 	"sync"
 	"time"
 )
@@ -34,23 +33,36 @@ func (s AIState) String() string {
 	}
 }
 
-// patrolStepSize is the world-unit distance advanced per Tick along a patrol path.
-const patrolStepSize float32 = 2.0
-
-// patrolRadius is the half-extent of the grid used to generate patrol waypoints.
-const patrolRadius float32 = 32.0
-
 // Squad represents a group of AI entities moving through the Zone.
 type Squad struct {
-	ID        uint32
-	Level     string     // level the squad occupies
-	Position  [3]float32 // current world-space position
-	State     AIState
-	Path      []Waypoint // waypoints produced by A* pathfinding
-	PathIndex int        // next waypoint to move toward
-	Health    float32
-	Faction   string
-	SpawnedAt time.Time
+	ID       uint32
+	DBID     int64      // ai_squads.squad_id when loaded from the DB, else 0
+	Level    string     // level the squad occupies
+	Position [3]float32 // current world-space position
+	State    AIState
+	Health   float32
+	Faction  string
+
+	// Puppet replication metadata (wave A). Puppet squads are simulated by
+	// TickPuppets along Loop and replicated to clients through OpAIState. No
+	// combat AI exists in this wave: State stays AIStatePatrol and damage is
+	// never applied to puppets.
+	Puppet       bool
+	Label        string
+	Section      string
+	PatrolRadius float32
+	WalkSpeed    float32 // m/s, used while patrolling (default 1.5)
+	RunSpeed     float32 // m/s, used while runUntil is in the future (default 3.0)
+	Yaw          float32 // radians, faces the current movement direction
+	Anim         uint8   // AnimIdle/AnimWalk/AnimRun wire value
+	Online       bool    // true when a player is within the replication radius
+	Loop         []Waypoint
+	LoopIndex    int
+	lastStep     time.Time
+	runUntil     time.Time
+	// deadSince records when the squad entered AIStateDead; TickPuppets keeps
+	// broadcasting AnimDeath for puppetDespawnDelay before despawning it.
+	deadSince time.Time
 }
 
 // SquadManager manages all active AI squads.
@@ -68,42 +80,6 @@ func NewSquadManager() *SquadManager {
 	}
 }
 
-// SpawnSquad creates a new squad at the given world-space position and
-// immediately computes a simple patrol circuit using A*.
-func (sm *SquadManager) SpawnSquad(level string, x, y, z float32, faction string) *Squad {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	id := sm.nextID
-	sm.nextID++
-
-	start := Waypoint{X: x, Y: y, Z: z}
-	goal := Waypoint{X: x + patrolRadius, Y: y, Z: z + patrolRadius}
-
-	g := newPatrolGrid(start, goal)
-	path := AStar(start, goal, g)
-
-	// Fall back to a two-waypoint path when A* cannot find a route.
-	if len(path) == 0 {
-		path = []Waypoint{start, goal}
-	}
-
-	sq := &Squad{
-		ID:        id,
-		Level:     level,
-		Position:  [3]float32{x, y, z},
-		State:     AIStatePatrol,
-		Path:      path,
-		PathIndex: 0,
-		Health:    100.0,
-		Faction:   faction,
-		SpawnedAt: time.Now(),
-	}
-
-	sm.squads[id] = sq
-	return sq
-}
-
 // DespawnSquad removes a squad by ID.
 func (sm *SquadManager) DespawnSquad(id uint32) {
 	sm.mu.Lock()
@@ -119,18 +95,6 @@ func (sm *SquadManager) GetSquad(id uint32) (*Squad, bool) {
 	return sq, ok
 }
 
-// GetAllSquads returns a slice of all active squads.
-func (sm *SquadManager) GetAllSquads() []*Squad {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	squads := make([]*Squad, 0, len(sm.squads))
-	for _, sq := range sm.squads {
-		squads = append(squads, sq)
-	}
-	return squads
-}
-
 // SetSquadState updates the AI state of the squad with the given ID.
 func (sm *SquadManager) SetSquadState(id uint32, state AIState) {
 	sm.mu.Lock()
@@ -139,166 +103,4 @@ func (sm *SquadManager) SetSquadState(id uint32, state AIState) {
 	if sq, ok := sm.squads[id]; ok {
 		sq.State = state
 	}
-}
-
-// Count returns the number of active (non-removed) squads.
-func (sm *SquadManager) Count() int {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	return len(sm.squads)
-}
-
-type squadBroadcast struct {
-	id    uint32
-	state AIState
-	pos   [3]float32
-}
-
-// Tick advances all squad AI states and movement, then calls broadcastFn for
-// every live squad so the caller can fan out packets to nearby sessions.
-// broadcastFn receives (squadID, currentState, currentPosition).
-//
-// Tick safely skips AIStateDead squads and deliberately avoids importing
-// internal/game to prevent circular imports.
-func (sm *SquadManager) Tick(_ time.Time, broadcastFn func(squadID uint32, state AIState, pos [3]float32)) {
-	sm.mu.Lock()
-	var broadcasts []squadBroadcast
-	if broadcastFn != nil && len(sm.squads) > 0 {
-		broadcasts = make([]squadBroadcast, 0, len(sm.squads))
-	}
-
-	for _, sq := range sm.squads {
-		if sq.State == AIStateDead {
-			continue
-		}
-
-		if sq.State == AIStatePatrol {
-			sq.advancePatrol()
-		}
-
-		if broadcastFn != nil {
-			broadcasts = append(broadcasts, squadBroadcast{
-				id:    sq.ID,
-				state: sq.State,
-				pos:   sq.Position,
-			})
-		}
-	}
-	sm.mu.Unlock()
-
-	if broadcastFn != nil {
-		for _, b := range broadcasts {
-			broadcastFn(b.id, b.state, b.pos)
-		}
-	}
-}
-
-// advancePatrol moves the squad one step along its path, looping when the end
-// is reached so the squad continuously patrols the circuit.
-func (sq *Squad) advancePatrol() {
-	if len(sq.Path) == 0 {
-		return
-	}
-
-	if sq.PathIndex >= len(sq.Path) {
-		sq.PathIndex = 0
-	}
-
-	target := sq.Path[sq.PathIndex]
-	dx := target.X - sq.Position[0]
-	dy := target.Y - sq.Position[1]
-	dz := target.Z - sq.Position[2]
-	distSq := dx*dx + dy*dy + dz*dz
-
-	// If already at the current waypoint, advance to the next waypoint.
-	if distSq < 1e-4 {
-		sq.PathIndex = (sq.PathIndex + 1) % len(sq.Path)
-		target = sq.Path[sq.PathIndex]
-		dx = target.X - sq.Position[0]
-		dy = target.Y - sq.Position[1]
-		dz = target.Z - sq.Position[2]
-		distSq = dx*dx + dy*dy + dz*dz
-	}
-
-	// Euclidean distance to the next waypoint.
-	if distSq <= patrolStepSize*patrolStepSize {
-		// Snap to waypoint and advance the index (loop).
-		sq.Position = [3]float32{target.X, target.Y, target.Z}
-		sq.PathIndex = (sq.PathIndex + 1) % len(sq.Path)
-		return
-	}
-
-	// Move patrolStepSize units toward the target.
-	dist := float32(math.Sqrt(float64(distSq)))
-	if dist > 0 {
-		sq.Position[0] += (dx / dist) * patrolStepSize
-		sq.Position[1] += (dy / dist) * patrolStepSize
-		sq.Position[2] += (dz / dist) * patrolStepSize
-	}
-}
-
-// ---------------------------------------------------------------------------
-// patrolGrid — minimal Graph implementation for A* patrol path generation.
-// It builds a flat 2-D walkable grid between two world-space waypoints so the
-// pathfinder has a concrete graph to traverse without importing engine data.
-// ---------------------------------------------------------------------------
-
-// patrolGrid implements the Graph interface used by AStar.
-type patrolGrid struct {
-	nodes map[Waypoint][]Waypoint
-}
-
-// newPatrolGrid builds a sparse grid of waypoints connecting start and goal by
-// stepping in world-unit increments along X and Z.
-func newPatrolGrid(start, goal Waypoint) *patrolGrid {
-	g := &patrolGrid{nodes: make(map[Waypoint][]Waypoint)}
-
-	// Generate a chain of waypoints from start to goal at fixed step intervals.
-	step := patrolStepSize * 4 // coarse grid — fine enough for pathing
-	if step <= 0 {
-		step = 8.0
-	}
-
-	// Build a simple grid row connecting start.X→goal.X at start.Z, then a
-	// column from start.Z→goal.Z at goal.X, forming an L-shaped patrol route.
-	var chain []Waypoint
-	chain = append(chain, start)
-
-	// Horizontal leg
-	x := start.X + step
-	for x < goal.X {
-		chain = append(chain, Waypoint{X: x, Y: start.Y, Z: start.Z})
-		x += step
-	}
-
-	// Corner
-	corner := Waypoint{X: goal.X, Y: start.Y, Z: start.Z}
-	chain = append(chain, corner)
-
-	// Vertical leg
-	z := start.Z + step
-	for z < goal.Z {
-		chain = append(chain, Waypoint{X: goal.X, Y: start.Y, Z: z})
-		z += step
-	}
-
-	chain = append(chain, goal)
-
-	// Wire neighbours (bidirectional chain).
-	for i, wp := range chain {
-		var nbrs []Waypoint
-		if i > 0 {
-			nbrs = append(nbrs, chain[i-1])
-		}
-		if i < len(chain)-1 {
-			nbrs = append(nbrs, chain[i+1])
-		}
-		g.nodes[wp] = nbrs
-	}
-
-	return g
-}
-
-func (g *patrolGrid) GetNeighbors(node Waypoint) []Waypoint {
-	return g.nodes[node]
 }

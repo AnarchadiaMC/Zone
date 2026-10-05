@@ -28,19 +28,10 @@ type PlayerSession struct {
 	SafeZoneID        string
 	LastSeen          time.Time
 	LastSequence      uint32
-	LastTransformTime time.Time
-	// LastHeartbeat is the arrival time of the most recent heartbeat or client
-	// ACK (any traffic that proves the link is alive without a transform).
-	// Anti-lag-switch uses it to distinguish a deliberately stalled transform
-	// stream from plain packet loss.
-	LastHeartbeat time.Time
-	// TransformHistory is the rolling ring of accepted transforms (last ~2 s).
-	// Mutated only while the session lock is held.
-	TransformHistory TransformRing
-	LastRejectedPos  [3]float32
-	RejectConfirm    int
-	HasRejected      bool
-	SessionToken     uint64
+	// LastAIStateSent throttles OpAIState to a time-based ~30 Hz ceiling
+	// regardless of the configured tick rate.
+	LastAIStateSent time.Time
+	SessionToken    uint64
 	Dirty            bool
 	LastCheckpoint   time.Time
 	InCombatUntil    time.Time
@@ -142,14 +133,17 @@ func (sm *SessionManager) AddSession(s *PlayerSession) {
 
 // TryAddCapped performs check-and-insert under ONE mutex hold, closing the
 // TOCTOU window between GetAll()+AddSession across UDP workers.
-// It returns the sessions it evicted (same-address reconnect and same-ID
-// replacement) so the caller can run full disconnect cleanup on them, and
-// whether the new session was inserted. A false bool means the caller must
-// still clean up any returned evicted sessions.
+// It returns the sessions it evicted (same-address reconnect, same-AccountID
+// double session, and same-ID replacement) so the caller can run full
+// disconnect cleanup on them, and whether the new session was inserted. A
+// false bool means the caller must still clean up any returned evicted
+// sessions.
 // Duplicate connections from the same addr replace the old entry instead of
 // counting twice: old sessions with the same addr (different SessionID) are
-// removed first. Same-SessionID re-adds are treated as updates and allowed
-// even at cap. max <= 0 means uncapped (always insert).
+// removed first. A second live session with the SAME AccountID is also
+// evicted (prevents double sessions and rate-budget splitting). Same-SessionID
+// re-adds are treated as updates and allowed even at cap. max <= 0 means
+// uncapped (always insert).
 func (sm *SessionManager) TryAddCapped(s *PlayerSession, max int) (evicted []*PlayerSession, added bool) {
 	if s == nil {
 		return nil, false
@@ -167,6 +161,23 @@ func (sm *SessionManager) TryAddCapped(s *PlayerSession, max int) (evicted []*Pl
 					delete(sm.sessions, id)
 					evicted = append(evicted, sess)
 				}
+			}
+		}
+	}
+	// Same-AccountID eviction: one account may hold exactly one live session.
+	// Without this, a player connecting from a second address keeps the old
+	// session alive (double grid/group entry, split rate budgets).
+	if s.AccountID != "" {
+		for id, sess := range sm.sessions {
+			if id == s.SessionID {
+				continue
+			}
+			if sess != nil && sess.AccountID == s.AccountID {
+				delete(sm.sessions, id)
+				if sess.UDPAddr != nil {
+					delete(sm.byAddr, sess.UDPAddr.String())
+				}
+				evicted = append(evicted, sess)
 			}
 		}
 	}

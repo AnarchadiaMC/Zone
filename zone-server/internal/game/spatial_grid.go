@@ -229,3 +229,11 @@ func (g *SpatialGrid) Contains(id uint32) bool {
 func (g *SpatialGrid) CellSize() float32 {
 	return g.cellSize
 }
+
+// Displacement returns the 3D distance between two positions.
+func Displacement(a, b [3]float32) float64 {
+	dx := float64(a[0] - b[0])
+	dy := float64(a[1] - b[1])
+	dz := float64(a[2] - b[2])
+	return math.Sqrt(dx*dx + dy*dy + dz*dz)
+}

@@ -1,6 +1,16 @@
 -- zone_dummy.script
 -- Proxy stalker system with Hermite Spline Interpolation
 
+local ffi = require("ffi")
+-- Distinct union name: zone_net.script already cdefs znet_float_cast in the
+-- same Lua state. pcall keeps a same-state script reload (ctype already
+-- defined) from raising; the type then simply already exists.
+pcall(function()
+    ffi.cdef[[
+        typedef union { float f; uint8_t b[4]; } zone_hit_float_cast;
+    ]]
+end)
+
 local spawned_proxies = {}
 local peer_factions = {}
 local peer_names = {}
@@ -17,6 +27,24 @@ local PENDING_PEER_CAP = 32
 local PENDING_PEER_TTL_MS = 120000
 local pending_prune_logged = false
 
+-- Snapshot rotation/anim application. MonsterSpace enums mirror
+-- zone_ai_proxy.script (ai_monster_space.h:22-34):
+--   EBodyState:    eBodyStateCrouch = 0, eBodyStateStand = 1
+--   EMovementType: eMovementTypeWalk = 0, eMovementTypeRun = 1
+-- Wire animflags (same bits zone_net produces): bit 0 crouch, bit 1 sprint.
+local BODY_CROUCH = 0
+local BODY_STAND = 1
+local MOVE_WALK = 0
+local MOVE_RUN = 1
+local ANIM_FLAG_CROUCH = 1
+local ANIM_FLAG_SPRINT = 2
+-- Snap the proxy with set_npc_position only when the interpolated target moved
+-- more than this since the last snap; between snaps the puppet is steered with
+-- set_desired_position, which avoids a teleport-driven animation reset every
+-- frame.
+local PROXY_SNAP_EPS_M = 0.1
+local PROXY_SNAP_EPS_SQ = PROXY_SNAP_EPS_M * PROXY_SNAP_EPS_M
+
 -- Snapshot-gap extrapolation (v4 smoothing): when no snapshot arrived for a
 -- proxy for > 150 ms, continue along the last known velocity for at most
 -- 250 ms / 1.5 m, then blend back to authoritative data over 150 ms.
@@ -26,16 +54,47 @@ local EXTRAPOLATE_CAP_MS = 250
 local EXTRAPOLATE_MAX_DIST = 1.5
 local EXTRAPOLATE_BLEND_MS = 150
 
--- Local player position correction (OpPositionCorrection 0x007B).
-local CORRECTION_DEADZONE_M = 1.0
-local CORRECTION_HARD_SNAP_M = 8.0
-local CORRECTION_BLEND_MS = 500
-local CORRECTION_BLEND_STEP = 0.2
-local CORRECTION_FINAL_EPS_M = 0.25
-local CORRECTION_NOTICE_MS = 5000
-local corr_x, corr_y, corr_z = nil, nil, nil
-local corr_deadline = 0
-local corr_last_notice = 0
+-- Reusable vectors for the per-frame path: one module-level instance instead of
+-- a vector allocation per proxy per frame. Created lazily because vector() may
+-- not be bound during the very first script load pass.
+local g_render_pos, g_render_dir
+
+local function ensure_render_vectors()
+    if g_render_pos then return end
+    g_render_pos = vector():set(0, 0, 0)
+    g_render_dir = vector():set(0, 0, 1)
+end
+
+-- Named wrappers so pcall(fn, ...) does not allocate a closure per proxy per
+-- frame. Each one feeds the corresponding reusable vector.
+local function obj_set_npc_position(obj)
+    obj:set_npc_position(g_render_pos)
+end
+
+local function obj_set_desired_position(obj)
+    obj:set_desired_position(g_render_pos)
+end
+
+local function obj_set_desired_direction(obj)
+    obj:set_desired_direction(g_render_dir)
+end
+
+local function obj_set_body_state(obj, state)
+    obj:set_body_state(state)
+end
+
+local function obj_set_movement_type(obj, movement_type)
+    obj:set_movement_type(movement_type)
+end
+
+local function obj_alive(obj)
+    return obj:alive()
+end
+
+-- level.object_by_id is an engine call; always reached through pcall.
+local function level_object_by_id(id)
+    return level.object_by_id(id)
+end
 
 -- Ring buffer helper functions (L-30: avoid table.remove(tbl, 1) in hot path)
 local function add_history_sample(proxy, sample)
@@ -95,6 +154,23 @@ local function resolve_spawn_section()
         if ini_sys:section_exist(FALLBACK_PROXY_SECTION) then return FALLBACK_PROXY_SECTION end
     end
     return nil
+end
+
+-- Co-op dormancy gate. Single owner is zone_main.xrr_is_active(), which also
+-- covers XrrNet; the raw Xrr* globals are only a fallback while zone_main is
+-- not loaded (nil-safe, never fatal).
+local function xrr_is_active()
+    local fn = zone_main and zone_main.xrr_is_active
+    if type(fn) == "function" then
+        local ok, res = pcall(fn)
+        if ok then return res == true end
+    end
+    local active = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then active = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then active = true end
+    end)
+    return active
 end
 
 -- Server ENTITY_ENTER never carries a visual for AI puppets; player peers do.
@@ -195,12 +271,7 @@ function spawn_proxy(session_id, pos, faction, visual, gvid)
     if not pos then return false end
 
     -- Never spawn while xrRazom owns the world (dual proxy systems conflict).
-    local xrr_active = false
-    pcall(function()
-        if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_active = true end
-        if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_active = true end
-    end)
-    if xrr_active then return false end
+    if xrr_is_active() then return false end
 
     -- Game vertex is packet-authoritative; 0 means the server had none.
     if not gvid or gvid == 0 then return false end
@@ -242,8 +313,6 @@ function spawn_proxy(session_id, pos, faction, visual, gvid)
         last_attacker_id = nil,
         last_update = time_global()
     }
-    -- Tag for death manager bypass (needs integration in death_manager.script)
-    pcall(function() se_obj.is_zone_proxy = true end)
     return true
 end
 
@@ -271,6 +340,53 @@ function despawn_proxy(session_id)
     end
 end
 
+-- Apply decoded animflags as body/movement state. Only called when the flags
+-- actually changed, so no engine call is issued for unchanged state.
+local function apply_proxy_anim(proxy, obj)
+    if proxy.applied_animflags == proxy.animflags then return end
+    proxy.applied_animflags = proxy.animflags
+    local flags = proxy.animflags or 0
+    local crouch = bit.band(flags, ANIM_FLAG_CROUCH) ~= 0
+    local sprint = bit.band(flags, ANIM_FLAG_SPRINT) ~= 0
+    pcall(obj_set_body_state, obj, crouch and BODY_CROUCH or BODY_STAND)
+    pcall(obj_set_movement_type, obj, sprint and MOVE_RUN or MOVE_WALK)
+end
+
+-- Re-apply the cached snapshot yaw every interpolation tick as a desired
+-- direction, and move the proxy. Pitch is decoded and cached but intentionally
+-- not applied: the script API has no verified cheap NPC pitch binding and
+-- folding pitch into set_desired_direction is not verified to aim the puppet.
+-- set_npc_position is only used when the render target moved more than
+-- PROXY_SNAP_EPS_M since the last snap (teleport resets animation state);
+-- otherwise set_desired_position steers the puppet smoothly.
+local function apply_proxy_motion(proxy, obj, ix, iy, iz)
+    if proxy.target_yaw then
+        g_render_dir:set(math.sin(proxy.target_yaw), 0, math.cos(proxy.target_yaw))
+        pcall(obj_set_desired_direction, obj)
+    end
+    g_render_pos:set(ix, iy, iz)
+    local moved_sq = nil
+    if proxy.render_applied_x then
+        local dx = ix - proxy.render_applied_x
+        local dy = iy - proxy.render_applied_y
+        local dz = iz - proxy.render_applied_z
+        moved_sq = dx * dx + dy * dy + dz * dz
+    end
+    if moved_sq == nil or moved_sq > PROXY_SNAP_EPS_SQ then
+        pcall(obj_set_npc_position, obj)
+        proxy.render_applied_x, proxy.render_applied_y, proxy.render_applied_z = ix, iy, iz
+    else
+        pcall(obj_set_desired_position, obj)
+    end
+end
+
+local function apply_motion_if_alive(proxy, obj, ix, iy, iz)
+    if obj_alive(obj) then
+        apply_proxy_motion(proxy, obj, ix, iy, iz)
+        apply_proxy_anim(proxy, obj)
+    end
+end
+
 function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     local proxy = spawned_proxies[session_id]
     if not proxy then return end
@@ -279,6 +395,11 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     add_history_sample(proxy, {
         x = x, y = y, z = z, yaw = yaw, pitch = pitch, animflags = animflags, health = health, t = tg
     })
+    -- Cache rotation/animation so the interpolate tick can re-apply it even
+    -- between snapshots.
+    proxy.target_yaw = yaw
+    proxy.target_pitch = pitch
+    proxy.animflags = animflags
 
     -- Last known velocity in m/ms from the two newest samples (scalars only).
     if proxy.hist_count >= 2 then
@@ -306,17 +427,22 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     
     -- Resolve game_id once online and apply the peer's real visual.
     if not proxy.game_id and level and level.object_by_id then
-        local obj = level.object_by_id(proxy.se_id)
-        if obj then
+        local ok_obj, obj = pcall(level_object_by_id, proxy.se_id)
+        if ok_obj and obj then
             proxy.game_id = proxy.se_id
             try_apply_visual(proxy, obj)
         end
     end
-    
-    -- Apply anim flags / health if game object exists
-    local obj = (proxy.game_id and level and level.object_by_id) and level.object_by_id(proxy.game_id) or nil
+
+    -- Apply rotation-independent state / health if the game object exists.
+    local obj = nil
+    if proxy.game_id then
+        local ok_obj, resolved = pcall(level_object_by_id, proxy.game_id)
+        if ok_obj then obj = resolved end
+    end
     if obj then
         try_apply_visual(proxy, obj)
+        apply_proxy_anim(proxy, obj)
         if health <= 0 and obj:alive() then
             -- L-18: Attribute killer to actual attacker entity instead of self
             local killer_obj = resolve_entity(proxy.last_attacker_id) or obj
@@ -335,122 +461,19 @@ local function reap_stale_proxies(tg)
     end
 end
 
--- ---------------------------------------------------------------------------
--- Local player correction (OpPositionCorrection 0x007B)
--- ---------------------------------------------------------------------------
-local function zone_connected()
-    local connected = false
-    pcall(function()
-        if ZoneNet and ZoneNet.IsConnected then
-            connected = ZoneNet:IsConnected() and true or false
-        end
-    end)
-    return connected
-end
-
-local function game_loaded()
-    local present = false
-    pcall(function() present = (level ~= nil and level.present() == true) end)
-    return present
-end
-
-local function clear_local_correction()
-    corr_x, corr_y, corr_z = nil, nil, nil
-    corr_deadline = 0
-end
-
-local function correction_notice(dist, snapped)
-    local tg = time_global()
-    if tg - corr_last_notice < CORRECTION_NOTICE_MS then return end
-    corr_last_notice = tg
-    printf("[zone_dummy] position correction applied: %.2f m (%s)",
-        dist, snapped and "hard snap" or "smooth")
-end
-
--- Called from zone_net dispatch for 0x007B. Ignores corrections under the
--- 1 m deadzone (player is already where the server wants), hard-snaps above
--- 8 m, blends the rest over ~0.5 s from the tick.
-function on_position_correction(x, y, z)
-    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then return end
-    if not game_loaded() or not zone_connected() then return end
-    local actor = db and db.actor
-    if not actor then return end
-
-    local cur = nil
-    pcall(function() cur = actor:position() end)
-    if not cur then return end
-
-    local dx, dy, dz = x - cur.x, y - cur.y, z - cur.z
-    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if dist < CORRECTION_DEADZONE_M then return end
-
-    if dist > CORRECTION_HARD_SNAP_M then
-        local applied = false
-        pcall(function()
-            actor:set_actor_position(vector():set(x, y, z), false, false)
-            applied = true
-        end)
-        if applied then
-            clear_local_correction()
-            correction_notice(dist, true)
-        end
-        return
-    end
-
-    corr_x, corr_y, corr_z = x, y, z
-    corr_deadline = time_global() + CORRECTION_BLEND_MS
-    correction_notice(dist, false)
-end
-
--- Runs every frame from interpolate_proxies. Moves the actor toward the
--- corrected position in ~20% steps; the final step keeps momentum.
-local function update_local_correction(tg)
-    if corr_x == nil then return end
-    if not game_loaded() then
-        clear_local_correction()
-        return
-    end
-    local actor = db and db.actor
-    if not actor then
-        clear_local_correction()
-        return
-    end
-
-    local cur = nil
-    pcall(function() cur = actor:position() end)
-    if not cur then return end
-
-    local dx, dy, dz = corr_x - cur.x, corr_y - cur.y, corr_z - cur.z
-    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if dist < CORRECTION_FINAL_EPS_M or tg >= corr_deadline then
-        pcall(function()
-            actor:set_actor_position(vector():set(corr_x, corr_y, corr_z), false, true)
-        end)
-        clear_local_correction()
-        return
-    end
-
-    local nx = cur.x + dx * CORRECTION_BLEND_STEP
-    local ny = cur.y + dy * CORRECTION_BLEND_STEP
-    local nz = cur.z + dz * CORRECTION_BLEND_STEP
-    pcall(function()
-        actor:set_actor_position(vector():set(nx, ny, nz), false, false)
-    end)
-end
-
 -- Hermite spline interpolation for smooth proxy movement (L-05 & L-24)
 function interpolate_proxies()
+    ensure_render_vectors()
     local tg = time_global()
     local target_t = tg - JITTER_BUFFER_MS
 
-    pcall(update_local_correction, tg)
     reap_stale_proxies(tg)
 
     for sid, proxy in pairs(spawned_proxies) do
         -- Resolve game_id once online if not yet resolved
         if not proxy.game_id and level and level.object_by_id then
-            local obj = level.object_by_id(proxy.se_id)
-            if obj then
+            local ok_obj, obj = pcall(level_object_by_id, proxy.se_id)
+            if ok_obj and obj then
                 proxy.game_id = proxy.se_id
                 try_apply_visual(proxy, obj)
             end
@@ -566,24 +589,20 @@ function interpolate_proxies()
             end
             proxy.render_x, proxy.render_y, proxy.render_z = ix, iy, iz
 
-            if proxy.game_id and level and level.object_by_id then
-                pcall(function()
-                    local obj = level.object_by_id(proxy.game_id)
-                    if obj and obj:alive() and obj.set_npc_position then
-                        obj:set_npc_position(vector():set(ix, iy, iz))
-                    end
-                end)
+            if proxy.game_id then
+                local ok_obj, obj = pcall(level_object_by_id, proxy.game_id)
+                if ok_obj and obj then
+                    pcall(apply_motion_if_alive, proxy, obj, ix, iy, iz)
+                end
             end
         elseif count == 1 then
             local p1 = get_history_sample(proxy, 1)
             proxy.render_x, proxy.render_y, proxy.render_z = p1.x, p1.y, p1.z
-            if proxy.game_id and level and level.object_by_id then
-                pcall(function()
-                    local obj = level.object_by_id(proxy.game_id)
-                    if obj and obj:alive() and obj.set_npc_position then
-                        obj:set_npc_position(vector():set(p1.x, p1.y, p1.z))
-                    end
-                end)
+            if proxy.game_id then
+                local ok_obj, obj = pcall(level_object_by_id, proxy.game_id)
+                if ok_obj and obj then
+                    pcall(apply_motion_if_alive, proxy, obj, p1.x, p1.y, p1.z)
+                end
             end
         end
     end
@@ -741,7 +760,178 @@ function get_nearby_players(max_dist)
     return out
 end
 
+-- ---------------------------------------------------------------------------
+-- Hit registration (protocol 0x0050, frozen layout: TargetID u32, AttackerID
+-- u32, Damage f32, BoneID u8 = 13 bytes).
+--
+-- Outgoing: when the local actor hits one of our spawned player proxies, the
+-- proxy's engine HP is not locally authoritative, so the hit is reported to the
+-- server and cancelled locally. The callback signature and flags contract are
+-- the base-game ones: _g.script:1243-1247 dispatches
+-- npc_on_before_hit(npc, shit, bone_id, flags) from
+-- _G.CAI_Stalker__BeforeHitCallback and returns flags.ret_value; returning
+-- false skips the hit entirely (ai_stalker_fire.cpp:408-423).
+-- ---------------------------------------------------------------------------
+local HIT_SEND_MIN_MS = 50 -- <= 20 sends/s
+local HIT_NOTICE_MS = 1000
+local last_hit_send_tg = 0
+local last_hit_notice_tg = 0
+
+local g_hit_payload = ffi.new("char[13]")
+local g_hit_float = ffi.new("zone_hit_float_cast")
+
+local function hit_payload_u32(buf, off, v)
+    v = (tonumber(v) or 0) % 4294967296
+    buf[off] = v % 256
+    buf[off + 1] = math.floor(v / 256) % 256
+    buf[off + 2] = math.floor(v / 65536) % 256
+    buf[off + 3] = math.floor(v / 16777216) % 256
+end
+
+local function hit_payload_f32(buf, off, v)
+    g_hit_float.f = tonumber(v) or 0
+    for i = 0, 3 do buf[off + i] = g_hit_float.b[i] end
+end
+
+-- Reverse lookup: the engine hands us a game object, the wire addresses the
+-- proxy by its session id. Proxy se_id/game_id are both the local alife/engine
+-- object id (spawn_proxy stores se_obj.id; update_proxy promotes it to
+-- game_id), so either comparison resolves the wire id.
+local function proxy_session_for_object(obj)
+    if not obj then return nil end
+    local id = nil
+    pcall(function() id = obj:id() end)
+    if id == nil then return nil end
+    for sid, proxy in pairs(spawned_proxies) do
+        if proxy.game_id == id or proxy.se_id == id then
+            return sid
+        end
+    end
+    return nil
+end
+
+local function is_local_actor(obj)
+    if not obj then return false end
+    if obj == db.actor then return true end
+    local same = false
+    pcall(function()
+        if db and db.actor then same = (obj:id() == db.actor:id()) end
+    end)
+    return same
+end
+
+local function local_session_id()
+    local sid = 0
+    pcall(function()
+        if ZoneNet and ZoneNet.GetSessionInfo then
+            sid = select(1, ZoneNet:GetSessionInfo()) or 0
+        end
+    end)
+    return tonumber(sid) or 0
+end
+
+-- Never let a callback error escape into the engine dispatcher.
+local function on_npc_before_hit(npc, s_hit, bone_id, flags)
+    pcall(function()
+        if not s_hit then return end
+        local sid = proxy_session_for_object(npc)
+        if not sid then return end
+        if not is_local_actor(s_hit.draftsman) then return end
+
+        local damage = tonumber(s_hit.power) or 0
+        if damage <= 0 then damage = 1 end
+        local bone = tonumber(bone_id) or 0
+        if bone < 0 then bone = 0 end
+        if bone > 255 then bone = 255 end
+
+        local tg = time_global()
+        if tg - last_hit_send_tg >= HIT_SEND_MIN_MS then
+            last_hit_send_tg = tg
+            hit_payload_u32(g_hit_payload, 0, sid)
+            hit_payload_u32(g_hit_payload, 4, local_session_id())
+            hit_payload_f32(g_hit_payload, 8, damage)
+            g_hit_payload[12] = bit.band(bone, 0xFF)
+            if ZoneNet and type(ZoneNet.SendRaw) == "function" then
+                ZoneNet:SendRaw(0x0050, g_hit_payload, 13, true)
+            end
+        end
+
+        -- Proxy HP is server-authoritative: cancel the local engine hit. The
+        -- flag veto is the verified contract; zeroing power is defence in
+        -- depth in case another npc_on_before_hit subscriber re-asserts the
+        -- flag after us.
+        pcall(function() s_hit.power = 0 end)
+        if type(flags) == "table" then
+            flags.ret_value = false
+        end
+    end)
+end
+
+-- Incoming: a server-relayed 0x0050 addressed to this client. The wire target
+-- is the local session id; db.actor:id() is also accepted (legacy/engine-id
+-- shape) so a relay cannot silently miss. Damage is applied through the
+-- verified CScriptGameObject binding (script_game_object_script2.cpp:83,
+-- EntityCondition.cpp:181) and never in a safe zone. Death (health <= 0) is
+-- left entirely to the engine: ChangeHealth only accumulates a delta and the
+-- engine's condition update clamps/raises the death path; no extra logic here.
+local function local_actor_target(target_id)
+    if not (db and db.actor) then return false end
+    if target_id == db.actor:id() then return true end
+    local sid = local_session_id()
+    return sid ~= 0 and target_id == sid
+end
+
+local function actor_in_safezone()
+    local inside = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsInSafeZone then
+            inside = ZoneNet:IsInSafeZone() == true
+        end
+    end)
+    if inside then return true end
+    pcall(function()
+        if zone_safezone and type(zone_safezone.is_position_in_safezone) == "function" then
+            inside = zone_safezone.is_position_in_safezone(db.actor:position()) == true
+        end
+    end)
+    return inside
+end
+
+local function apply_actor_hit(damage, attacker_id)
+    local dmg = tonumber(damage) or 0
+    if dmg <= 0 then return end
+    if not (db and db.actor) then return end
+    if actor_in_safezone() then return end
+
+    local hp = nil
+    pcall(function() hp = db.actor:health() end)
+    if hp ~= nil then
+        hp = tonumber(hp) or 0
+        if hp <= 0 then return end
+        if dmg > hp then dmg = hp end
+    end
+
+    pcall(function() db.actor:change_health(-dmg) end)
+
+    local tg = time_global()
+    if tg - last_hit_notice_tg >= HIT_NOTICE_MS then
+        last_hit_notice_tg = tg
+        local attacker_name = peer_names[attacker_id] or ""
+        local msg = attacker_name ~= ""
+            and string.format("%s hit you: %.1f", attacker_name, dmg)
+            or string.format("Incoming hit: %.1f", dmg)
+        pcall(function()
+            db.actor:give_game_news("Zone", msg, "ui_inGame2_PDA_icon", 0, 3000, 0)
+        end)
+    end
+end
+
 function on_damage_notify(target_id, attacker_id, damage, bone_id)
+    if local_actor_target(target_id) then
+        apply_actor_hit(damage, attacker_id)
+        return
+    end
+
     local proxy = spawned_proxies[target_id]
     if not proxy then return end
 
@@ -779,8 +969,10 @@ function on_entity_leave(pkt, offset)
     despawn_proxy(eid)
 end
 
-function on_level_changing()
-    clear_local_correction()
+-- Release every online proxy and drop all wire state. Shared by level change
+-- and server-drop cleanup (zone_net calls on_disconnect when the DLL reports
+-- the session lost, so proxies do not freeze until the next level load).
+local function release_all_proxies()
     pcall(function()
         local sim = nil
         if alife then
@@ -803,8 +995,19 @@ function on_level_changing()
     pending_peers = {}
 end
 
+function on_level_changing()
+    release_all_proxies()
+end
+
+function on_disconnect()
+    release_all_proxies()
+end
+
 function on_game_start()
     if RegisterScriptCallback then
         RegisterScriptCallback("on_level_changing", on_level_changing)
+        RegisterScriptCallback("actor_on_net_destroy", on_disconnect)
+        -- Outgoing player-vs-player hit registration (0x0050).
+        RegisterScriptCallback("npc_on_before_hit", on_npc_before_hit)
     end
 end

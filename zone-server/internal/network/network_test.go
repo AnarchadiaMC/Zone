@@ -104,6 +104,50 @@ func TestTryAddCappedReturnsEvictedSameID(t *testing.T) {
 	}
 }
 
+// Same-AccountID replacement must also be reported as evicted: one account
+// holds exactly one live session (no double sessions, no split rate budgets).
+func TestTryAddCappedEvictsSameAccount(t *testing.T) {
+	sm := NewSessionManager()
+	addr1, _ := net.ResolveUDPAddr("udp", "127.0.0.1:12347")
+	addr2, _ := net.ResolveUDPAddr("udp", "127.0.0.1:12348")
+
+	first := &PlayerSession{SessionID: 11, AccountID: "acct-dup", UDPAddr: addr1, LastSeen: time.Now()}
+	if evicted, added := sm.TryAddCapped(first, 10); !added || len(evicted) != 0 {
+		t.Fatalf("initial insert: added=%v evicted=%d, want true/0", added, len(evicted))
+	}
+
+	second := &PlayerSession{SessionID: 12, AccountID: "acct-dup", UDPAddr: addr2, LastSeen: time.Now()}
+	evicted, added := sm.TryAddCapped(second, 10)
+	if !added {
+		t.Fatal("same-account reconnect was rejected")
+	}
+	if len(evicted) != 1 || evicted[0] != first {
+		t.Fatalf("evicted = %v, want the previous same-account session", evicted)
+	}
+	if sm.GetByID(11) != nil {
+		t.Fatal("evicted same-account session still resolvable by ID")
+	}
+	if sm.GetByAddr(addr1.String()) != nil {
+		t.Fatal("evicted same-account session still resolvable by address")
+	}
+	if sm.Count() != 1 {
+		t.Fatalf("count = %d, want 1 after same-account eviction", sm.Count())
+	}
+	if sm.GetByAddr(addr2.String()) != second {
+		t.Fatal("byAddr does not point at the new same-account session")
+	}
+
+	// A different account from a distinct address is still subject to the cap.
+	addr3, _ := net.ResolveUDPAddr("udp", "127.0.0.1:12349")
+	third := &PlayerSession{SessionID: 13, AccountID: "acct-other", UDPAddr: addr3, LastSeen: time.Now()}
+	if _, added := sm.TryAddCapped(third, 1); added {
+		t.Fatal("different account was admitted over cap")
+	}
+	if sm.Count() != 1 {
+		t.Fatalf("count = %d, want 1 after capped reject", sm.Count())
+	}
+}
+
 // Handshake names are made unique case-insensitively with deterministic "~n"
 // suffixes.
 func TestEnsureUniqueName(t *testing.T) {

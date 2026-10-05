@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"zone-online/zone-server/internal/config"
 	"zone-online/zone-server/internal/network"
 	"zone-online/zone-server/internal/protocol"
 )
@@ -371,5 +372,249 @@ func BenchmarkItemLedger_LookupRecord(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		l.Record(1, uint32(i+1), pkt)
 		_, _ = l.Lookup(1, uint32(i+1))
+	}
+}
+
+// The dropped world item's condition comes from the removed inventory row, not
+// from the client-supplied byte, so a 60% stack cannot be laundered into a
+// 100% world item.
+func TestItemDropConditionDerivedFromInventory(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-cond-drop", "hwid", "CondDrop"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-cond-drop", "bandage", 2, 0.6)
+	sess := ledgerSession(t, s, 6801, 45081, "uuid-cond-drop", "l01_escape", [3]float32{0, 0, 0})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionDrop
+	pkt.Count = 2
+	pkt.Condition = 100
+	assembleSection(&pkt.Section, "bandage")
+	sendItemAction(t, s, sess, 1, pkt)
+
+	ok := itemUpdatesByResult(t, sink)[protocol.ItemResultOK]
+	if len(ok) != 1 {
+		t.Fatalf("drop OK updates = %d, want 1", len(ok))
+	}
+	if ok[0].Condition != 60 {
+		t.Fatalf("drop update condition = %d, want 60 from the inventory row", ok[0].Condition)
+	}
+	wi, err := db.GetWorldItem(int64(ok[0].ItemID))
+	if err != nil {
+		t.Fatalf("GetWorldItem: %v", err)
+	}
+	if got := int(wi.Condition*100 + 0.5); got != 60 {
+		t.Fatalf("world item condition = %d, want 60", got)
+	}
+}
+
+// Picked-up items merge into the inventory row with the same condition bucket;
+// a 50% pickup never repairs the 100% stack.
+func TestItemPickupMergesByConditionBucket(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-cond-pick", "hwid", "CondPick"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-cond-pick", "bandage", 1, 0.5)
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-cond-pick", "bandage", 1, 1.0)
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", 5, 1, 5, "bandage", 2, 0.5)
+	var itemID int64
+	if err := db.RawDB().QueryRow("SELECT id FROM world_items LIMIT 1").Scan(&itemID); err != nil {
+		t.Fatalf("world item id: %v", err)
+	}
+	sess := ledgerSession(t, s, 6802, 45082, "uuid-cond-pick", "l01_escape", [3]float32{5, 1, 5})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionPickup
+	pkt.ItemID = uint32(itemID)
+	assembleSection(&pkt.Section, "bandage")
+	sendItemAction(t, s, sess, 1, pkt)
+	if len(itemUpdatesByResult(t, sink)[protocol.ItemResultOK]) != 1 {
+		t.Fatalf("pickup not acknowledged")
+	}
+
+	byCondition := map[int]int{}
+	items, err := db.GetCharacterInventory("uuid-cond-pick")
+	if err != nil {
+		t.Fatalf("GetCharacterInventory: %v", err)
+	}
+	for _, it := range items {
+		byCondition[int(it.Condition*100+0.5)] += it.ItemCount
+	}
+	if len(items) != 2 || byCondition[50] != 3 || byCondition[100] != 1 {
+		t.Fatalf("inventory buckets = %+v (rows %+v), want 50:3 100:1", byCondition, items)
+	}
+}
+
+// A rejected pickup must force an inventory sync so the client cannot keep a
+// ghost copy of a ground item it optimistically removed.
+func TestItemPickupRejectedForcesSync(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-pick-rej", "hwid", "PickRej"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", 100, 0, 100, "medkit", 1, 1.0)
+	var itemID int64
+	if err := db.RawDB().QueryRow("SELECT id FROM world_items LIMIT 1").Scan(&itemID); err != nil {
+		t.Fatalf("world item id: %v", err)
+	}
+	sess := ledgerSession(t, s, 6803, 45083, "uuid-pick-rej", "l01_escape", [3]float32{0, 0, 0})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionPickup
+	pkt.ItemID = uint32(itemID)
+	assembleSection(&pkt.Section, "medkit")
+	sendItemAction(t, s, sess, 1, pkt)
+
+	if len(itemUpdatesByResult(t, sink)[protocol.ItemResultRejected]) != 1 {
+		t.Fatalf("out-of-range pickup not rejected")
+	}
+	if len(packetsByOpcode(sink, protocol.OpInventorySync)) == 0 {
+		t.Fatal("rejected pickup did not force an inventory sync")
+	}
+}
+
+// Per-level world item cap rejects drops beyond the limit and leaves the
+// inventory untouched.
+func TestItemDropPerLevelCapRejected(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	s.cfg = &config.Config{WorldItemMaxPerLevel: 1}
+	if err := db.AutoProvision("uuid-cap", "hwid", "Cap"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-cap", "bandage", 2, 1.0)
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", 0, 0, 0, "medkit", 1, 1.0)
+	sess := ledgerSession(t, s, 6804, 45084, "uuid-cap", "l01_escape", [3]float32{0, 0, 0})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionDrop
+	pkt.Count = 1
+	assembleSection(&pkt.Section, "bandage")
+	sendItemAction(t, s, sess, 1, pkt)
+
+	if len(itemUpdatesByResult(t, sink)[protocol.ItemResultRejected]) != 1 {
+		t.Fatalf("over-cap drop not rejected")
+	}
+	if got := countWorldItems(t, s); got != 1 {
+		t.Fatalf("world items after capped drop = %d, want 1", got)
+	}
+	if avail, _ := db.AvailableItemCount("uuid-cap", "bandage"); avail != 2 {
+		t.Fatalf("inventory after capped drop = %d, want 2", avail)
+	}
+}
+
+// Drop broadcasts go only to sessions within the AoI radius of the item (plus
+// the sender echo), not to every same-level session.
+func TestItemBroadcastAoIOnly(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-aoi", "hwid", "AoI"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+		"uuid-aoi", "bandage", 1, 1.0)
+	sender := ledgerSession(t, s, 6805, 45085, "uuid-aoi", "l01_escape", [3]float32{0, 0, 0})
+	ledgerSession(t, s, 6806, 45086, "uuid-near", "l01_escape", [3]float32{10, 0, 10})
+	ledgerSession(t, s, 6807, 45087, "uuid-far", "l01_escape", [3]float32{900, 0, 900})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionDrop
+	pkt.Count = 1
+	assembleSection(&pkt.Section, "bandage")
+	sendItemAction(t, s, sender, 1, pkt)
+
+	if got := len(packetsByOpcode(sink, protocol.OpItemUpdate)); got != 2 {
+		t.Fatalf("OpItemUpdate deliveries = %d, want 2 (sender echo + near peer only)", got)
+	}
+}
+
+// A pickup of a section whose existing row is ammo-bearing adds rounds to
+// ammo_current instead of materialising zero-ammo copies.
+func TestItemPickupCreditsAmmoRounds(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-ammo-pick", "hwid", "AmmoPick"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO character_inventory (client_uuid, item_section, item_count, condition, ammo_current) VALUES (?, ?, ?, ?, ?)",
+		"uuid-ammo-pick", "wpn_pm", 1, 1.0, 30)
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", 0, 0, 0, "wpn_pm", 15, 1.0)
+	var itemID int64
+	if err := db.RawDB().QueryRow("SELECT id FROM world_items LIMIT 1").Scan(&itemID); err != nil {
+		t.Fatalf("world item id: %v", err)
+	}
+	sess := ledgerSession(t, s, 6808, 45088, "uuid-ammo-pick", "l01_escape", [3]float32{0, 0, 0})
+	sink.Reset()
+
+	var pkt protocol.ItemActionPacket
+	pkt.ActionID = 1
+	pkt.Action = protocol.ItemActionPickup
+	pkt.ItemID = uint32(itemID)
+	assembleSection(&pkt.Section, "wpn_pm")
+	sendItemAction(t, s, sess, 1, pkt)
+
+	items, err := db.GetCharacterInventory("uuid-ammo-pick")
+	if err != nil {
+		t.Fatalf("GetCharacterInventory: %v", err)
+	}
+	if len(items) != 1 || items[0].ItemCount != 1 || items[0].AmmoCurrent != 45 {
+		t.Fatalf("ammo pickup = %+v, want one object with ammo 45", items)
+	}
+}
+
+// Expired world items are deleted and same-level clients receive a removal
+// broadcast.
+func TestWorldItemTTLSweep(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-ttl", "hwid", "TTL"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	if _, err := db.RawDB().Exec(
+		`INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, created_at) VALUES ('l01_escape', 0, 0, 0, 'old_item', '2000-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed old item: %v", err)
+	}
+	if _, err := db.RawDB().Exec(
+		`INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section) VALUES ('l01_escape', 0, 0, 0, 'fresh_item')`); err != nil {
+		t.Fatalf("seed fresh item: %v", err)
+	}
+	ledgerSession(t, s, 6901, 45091, "uuid-ttl", "l01_escape", [3]float32{0, 0, 0})
+	sink.Reset()
+
+	s.sweepWorldItems(time.Now(), time.Minute)
+
+	var remaining string
+	if err := db.RawDB().QueryRow("SELECT section FROM world_items LIMIT 1").Scan(&remaining); err != nil {
+		t.Fatalf("remaining world item query: %v", err)
+	}
+	if remaining != "fresh_item" {
+		t.Fatalf("remaining world item = %q, want fresh_item", remaining)
+	}
+	updates := packetsByOpcode(sink, protocol.OpItemUpdate)
+	if len(updates) != 1 {
+		t.Fatalf("TTL removal broadcasts = %d, want 1", len(updates))
+	}
+	var removal protocol.ItemUpdatePacket
+	if err := binary.Read(bytes.NewReader(packetPayload(t, updates[0])), binary.LittleEndian, &removal); err != nil {
+		t.Fatalf("decode removal: %v", err)
+	}
+	if removal.Action != protocol.ItemActionPickup || removal.Count != 0 || removal.ItemID == 0 {
+		t.Fatalf("removal packet = %+v, want pickup-shaped count=0 removal", removal)
 	}
 }

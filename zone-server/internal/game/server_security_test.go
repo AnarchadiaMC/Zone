@@ -3,6 +3,7 @@ package game
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -217,9 +218,12 @@ func TestSecurity_TryAddCappedConcurrent(t *testing.T) {
 			addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:42000")
 			// Distinct port per racer so they are distinct addrs.
 			addr.Port = 42000 + i
+			// Distinct accounts per racer: same-AccountID sessions are
+			// deliberately evicted by TryAddCapped (one live session per
+			// account), so a shared account would defeat the cap assertion.
 			_, ok := sm.TryAddCapped(&network.PlayerSession{
 				SessionID: uint32(8000 + i),
-				AccountID: "uuid-race",
+				AccountID: fmt.Sprintf("uuid-race-%d", i),
 				UDPAddr:   addr,
 				LastSeen:  time.Now(),
 			}, max)

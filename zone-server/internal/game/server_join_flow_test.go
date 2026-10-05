@@ -502,3 +502,74 @@ func TestJoinFlow_NewcomerSkipsPeersWithoutVisual(t *testing.T) {
 		t.Fatal("newcomer did not receive ENTITY_ENTER for peer with gvid+visual")
 	}
 }
+
+// On join a returning player receives one drop-shaped OpItemUpdate per
+// persisted world item inside AoI; items on other levels or outside the radius
+// are skipped.
+func TestJoinFlow_SendsWorldItemsInAoI(t *testing.T) {
+	s, sink, db := setupTestServerWithDB(t)
+	if err := db.AutoProvision("uuid-join-items", "hwid", "Scavenger"); err != nil {
+		t.Fatalf("AutoProvision: %v", err)
+	}
+	if err := db.CreateCharacter("uuid-join-items", "stalker", "", 0); err != nil {
+		t.Fatalf("CreateCharacter: %v", err)
+	}
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", -211.3, -20.2, -145.8, "medkit", 2, 0.5)
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l01_escape", 0, 0, 0, "far_item", 1, 1.0)
+	mustExec(t, s, "INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"l02_garbage", -211.3, -20.2, -145.8, "other_level", 1, 1.0)
+	sink.Reset()
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31020}
+	doJoinHandshake(t, s, addr, "uuid-join-items", "Scavenger")
+
+	updates := packetsByOpcode(sink, protocol.OpItemUpdate)
+	if len(updates) != 1 {
+		t.Fatalf("join world item updates = %d, want 1 (near item only)", len(updates))
+	}
+	var u protocol.ItemUpdatePacket
+	if err := binary.Read(bytes.NewReader(packetPayload(t, updates[0])), binary.LittleEndian, &u); err != nil {
+		t.Fatalf("decode world item update: %v", err)
+	}
+	if u.Result != protocol.ItemResultOK || u.Action != protocol.ItemActionDrop || u.ItemID == 0 {
+		t.Fatalf("world item update = %+v, want drop-shaped result=0 action=1", u)
+	}
+	if sec := string(bytes.TrimRight(u.Section[:], "\x00")); sec != "medkit" {
+		t.Fatalf("world item section = %q, want medkit", sec)
+	}
+	if u.Condition != 50 {
+		t.Fatalf("world item condition = %d, want 50", u.Condition)
+	}
+}
+
+// A second handshake with the same account UUID evicts the first session: at
+// most one live session per account.
+func TestJoinFlow_SameUUIDEvictsOldSession(t *testing.T) {
+	s, _, _ := setupTestServerWithDB(t)
+	addr1 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31021}
+	addr2 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31022}
+
+	doJoinHandshake(t, s, addr1, "uuid-dup-join", "First")
+	if s.sessions.GetByAddr(addr1.String()) == nil {
+		t.Fatal("first session missing after handshake")
+	}
+	doJoinHandshake(t, s, addr2, "uuid-dup-join", "Second")
+
+	live := 0
+	for _, sess := range s.sessions.GetAll() {
+		if sess.AccountID == "uuid-dup-join" {
+			live++
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live sessions for UUID = %d, want exactly 1", live)
+	}
+	if s.sessions.GetByAddr(addr1.String()) != nil {
+		t.Fatal("old same-UUID session was not evicted")
+	}
+	if s.sessions.GetByAddr(addr2.String()) == nil {
+		t.Fatal("second same-UUID session missing")
+	}
+}

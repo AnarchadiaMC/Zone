@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS world_items (
     condition REAL NOT NULL DEFAULT 1.0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+-- schema_version tracks which idempotent boot migrations have already run.
+-- Single-row table (id=1); a database without a row is treated as version 0
+-- and all migrations run once, then get stamped. Without this gate every boot
+-- re-ran the data-mutating UPDATEs in migrateCharacterColumns.
+CREATE TABLE IF NOT EXISTS schema_version (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS world_stashes (
     stash_id INTEGER PRIMARY KEY AUTOINCREMENT,
     level_name TEXT NOT NULL,
@@ -99,7 +107,11 @@ CREATE TABLE IF NOT EXISTS ai_squads (
     pos_y REAL NOT NULL,
     pos_z REAL NOT NULL,
     patrol_path TEXT,
-    is_online INTEGER NOT NULL DEFAULT 0
+    is_online INTEGER NOT NULL DEFAULT 0,
+    label TEXT NOT NULL DEFAULT '',
+    patrol_radius REAL NOT NULL DEFAULT 32.0,
+    walk_speed REAL NOT NULL DEFAULT 1.5,
+    run_speed REAL NOT NULL DEFAULT 3.0
 );
 -- Performance indexes (idempotent; safe for existing DBs on Open).
 -- NOTE: this schema uses client_uuid as the account/character key, so
@@ -108,5 +120,6 @@ CREATE INDEX IF NOT EXISTS idx_char_account ON characters(client_uuid);
 CREATE INDEX IF NOT EXISTS idx_inv_char ON character_inventory(client_uuid);
 CREATE INDEX IF NOT EXISTS idx_stashes_level ON world_stashes(level_name);
 CREATE INDEX IF NOT EXISTS idx_world_items_level ON world_items(level_name);
+CREATE INDEX IF NOT EXISTS idx_world_items_created ON world_items(created_at);
 CREATE INDEX IF NOT EXISTS idx_zones_level ON safe_zones(level_name);
 `

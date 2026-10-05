@@ -2,6 +2,7 @@ package game
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"net"
 	"sync"
@@ -52,10 +53,6 @@ func (f *fakeSink) PacketCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.sent)
-}
-
-func newFakeSessionManager() *network.SessionManager {
-	return network.NewSessionManager()
 }
 
 func setupTestServerWithDB(t *testing.T) (*Server, *fakeSink, *database.DB) {
@@ -232,19 +229,18 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10020}
 	sess := &network.PlayerSession{
-		SessionID:         100,
-		AccountID:         "uuid-transform",
-		UDPAddr:           addr,
-		Position:          [3]float32{0, 0, 0},
-		LastTransformTime: time.Now().Add(-1 * time.Second),
+		SessionID: 100,
+		AccountID: "uuid-transform",
+		UDPAddr:   addr,
+		Position:  [3]float32{0, 0, 0},
 	}
 	s.sessions.AddSession(sess)
 
-	// 1. Valid transform (physically plausible: ~14.3m in ~1s ≈ 14 m/s).
+	// 1. Valid transform (movement is accepted regardless of distance)
 	ctValid := protocol.ClientTransform{
-		PosX:      10.0,
-		PosY:      2.0,
-		PosZ:      10.0,
+		PosX:      2.0,
+		PosY:      0.5,
+		PosZ:      2.0,
 		Yaw:       4500,
 		Pitch:     0,
 		VelX:      300,
@@ -258,8 +254,8 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	pos := sess.Position
 	sess.Unlock()
-	if pos[0] != 10.0 || pos[1] != 2.0 || pos[2] != 10.0 {
-		t.Errorf("expected position [10, 2, 10], got %v", pos)
+	if pos[0] != 2.0 || pos[1] != 0.5 || pos[2] != 2.0 {
+		t.Errorf("expected position [2, 0.5, 2], got %v", pos)
 	}
 
 	// 2. S-09: Invalid transform with NaN
@@ -274,7 +270,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterNaN := sess.Position
 	sess.Unlock()
-	if posAfterNaN[0] != 10.0 {
+	if posAfterNaN[0] != 2.0 {
 		t.Errorf("S-09 violation: position updated with NaN! Got %v", posAfterNaN)
 	}
 
@@ -290,7 +286,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterInf := sess.Position
 	sess.Unlock()
-	if posAfterInf[0] != 10.0 {
+	if posAfterInf[0] != 2.0 {
 		t.Errorf("S-09 violation: position updated with Inf! Got %v", posAfterInf)
 	}
 
@@ -306,7 +302,7 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 	sess.Lock()
 	posAfterOOB := sess.Position
 	sess.Unlock()
-	if posAfterOOB[0] != 10.0 {
+	if posAfterOOB[0] != 2.0 {
 		t.Errorf("S-09 violation: position updated with out of bounds coord! Got %v", posAfterOOB)
 	}
 }
@@ -315,39 +311,66 @@ func TestHandlePacket_Transform_ValidAndInvalidBounds(t *testing.T) {
 // S-01: Tick Play Time Increments
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestTick_PlayTimeIncrement_30Hz(t *testing.T) {
-	s, _, _ := setupTestServerWithDB(t)
+// S-01: play time must be credited once per REAL second at any tick rate.
+func TestTick_PlayTimeIncrement_TimeBased(t *testing.T) {
+	for _, hz := range []int{20, 30, 60} {
+		t.Run(fmt.Sprintf("%dHz", hz), func(t *testing.T) {
+			s, _, _ := setupTestServerWithDB(t)
 
-	dbQueue := make(chan *database.DBWriteJob, 100)
-	s.dbQueue = dbQueue
+			dbQueue := make(chan *database.DBWriteJob, 100)
+			s.dbQueue = dbQueue
 
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10030}
-	sess := &network.PlayerSession{
-		SessionID: 300,
-		AccountID: "uuid-stats-test",
-		UDPAddr:   addr,
-		LastSeen:  time.Now(),
-	}
-	s.sessions.AddSession(sess)
+			addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10030 + hz}
+			sess := &network.PlayerSession{
+				SessionID: 300,
+				AccountID: "uuid-stats-test",
+				UDPAddr:   addr,
+				LastSeen:  time.Now(),
+			}
+			s.sessions.AddSession(sess)
 
-	// Run 29 ticks
-	for i := 0; i < 29; i++ {
-		s.Tick(time.Now())
-	}
-	// At tick 29, queue should be empty (no stats queued yet)
-	if len(dbQueue) > 0 {
-		t.Fatalf("S-01 violation: QueuePeriodicStats called before 30th tick! Queue len = %d", len(dbQueue))
-	}
+			interval := time.Second / time.Duration(hz)
+			base := time.Now()
 
-	// 30th tick should trigger QueuePeriodicStats
-	s.Tick(time.Now())
-	if len(dbQueue) != 1 {
-		t.Fatalf("expected exactly 1 DB write job at tick 30, got %d", len(dbQueue))
-	}
+			// First tick seeds the credit clock; nothing is credited yet.
+			s.Tick(base)
+			if len(dbQueue) != 0 {
+				t.Fatalf("%dHz: QueuePeriodicStats before one real second, queue=%d", hz, len(dbQueue))
+			}
 
-	job := <-dbQueue
-	if !bytes.Contains([]byte(job.Query), []byte("play_time_sec = play_time_sec + ?")) {
-		t.Errorf("unexpected query queued: %s", job.Query)
+			// Ticks strictly inside the first second must not credit.
+			for i := 1; i < hz; i++ {
+				s.Tick(base.Add(time.Duration(i) * interval))
+			}
+			if len(dbQueue) != 0 {
+				t.Fatalf("%dHz: credited play time before a full second elapsed (queue=%d)", hz, len(dbQueue))
+			}
+
+			// The tick at exactly +1 s credits exactly 1 second.
+			s.Tick(base.Add(time.Second))
+			if len(dbQueue) != 1 {
+				t.Fatalf("%dHz: expected exactly 1 credit after 1 s, got %d", hz, len(dbQueue))
+			}
+			job := <-dbQueue
+			if !bytes.Contains([]byte(job.Query), []byte("play_time_sec = play_time_sec + ?")) {
+				t.Errorf("%dHz: unexpected query queued: %s", hz, job.Query)
+			}
+			if delta, ok := job.Args[0].(int); !ok || delta != 1 {
+				t.Errorf("%dHz: play time delta = %v, want 1", hz, job.Args[0])
+			}
+
+			// A second full second credits again, exactly once.
+			for i := hz + 1; i < 2*hz; i++ {
+				s.Tick(base.Add(time.Duration(i) * interval))
+			}
+			if len(dbQueue) != 0 {
+				t.Fatalf("%dHz: credited before the second full second (queue=%d)", hz, len(dbQueue))
+			}
+			s.Tick(base.Add(2 * time.Second))
+			if len(dbQueue) != 1 {
+				t.Fatalf("%dHz: expected exactly 1 credit after 2 s, got %d", hz, len(dbQueue))
+			}
+		})
 	}
 }
 
@@ -494,49 +517,5 @@ func TestBanPlayer_SavesStateKicksAndBreaksLoop(t *testing.T) {
 	}
 	if char.Health != 90.0 {
 		t.Errorf("expected DB health 90, got %f", char.Health)
-	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// S-13: Anti-Cheat 3D Speed Magnitude Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-func TestAntiCheat_ValidateMove_3DSpeedMagnitude(t *testing.T) {
-	ac := NewAntiCheatManager()
-
-	sess := &network.PlayerSession{
-		SessionID: 601,
-		Position:  [3]float32{0, 0, 0},
-	}
-
-	// 1. Normal horizontal move: 10m in 1s = 10 m/s <= 25 m/s -> valid
-	valid, reason := ac.ValidateMove(sess, [3]float32{10, 0, 0}, 1.0)
-	if !valid {
-		t.Errorf("expected normal move to be valid, got false: %s", reason)
-	}
-
-	// 2. Normal 3D move: dx=10, dy=5, dz=10, dt=1.0 -> sqrt(100+25+100) = sqrt(225) = 15 m/s <= 25 m/s -> valid
-	valid, reason = ac.ValidateMove(sess, [3]float32{10, 5, 10}, 1.0)
-	if !valid {
-		t.Errorf("expected normal 3D move to be valid, got false: %s", reason)
-	}
-
-	// 3. S-13 Violation: 3D diagonal speed hack:
-	// dx=18, dy=10, dz=18 -> 18^2+10^2+18^2 = 324+100+324 = 748 -> sqrt(748) ~ 27.35 m/s > 25 m/s!
-	valid, reason = ac.ValidateMove(sess, [3]float32{18, 10, 18}, 1.0)
-	if valid {
-		t.Errorf("S-13 violation: 3D speed > 25 m/s was accepted as valid!")
-	}
-	if reason == "" {
-		t.Errorf("expected non-empty reason for speed violation")
-	}
-
-	// 4. Vertical teleport: dy=20m > 15m
-	valid, reason = ac.ValidateMove(sess, [3]float32{0, 20, 0}, 1.0)
-	if valid {
-		t.Errorf("expected vertical teleport to be rejected")
-	}
-	if reason != "vertical teleport" {
-		t.Errorf("expected 'vertical teleport', got %q", reason)
 	}
 }

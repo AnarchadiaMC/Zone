@@ -407,7 +407,6 @@ function UIZoneServerList:__init(owner)
     self.broadcast_hit = nil
 
     -- Async scheduler state.
-    self.scan_mode = nil
     self.async_ok = nil
     self.scan_gen = 0
     self.query_inflight = {}
@@ -415,7 +414,6 @@ function UIZoneServerList:__init(owner)
     self.queue_lan = {}
     self.scan_total = 0
     self.scan_done = 0
-    self.scan_fail_reason = nil
     self.last_fail_reason = nil
     self.last_retry_service = 0
     -- Post-scan summary and persistent-failure reporting.
@@ -1692,7 +1690,6 @@ function UIZoneServerList:StartScan(reset_backoff)
     if not self.async_ok then
         -- Blocking fallback (DLL without ZN_QueryStart): legacy 450 ms probes
         -- spaced by SCAN_STEP_MS so the UI stays responsive.
-        self.scan_mode = "blocking"
         local queue = {}
         local seen = {}
         local function push(e)
@@ -1735,14 +1732,12 @@ function UIZoneServerList:StartScan(reset_backoff)
 
     -- Async scheduling: new generation, favorites/history first, LAN
     -- broadcast entries on the LAN tab, then fill up to the concurrency caps.
-    self.scan_mode = "async"
     self.scan_gen = (self.scan_gen or 0) + 1
     self.query_inflight = {}
     self.queue_internet = {}
     self.queue_lan = {}
     self.scan_total = 0
     self.scan_done = 0
-    self.scan_fail_reason = nil
     self.view_dirty = false
 
     local now_wall = now_timestamp()
@@ -1943,14 +1938,6 @@ function UIZoneServerList:ApplyQuery(probe, info)
     return entry
 end
 
-function UIZoneServerList:ApplyOffline(probe, reason)
-    if probe.broadcast then return nil end
-    local entry = self:FindEntry(probe.ip, probe.port)
-    if not entry then return nil end
-    self:MarkFailure(entry, reason)
-    return entry
-end
-
 function UIZoneServerList:OnProbeSuccess(probe, info)
     if probe.gen and probe.gen ~= self.scan_gen then return end
     local entry = self:ApplyQuery(probe, info)
@@ -1977,7 +1964,6 @@ function UIZoneServerList:OnProbeFailure(probe, reason)
     end
     if not probe.broadcast then
         self.last_fail_reason = reason or ""
-        if probe.scan then self.scan_fail_reason = reason or "" end
         local entry = self:FindEntry(probe.ip, probe.port)
         if entry then
             self:MarkFailure(entry, reason)

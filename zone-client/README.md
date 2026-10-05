@@ -52,7 +52,6 @@ Unlike traditional mods that require manual file extraction, directory creation,
 ```
 zone-client/
 ├── 3rdparty/
-│   ├── lua/                # LuaJIT C API headers (reference only; not compiled)
 │   └── minhook/            # MinHook source & headers (buffer, hook, trampoline, hde64)
 ├── injector/
 │   └── injector_main.cpp   # Automated launcher, DLL staging and Win32 remote thread injector
@@ -61,8 +60,7 @@ zone-client/
 │   │   ├── identity.h      # HWID (FNV-1a) & UUID v4 identity engine
 │   │   └── identity.cpp    # zone_identity.ltx merge writer (canonical schema)
 │   ├── lua/
-│   │   ├── zone_bindings.h # ZoneNet Lua C function declarations (legacy reference)
-│   │   └── zone_bindings.cpp # 21 ZN_* FFI exports
+│   │   └── zone_bindings.cpp # 22 ZN_* FFI exports (loaded via ffi.load)
 │   ├── net/
 │   │   ├── udp_client.h    # WinSock2 background networking thread
 │   │   └── udp_client.cpp

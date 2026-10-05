@@ -28,8 +28,6 @@ end
 function xrr_is_active()
     return xrr_overlay_active()
 end
--- Alias matching the suggested helper name.
-zone_active = xrr_is_active
 
 local function generate_random_uuid()
     math.randomseed(os.time() + (time_global and time_global() or 0))
@@ -412,18 +410,4 @@ function on_before_load_input(dik, bind, flags)
         end)
         flags.ret = true
     end
-end
-function get_server_spawn()
-    local x, y, z = 0, 0, 0
-    pcall(function()
-        if ZoneNet and ZoneNet.GetSpawn then x, y, z = ZoneNet:GetSpawn() end
-    end)
-    return x, y, z
-end
-function has_server_character()
-    local has = false
-    pcall(function()
-        if ZoneNet and ZoneNet.HasCharacter then has = ZoneNet:HasCharacter() and true or false end
-    end)
-    return has
 end

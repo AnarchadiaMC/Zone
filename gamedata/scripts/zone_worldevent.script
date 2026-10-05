@@ -1,8 +1,6 @@
 -- zone_worldevent.script
 -- World events (emissions, raids)
 
-local active_emission = false
-local emission_timer = 0
 local current_snd = nil
 
 -- Failure notifications are rate-limited per event type so a broken sound or
@@ -43,8 +41,6 @@ local function notify_failure(kind, msg)
 end
 
 function reset_world_events()
-    active_emission = false
-    emission_timer = 0
     last_notify = {}
     if current_snd then
         pcall(function()
@@ -65,7 +61,6 @@ function on_disconnect()
 end
 
 local function handle_emission_warn(timer)
-    emission_timer = timer
     if not db.actor then return end
     pcall(function()
         local msg = "ZONE EMISSION IN " .. tostring(timer) .. " SECONDS - FIND SHELTER"
@@ -97,8 +92,6 @@ local function handle_emission_warn(timer)
 end
 
 local function handle_emission_active()
-    active_emission = true
-    emission_timer = 0
     -- xr_effects is an unverified Anomaly-script global; nil-guard + pcall (CTD risk).
     local started = false
     if xr_effects and xr_effects.start_surge and db.actor then
@@ -122,8 +115,6 @@ local function handle_emission_active()
 end
 
 local function handle_emission_clear()
-    active_emission = false
-    emission_timer = 0
     -- L-27: Avoid double weather change on emission clear
     local ended = false
     pcall(function()
@@ -195,7 +186,6 @@ function on_world_event(pkt, offset)
             notify_failure("emission_state_" .. tostring(state),
                 tr("ui_zone_event_malformed", "World event data was malformed"))
         end
-    -- NOTE: legacy event_type 1..3 compat removed: collides with future Psi-Storm typing.
     -- Use type 0/state 1-3 for emission; type 4/5 for raids only.
     elseif event_type == 4 then -- RAID_START
         handle_raid_start()

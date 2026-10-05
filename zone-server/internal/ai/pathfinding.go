@@ -153,8 +153,3 @@ func AStar(start, goal Waypoint, graph Graph) []Waypoint {
 
 	return path
 }
-
-// FindPath calculates a path from start to goal using the A* algorithm with iteration limit safety.
-func FindPath(start, goal Waypoint, graph Graph) []Waypoint {
-	return AStar(start, goal, graph)
-}

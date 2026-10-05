@@ -36,6 +36,11 @@ func main() {
 	if *tickRate > 0 {
 		cfg.TickRateHz = *tickRate
 	}
+	// CLI overrides bypass config.Load's validation, so re-validate the merged
+	// result (and re-apply defaults) before the server consumes it.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration after CLI overrides: %v", err)
+	}
 
 	level := zapcore.InfoLevel
 	switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {

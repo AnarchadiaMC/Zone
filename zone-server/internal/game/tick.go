@@ -15,6 +15,11 @@ func (s *Server) RunGameLoop(ctx context.Context) {
 	if s.cfg != nil && s.cfg.TickRateHz > 0 {
 		interval = time.Second / time.Duration(s.cfg.TickRateHz)
 	}
+	// Defensive: an unvalidated config could yield a non-positive interval,
+	// which time.NewTicker panics on.
+	if interval <= 0 {
+		interval = 33333 * time.Microsecond
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

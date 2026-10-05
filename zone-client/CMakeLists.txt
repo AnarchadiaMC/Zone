@@ -67,7 +67,6 @@ set(ZONE_CLIENT_SOURCES
     src/net/udp_client.cpp
     src/net/udp_client.h
     src/lua/zone_bindings.cpp
-    src/lua/zone_bindings.h
     src/provision/asset_provisioner.cpp
     src/provision/asset_provisioner.h
     ${GEN_CPP}
@@ -78,7 +77,6 @@ add_library(ZoneClient SHARED ${ZONE_CLIENT_SOURCES})
 target_include_directories(ZoneClient PRIVATE
     src
     3rdparty/minhook/include
-    3rdparty/lua
     ${GEN_DIR}
 )
 target_link_libraries(ZoneClient PRIVATE
@@ -89,7 +87,6 @@ target_link_libraries(ZoneClient PRIVATE
     wbemuuid
     rpcrt4
 )
-target_compile_definitions(ZoneClient PRIVATE ZO_INJECTABLE)
 
 # ----------------------------------------------------------------------
 # Target 2: ZoneClient_Injector (EXE)

@@ -33,9 +33,6 @@
     <string id="ui_zone_col_mode">
         <text>Режим</text>
     </string>
-    <string id="ui_zone_scan">
-        <text>Сканировать</text>
-    </string>
     <string id="ui_zone_scanning">
         <text>Сканирование...</text>
     </string>
@@ -80,9 +77,6 @@
     </string>
     <string id="ui_zone_status_ready">
         <text>Готово</text>
-    </string>
-    <string id="ui_zone_status_offline">
-        <text>Сетевой модуль недоступен</text>
     </string>
     <string id="ui_zone_details">
         <text>Сведения</text>
@@ -131,12 +125,6 @@
     </string>
     <string id="ui_zone_nearby_title">
         <text>Рядом</text>
-    </string>
-    <string id="ui_zone_no_group">
-        <text>Нет группы</text>
-    </string>
-    <string id="ui_zone_chat_help">
-        <text>Команды чата: /invite &lt;ник&gt;, /accept, /decline, /leave, /group</text>
     </string>
     <string id="ui_zone_sort_hint">
         <text>Щёлкните заголовок столбца для сортировки</text>
@@ -275,5 +263,8 @@
     </string>
     <string id="ui_zone_item_action_rejected">
         <text>Сервер отклонил действие с предметом: %s</text>
+    </string>
+    <string id="ui_zone_item_action_timeout">
+        <text>Сервер не подтвердил действие с предметом; инвентарь будет синхронизирован при следующей синхронизации.</text>
     </string>
 </string_table>

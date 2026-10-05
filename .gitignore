@@ -53,3 +53,7 @@ zone_world.db*
 *.bak
 appdata/logs/
 imgui.ini
+
+# Python Bytecode
+__pycache__/
+*.pyc

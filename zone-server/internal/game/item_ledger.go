@@ -35,15 +35,33 @@ type cachedItemResult struct {
 	packet   protocol.ItemUpdatePacket
 }
 
+// cachedContainerResult is the OpContainerUpdate twin of cachedItemResult.
+// Both caches share the per-session monotonic ActionID floor and rate window,
+// so 0x007D and 0x007F cannot replay each other's action IDs.
+type cachedContainerResult struct {
+	actionID uint32
+	packet   protocol.ContainerUpdatePacket
+}
+
 // itemActionState is the per-session ledger bookkeeping: monotonic ActionID
-// floor, a fixed-size LRU of recent results, and the rate-limit window.
+// floor, fixed-size LRUs of recent item and container results, and the
+// rate-limit window.
 type itemActionState struct {
-	lastActionID uint32
-	hasLast      bool
-	cache        [itemActionCacheSize]cachedItemResult
-	cachePos     int
-	cacheLen     int
-	rate         []time.Time
+	lastActionID   uint32
+	hasLast        bool
+	cache          [itemActionCacheSize]cachedItemResult
+	cachePos       int
+	cacheLen       int
+	containerCache [itemActionCacheSize]cachedContainerResult
+	containerPos   int
+	containerLen   int
+	rate           []time.Time
+}
+
+// recordFloor advances the shared monotonic ActionID floor.
+func (st *itemActionState) recordFloor(actionID uint32) {
+	st.lastActionID = actionID
+	st.hasLast = true
 }
 
 // ItemLedger provides dupe-proof idempotency and per-session rate limiting for
@@ -132,12 +150,42 @@ func (l *ItemLedger) Record(sessionID, actionID uint32, result protocol.ItemUpda
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	st := l.stateLocked(sessionID)
-	st.lastActionID = actionID
-	st.hasLast = true
+	st.recordFloor(actionID)
 	st.cache[st.cachePos] = cachedItemResult{actionID: actionID, packet: result}
 	st.cachePos = (st.cachePos + 1) % itemActionCacheSize
 	if st.cacheLen < itemActionCacheSize {
 		st.cacheLen++
+	}
+}
+
+// LookupContainer returns the cached OpContainerUpdate for a replayed
+// ActionID. The cache shares the item ledger's monotonic floor.
+func (l *ItemLedger) LookupContainer(sessionID, actionID uint32) (protocol.ContainerUpdatePacket, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.sessions[sessionID]
+	if st == nil {
+		return protocol.ContainerUpdatePacket{}, false
+	}
+	for i := 0; i < st.containerLen; i++ {
+		if st.containerCache[i].actionID == actionID {
+			return st.containerCache[i].packet, true
+		}
+	}
+	return protocol.ContainerUpdatePacket{}, false
+}
+
+// RecordContainer advances the shared monotonic floor and caches an
+// OpContainerUpdate result for retransmit echo.
+func (l *ItemLedger) RecordContainer(sessionID, actionID uint32, result protocol.ContainerUpdatePacket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.stateLocked(sessionID)
+	st.recordFloor(actionID)
+	st.containerCache[st.containerPos] = cachedContainerResult{actionID: actionID, packet: result}
+	st.containerPos = (st.containerPos + 1) % itemActionCacheSize
+	if st.containerLen < itemActionCacheSize {
+		st.containerLen++
 	}
 }
 
@@ -215,7 +263,7 @@ func (s *Server) handleItemAction(addr *net.UDPAddr, buf *bytes.Reader) {
 		return
 	}
 
-	if pkt.Action != protocol.ItemActionDrop && pkt.Action != protocol.ItemActionPickup {
+	if pkt.Action != protocol.ItemActionDrop && pkt.Action != protocol.ItemActionPickup && pkt.Action != protocol.ItemActionConsume {
 		s.replyItemUpdate(sess, protocol.ItemUpdatePacket{
 			ActionID: pkt.ActionID,
 			Result:   protocol.ItemResultRejected,
@@ -238,6 +286,8 @@ func (s *Server) handleItemAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			Action:   pkt.Action,
 			Section:  pkt.Section,
 		})
+		// A stale/out-of-order action may have been applied locally; resync.
+		s.forceInventorySync(sess)
 		return
 	}
 	if !s.itemLedger.AllowAction(sess.SessionID, time.Now()) {
@@ -273,11 +323,16 @@ func (s *Server) handleItemAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			Action:   pkt.Action,
 			Section:  pkt.Section,
 		})
+		s.forceInventorySync(sess)
 		return
 	}
 
 	if pkt.Action == protocol.ItemActionDrop {
 		s.handleItemDrop(sess, uuid, level, section, pkt)
+		return
+	}
+	if pkt.Action == protocol.ItemActionConsume {
+		s.handleItemConsume(sess, uuid, section, pkt)
 		return
 	}
 	s.handleItemPickup(sess, uuid, level, playerPos, pkt)
@@ -295,21 +350,21 @@ func (s *Server) handleItemDrop(sess *network.PlayerSession, uuid, level, sectio
 			Action:   pkt.Action,
 			Section:  pkt.Section,
 		})
+		s.forceInventorySync(sess)
 		return
 	}
 
 	x := clampItemCoord(pkt.X)
 	y := clampItemCoord(pkt.Y)
 	z := clampItemCoord(pkt.Z)
-	condition := float32(pkt.Condition) / 100.0
-	if math.IsNaN(float64(condition)) || condition < 0 {
-		condition = 0
-	}
-	if condition > 1 {
-		condition = 1
+	// The client condition only chooses which inventory stack is consumed
+	// first; the world item's condition is derived from the removed row.
+	preferredBucket := int(pkt.Condition)
+	if preferredBucket > 100 {
+		preferredBucket = 100
 	}
 
-	newID, remaining, err := s.db.DropItemToWorld(uuid, level, section, int(pkt.Count), x, y, z, condition)
+	newID, remaining, droppedCondition, err := s.db.DropItemToWorld(uuid, level, section, int(pkt.Count), x, y, z, preferredBucket, s.worldItemMaxPerLevel())
 	if err != nil {
 		update := protocol.ItemUpdatePacket{
 			ActionID: pkt.ActionID,
@@ -323,9 +378,9 @@ func (s *Server) handleItemDrop(sess *network.PlayerSession, uuid, level, sectio
 		}
 		s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 		s.replyItemUpdate(sess, update)
-		if update.Result == protocol.ItemResultCorrected {
-			s.forceInventorySync(sess)
-		}
+		// Rejected/corrected drops are always client-local mutations: resync so
+		// a ghost item cannot survive the rejection.
+		s.forceInventorySync(sess)
 		s.audit(uuid, "item_drop_rejected",
 			fmt.Sprintf("action_id=%d section=%s count=%d err=%v", pkt.ActionID, section, pkt.Count, err))
 		return
@@ -343,10 +398,10 @@ func (s *Server) handleItemDrop(sess *network.PlayerSession, uuid, level, sectio
 		X:         x,
 		Y:         y,
 		Z:         z,
-		Condition: pkt.Condition,
+		Condition: conditionToWire(droppedCondition),
 	}
 	s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
-	s.broadcastItemUpdate(level, update)
+	s.broadcastItemUpdate(sess, level, x, z, update)
 	s.audit(uuid, "item_drop",
 		fmt.Sprintf("action_id=%d section=%s count=%d world_item=%d", pkt.ActionID, section, pkt.Count, newID))
 }
@@ -400,7 +455,7 @@ func (s *Server) handleItemPickup(sess *network.PlayerSession, uuid, level strin
 		Condition: conditionToWire(picked.Condition),
 	}
 	s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
-	s.broadcastItemUpdate(level, update)
+	s.broadcastItemUpdate(sess, level, picked.PosX, picked.PosZ, update)
 	s.audit(uuid, "item_pickup",
 		fmt.Sprintf("action_id=%d section=%s count=%d world_item=%d", pkt.ActionID, picked.Section, picked.Count, picked.ID))
 }
@@ -414,6 +469,10 @@ func (s *Server) rejectedItemPickup(sess *network.PlayerSession, uuid string, pk
 	}
 	s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 	s.replyItemUpdate(sess, update)
+	// A rejected pickup is a client-local mutation (the client removes the
+	// ground item optimistically): force a full resync so the rejected world
+	// item reappears instead of becoming a ghost.
+	s.forceInventorySync(sess)
 	s.audit(uuid, "item_pickup_rejected",
 		fmt.Sprintf("action_id=%d world_item=%d err=%v", pkt.ActionID, pkt.ItemID, cause))
 }
@@ -423,12 +482,50 @@ func (s *Server) replyItemUpdate(sess *network.PlayerSession, update protocol.It
 	s.SendToSession(sess, protocol.OpItemUpdate, protocol.FlagReliable, update)
 }
 
-// broadcastItemUpdate delivers the update to every session on the item's level
-// (the actor included), so peers remove the dropped visual and the owner gets
-// the authoritative ledger ack. AoI-radius delivery is a future refinement;
-// same-level is correct for the current single-level deployment.
-func (s *Server) broadcastItemUpdate(level string, update protocol.ItemUpdatePacket) {
-	for _, sess := range s.sessions.GetAll() {
+// broadcastItemUpdate delivers the update to the actor (always, so the ledger
+// ack/echo is reliable) and to same-level sessions inside the AoI radius of
+// the item position instead of every same-level session. The old
+// O(players-per-level) scan is only used as a fallback before the actor is
+// registered in the spatial grid (early tests, pre-transform state); normal
+// gameplay uses the grid index. Distances are horizontal (x/z), matching the
+// snapshot AoI.
+func (s *Server) broadcastItemUpdate(sender *network.PlayerSession, level string, x, z float32, update protocol.ItemUpdatePacket) {
+	senderID := uint32(0)
+	if sender != nil {
+		senderID = sender.SessionID
+		s.SendToSession(sender, protocol.OpItemUpdate, protocol.FlagReliable, update)
+	}
+
+	if s.grid == nil || sender == nil || !s.grid.Contains(senderID) {
+		// Fallback: direct distance filter so tests and the pre-grid window
+		// still get correct AoI semantics.
+		for _, sess := range s.sessions.GetAll() {
+			if sess.SessionID == senderID {
+				continue
+			}
+			sess.Lock()
+			same := sess.CurrentLevel == level
+			sx, sz := sess.Position[0], sess.Position[2]
+			sess.Unlock()
+			if !same {
+				continue
+			}
+			dx, dz := sx-x, sz-z
+			if dx*dx+dz*dz <= AoIRadius*AoIRadius {
+				s.SendToSession(sess, protocol.OpItemUpdate, protocol.FlagReliable, update)
+			}
+		}
+		return
+	}
+
+	for _, id := range s.grid.GetNeighbors(x, z, AoIRadius) {
+		if id == senderID {
+			continue
+		}
+		sess := s.sessions.GetByID(id)
+		if sess == nil {
+			continue
+		}
 		sess.Lock()
 		same := sess.CurrentLevel == level
 		sess.Unlock()

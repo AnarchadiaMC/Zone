@@ -12,7 +12,6 @@ func TestNetcodeOpcodesFrozen(t *testing.T) {
 		got  uint16
 		want uint16
 	}{
-		{"OpPositionCorrection", OpPositionCorrection, 0x007B},
 		{"OpItemAction", OpItemAction, 0x007D},
 		{"OpItemUpdate", OpItemUpdate, 0x007E},
 	}
@@ -29,7 +28,6 @@ func TestNetcodeByteLengths(t *testing.T) {
 		val  interface{}
 		want int
 	}{
-		{"PositionCorrection", PositionCorrection{}, 12},
 		{"ItemActionPacket", ItemActionPacket{}, 88},
 		{"ItemUpdatePacket", ItemUpdatePacket{}, 89},
 	}
@@ -37,36 +35,6 @@ func TestNetcodeByteLengths(t *testing.T) {
 		if got := binary.Size(tc.val); got != tc.want {
 			t.Errorf("%s binary.Size = %d, want %d", tc.name, got, tc.want)
 		}
-	}
-}
-
-func TestPositionCorrectionRoundTrip(t *testing.T) {
-	in := PositionCorrection{X: -211.3, Y: -20.2, Z: -145.8}
-
-	var buf bytes.Buffer
-	if err := WritePacket(&buf, OpPositionCorrection, 77, FlagUnreliable, in); err != nil {
-		t.Fatalf("WritePacket: %v", err)
-	}
-	hdr, err := ReadHeader(&buf)
-	if err != nil {
-		t.Fatalf("ReadHeader: %v", err)
-	}
-	if hdr.Opcode != OpPositionCorrection {
-		t.Fatalf("opcode = 0x%04X, want 0x%04X", hdr.Opcode, OpPositionCorrection)
-	}
-	if hdr.PayloadLength != 12 {
-		t.Fatalf("payload length = %d, want 12", hdr.PayloadLength)
-	}
-	if hdr.FlagsChannel != FlagUnreliable {
-		t.Fatalf("flags = 0x%02X, want FlagUnreliable", hdr.FlagsChannel)
-	}
-
-	var out PositionCorrection
-	if err := binary.Read(&buf, binary.LittleEndian, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if out != in {
-		t.Fatalf("roundtrip mismatch: got %+v, want %+v", out, in)
 	}
 }
 
@@ -163,9 +131,6 @@ func decodeShort(t *testing.T, val interface{}, have int) error {
 }
 
 func TestNetcodeMalformedShortPayloadsRejected(t *testing.T) {
-	if err := decodeShort(t, &PositionCorrection{}, 11); err == nil {
-		t.Error("11-byte PositionCorrection payload decoded without error")
-	}
 	if err := decodeShort(t, &ItemActionPacket{}, 87); err == nil {
 		t.Error("87-byte ItemActionPacket payload decoded without error")
 	}
@@ -177,9 +142,6 @@ func TestNetcodeMalformedShortPayloadsRejected(t *testing.T) {
 	}
 
 	// The correct sizes still decode cleanly.
-	if err := decodeShort(t, &PositionCorrection{}, 12); err != nil {
-		t.Errorf("12-byte PositionCorrection rejected: %v", err)
-	}
 	if err := decodeShort(t, &ItemActionPacket{}, 88); err != nil {
 		t.Errorf("88-byte ItemActionPacket rejected: %v", err)
 	}

@@ -126,23 +126,11 @@ func TestGroupMaxPlayersClampedToProtocolCap(t *testing.T) {
 	}
 }
 
-// Frozen netcode/ledger keys must default even when the YAML omits them.
+// Frozen ledger keys must default even when the YAML omits them.
 func TestConfigNetcodeAndLedgerDefaults(t *testing.T) {
 	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
-	}
-	if cfg.MaxSpeedMPS != 25 {
-		t.Errorf("MaxSpeedMPS default = %v, want 25", cfg.MaxSpeedMPS)
-	}
-	if cfg.CorrectionToleranceM != 2.0 {
-		t.Errorf("CorrectionToleranceM default = %v, want 2.0", cfg.CorrectionToleranceM)
-	}
-	if cfg.LagswitchGapMS != 1500 {
-		t.Errorf("LagswitchGapMS default = %d, want 1500", cfg.LagswitchGapMS)
-	}
-	if cfg.LagswitchStrikes != 3 {
-		t.Errorf("LagswitchStrikes default = %d, want 3", cfg.LagswitchStrikes)
 	}
 	if cfg.DamageBudgetPerS != 400 {
 		t.Errorf("DamageBudgetPerS default = %v, want 400", cfg.DamageBudgetPerS)
@@ -157,10 +145,6 @@ func TestConfigNetcodeAndLedgerKeysLoaded(t *testing.T) {
 port: 27015
 tick_rate_hz: 30
 max_players: 64
-max_speed_mps: 18.5
-correction_tolerance_m: 1.25
-lagswitch_gap_ms: 900
-lagswitch_strikes: 4
 damage_budget_per_s: 275.5
 item_rate_per_s: 2.5
 `
@@ -177,12 +161,6 @@ item_rate_per_s: 2.5
 	cfg, err := Load(tmpfile.Name())
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
-	}
-	if cfg.MaxSpeedMPS != 18.5 || cfg.CorrectionToleranceM != 1.25 {
-		t.Errorf("movement keys = %v/%v, want 18.5/1.25", cfg.MaxSpeedMPS, cfg.CorrectionToleranceM)
-	}
-	if cfg.LagswitchGapMS != 900 || cfg.LagswitchStrikes != 4 {
-		t.Errorf("lagswitch keys = %d/%d, want 900/4", cfg.LagswitchGapMS, cfg.LagswitchStrikes)
 	}
 	if cfg.DamageBudgetPerS != 275.5 || cfg.ItemRatePerS != 2.5 {
 		t.Errorf("ledger keys = %v/%v, want 275.5/2.5", cfg.DamageBudgetPerS, cfg.ItemRatePerS)
@@ -204,5 +182,126 @@ func TestValidate_MaxPlayers48And64(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("max_players %d: Validate returned nil, want error", max)
 		}
+	}
+}
+
+// tick_rate_hz must be validated inside 1..240 for both YAML and CLI paths.
+func TestValidate_TickRateBounds(t *testing.T) {
+	for _, hz := range []int{1, 20, 30, 60, 120, 240} {
+		cfg := &Config{Port: 27015, TickRateHz: hz, MaxPlayers: 64}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("tick_rate_hz %d: Validate returned %v, want nil", hz, err)
+		}
+	}
+	for _, hz := range []int{0, -1, 241, 1000} {
+		cfg := &Config{Port: 27015, TickRateHz: hz, MaxPlayers: 64}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("tick_rate_hz %d: Validate returned nil, want error", hz)
+		}
+	}
+}
+
+// ai_enabled defaults to true and ai_online_radius_m defaults to 220 when the
+// YAML omits both keys.
+func TestConfigAIDefaults(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !cfg.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = false, want true when ai_enabled is omitted")
+	}
+	if cfg.AIOnlineRadiusM != 220 {
+		t.Errorf("AIOnlineRadiusM default = %v, want 220", cfg.AIOnlineRadiusM)
+	}
+	if cfg.AIEnterRadiusM != 180 {
+		t.Errorf("AIEnterRadiusM default = %v, want 180", cfg.AIEnterRadiusM)
+	}
+	if cfg.AILeaveRadiusM != 220 {
+		t.Errorf("AILeaveRadiusM default = %v, want 220", cfg.AILeaveRadiusM)
+	}
+	if cfg.AIMaxEntities != 64 {
+		t.Errorf("AIMaxEntities default = %d, want 64", cfg.AIMaxEntities)
+	}
+}
+
+// An explicitly tuned legacy ai_online_radius_m pins both hysteresis radii so
+// old configs keep their exact boundary.
+func TestConfigAILegacyRadiusPinsBoth(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64, AIOnlineRadiusM: 100}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.AIEnterRadiusM != 100 || cfg.AILeaveRadiusM != 100 {
+		t.Errorf("legacy radius aliasing = %v/%v, want 100/100", cfg.AIEnterRadiusM, cfg.AILeaveRadiusM)
+	}
+}
+
+// Explicit ai keys must override the defaults in both directions.
+func TestConfigAIKeysLoaded(t *testing.T) {
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+ai_enabled: false
+ai_online_radius_m: 180.5
+`
+	tmpfile, err := os.CreateTemp("", "config_ai_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = true, want false from explicit ai_enabled: false")
+	}
+	if cfg.AIOnlineRadiusM != 180.5 {
+		t.Errorf("AIOnlineRadiusM = %v, want 180.5", cfg.AIOnlineRadiusM)
+	}
+
+	enabled := true
+	cfg2 := &Config{AIEnabled: &enabled}
+	cfg2.SetDefaults()
+	if !cfg2.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = false, want true from explicit ai_enabled: true")
+	}
+}
+
+// World item lifecycle keys: TTL defaults to 60 minutes (explicit 0 disables
+// the sweep), and the per-level cap defaults to 500.
+func TestConfigWorldItemDefaultsAndKeys(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.WorldItemMaxPerLevel != 500 {
+		t.Errorf("WorldItemMaxPerLevel default = %d, want 500", cfg.WorldItemMaxPerLevel)
+	}
+	if got := cfg.WorldItemTTLMinutes(); got != 60 {
+		t.Errorf("WorldItemTTLMinutes default = %d, want 60", got)
+	}
+
+	zero := 0
+	disabled := &Config{WorldItemTTLMin: &zero}
+	if got := disabled.WorldItemTTLMinutes(); got != 0 {
+		t.Errorf("explicit world_item_ttl_min 0 = %d, want 0 (disabled)", got)
+	}
+
+	five := 5
+	tuned := &Config{WorldItemTTLMin: &five, WorldItemMaxPerLevel: 12}
+	tuned.SetDefaults()
+	if got := tuned.WorldItemTTLMinutes(); got != 5 {
+		t.Errorf("world_item_ttl_min = %d, want 5", got)
+	}
+	if tuned.WorldItemMaxPerLevel != 12 {
+		t.Errorf("explicit WorldItemMaxPerLevel = %d, want 12", tuned.WorldItemMaxPerLevel)
 	}
 }
