@@ -17,3 +17,5 @@ lagswitch_gap_ms: 1500
 lagswitch_strikes: 3
 damage_budget_per_s: 400
 item_rate_per_s: 5
+ai_enabled: true
+ai_online_radius_m: 220

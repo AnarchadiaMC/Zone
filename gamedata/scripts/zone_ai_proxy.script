@@ -1,7 +1,41 @@
 -- zone_ai_proxy.script
 -- Server-authoritative AI puppet rendering
+--
+-- Wire contract (protocol v5):
+--   0x0012 ENTITY_ENTER_AOI (S->C, 132 B): entityID u32, type u8, section[64],
+--          x/y/z f32, faction[16], health u8, gvid u16, name[32]. AI entities
+--          use type 0 (legacy 2/3); gvid may be 0 because the server has no
+--          game-graph data, and name carries the squad label.
+--   0x007C OpAIState (S->C unreliable): count u8, then per entity 19 bytes:
+--          EntityID u32, X f32, Y f32, Z f32, Yaw u16 (0..65535), Anim u8.
+--          Multiple packets per tick, chunks of <= 32.
+--   Anim: 0 idle, 1 walk, 2 run, 3 attack, 4 death.
 
 local ai_entities = {}
+-- ENTITY_ENTER with an unresolved gvid (packet gvid 0 and out of fallback
+-- range): held here and retried from the next 0x007C state update.
+local pending_spawns = {}
+-- One fallback log per entity spawn lifecycle.
+local gvid_fallback_logged = {}
+
+local STATE_ENTRY_BYTES = 19
+local FREEZE_MS = 4000
+local GVID_FALLBACK_MAX_DIST = 150
+local GVID_FALLBACK_DIST_SQ = GVID_FALLBACK_MAX_DIST * GVID_FALLBACK_MAX_DIST
+local PENDING_SPAWN_TTL_MS = 60000
+local MOVE_STALL_DIST_SQ = 3 * 3
+local MOVE_STALL_EPS_SQ = 0.05 * 0.05
+local MOVE_STALL_SAMPLES = 2
+local CORPSE_RELEASE_MS = 5000
+
+-- MonsterSpace enums (ai_monster_space.h:22-34):
+--   EBodyState:    eBodyStateCrouch = 0, eBodyStateStand = 1
+--   EMovementType: eMovementTypeWalk = 0, eMovementTypeRun = 1,
+--                  eMovementTypeStand = 2
+local BODY_STAND = 1
+local MOVE_WALK = 0
+local MOVE_RUN = 1
+local MOVE_STAND = 2
 
 -- Mutual exclusion with xrRazom co-op (mirrors zone_dummy.spawn_proxy):
 -- never spawn Zone puppets while co-op owns the world.
@@ -14,6 +48,340 @@ local function xrr_active()
     return active
 end
 
+-- alife() is nil during level change (CTD without the guard).
+local function get_alife()
+    local sim = nil
+    pcall(function()
+        if alife then
+            local ok, res = pcall(alife)
+            if ok then sim = res end
+        end
+    end)
+    return sim
+end
+
+local function release_one(sim, entity)
+    if not sim or not entity or not entity.se_id then return end
+    local se = nil
+    pcall(function() se = sim:object(entity.se_id) end)
+    if se then pcall(function() sim:release(se, true) end) end
+end
+
+-- Lua has no binding that maps a world position or level_vertex_id to a game
+-- vertex id:
+--   level.vertex_id(pos) -> lvid only (level_script.cpp:1217-1220, exposed at
+--     level_script.cpp:2655);
+--   game_graph():vertex(gvid) -> GameGraph__CVertex and
+--     GameGraph__CVertex:level_vertex_id()/game_point() go gvid -> lvid
+--     (game_graph_script.cpp:68,76);
+--   CGameGraph:vertex_id takes a CVertex userdata, not a numeric lvid
+--     (game_graph.h:76, game_graph_script.cpp:69);
+--   CGameLevelCrossTable (the real lvid -> gvid map, game_level_cross_table.h)
+--     has no script registration (no class_ binding in xrGame).
+-- So: packet gvid when usable, otherwise the local actor's game_vertex_id,
+-- and only while the entity is within GVID_FALLBACK_MAX_DIST of the actor
+-- (a game vertex is a coarse area, so nearby entities share one).
+function resolve_gvid(pos, packet_gvid)
+    local gvid = tonumber(packet_gvid) or 0
+    if gvid > 0 then return gvid end
+    if not pos then return nil end
+    local actor = db and db.actor
+    if not actor then return nil end
+    local actor_pos = nil
+    pcall(function() actor_pos = actor:position() end)
+    if not actor_pos then return nil end
+    local dx = pos.x - actor_pos.x
+    local dy = pos.y - actor_pos.y
+    local dz = pos.z - actor_pos.z
+    if (dx * dx + dy * dy + dz * dz) > GVID_FALLBACK_DIST_SQ then return nil end
+    local actor_gvid = 0
+    pcall(function() actor_gvid = actor:game_vertex_id() or 0 end)
+    if actor_gvid <= 0 then return nil end
+    return actor_gvid
+end
+
+-- Yaw u16 (0..65535) -> direction. X-Ray yaw is atan2(dir.x, dir.z), so the
+-- inverse is dir = (sin(yaw), 0, cos(yaw)).
+local function yaw_direction(yaw_u16)
+    local rad = (tonumber(yaw_u16) or 0) * (2 * math.pi / 65536.0)
+    return vector():set(math.sin(rad), 0, math.cos(rad))
+end
+
+-- Cosmetic anim mapping. Engine enum values differ from the wire ids: wire 0
+-- idle and 3 attack both stand; wire 1 walk; wire 2 run. No aim body state
+-- exists (EBodyState is crouch/stand only), so attack is stand + facing.
+local function apply_anim_state(obj, anim)
+    if anim == 1 then
+        pcall(function() obj:set_body_state(BODY_STAND) end)
+        pcall(function() obj:set_movement_type(MOVE_WALK) end)
+    elseif anim == 2 then
+        pcall(function() obj:set_body_state(BODY_STAND) end)
+        pcall(function() obj:set_movement_type(MOVE_RUN) end)
+    else
+        pcall(function() obj:set_body_state(BODY_STAND) end)
+        pcall(function() obj:set_movement_type(MOVE_STAND) end)
+    end
+end
+
+-- Smooth steering: desired position + desired direction every state update.
+-- set_npc_position is only a recovery snap: if the puppet is still more than
+-- 3 m from the reported position and did not move across two consecutive
+-- state updates, desired-position steering is having no effect.
+local function steer_puppet(entity, obj, target, dir)
+    local cur = nil
+    pcall(function() cur = obj:position() end)
+    if not cur then return end
+    local dx = cur.x - target.x
+    local dy = cur.y - target.y
+    local dz = cur.z - target.z
+    if (dx * dx + dy * dy + dz * dz) > MOVE_STALL_DIST_SQ then
+        local moved_sq = nil
+        if entity.prev_pos then
+            local mx = cur.x - entity.prev_pos.x
+            local my = cur.y - entity.prev_pos.y
+            local mz = cur.z - entity.prev_pos.z
+            moved_sq = mx * mx + my * my + mz * mz
+        end
+        entity.prev_pos = vector():set(cur.x, cur.y, cur.z)
+        if moved_sq ~= nil and moved_sq < MOVE_STALL_EPS_SQ then
+            entity.stall = (entity.stall or 0) + 1
+        else
+            entity.stall = 0
+        end
+        if entity.stall >= MOVE_STALL_SAMPLES then
+            entity.stall = 0
+            entity.prev_pos = nil
+            pcall(function() obj:set_npc_position(target) end)
+            return
+        end
+    else
+        entity.stall = 0
+        entity.prev_pos = nil
+    end
+    pcall(function() obj:set_desired_position(target) end)
+    if dir then pcall(function() obj:set_desired_direction(dir) end) end
+end
+
+-- Attack (wire 3): cosmetic only, never fire. Face the nearest player (the
+-- local actor is the only real player in this wave).
+local function face_actor(obj)
+    local actor = db and db.actor
+    if not actor then return end
+    local op = nil
+    local ap = nil
+    pcall(function() op = obj:position() end)
+    pcall(function() ap = actor:position() end)
+    if not op or not ap then return end
+    local dx = ap.x - op.x
+    local dz = ap.z - op.z
+    local len_sq = dx * dx + dz * dz
+    if len_sq < 0.0001 then return end
+    local inv = 1 / math.sqrt(len_sq)
+    pcall(function()
+        obj:set_desired_direction(vector():set(dx * inv, 0, dz * inv))
+    end)
+end
+
+local function release_entity(eid)
+    local entity = ai_entities[eid]
+    if not entity then return end
+    release_one(get_alife(), entity)
+    ai_entities[eid] = nil
+    gvid_fallback_logged[eid] = nil
+end
+
+-- Existing death path: kill once, then despawn after the 5 s corpse timer.
+local function schedule_despawn(eid, entity)
+    if entity.dying then return end
+    entity.dying = true
+
+    local obj = nil
+    pcall(function() obj = level.object_by_id(entity.se_id) end)
+    if obj then
+        pcall(function()
+            if obj:alive() then
+                obj:kill(obj, false)
+            end
+        end)
+    end
+
+    local tg = 0
+    pcall(function() tg = time_global() end)
+    local release_time = tg + CORPSE_RELEASE_MS
+    pcall(function()
+        level.add_call(function() return time_global() > release_time end, function()
+            release_entity(eid)
+            return true
+        end)
+    end)
+end
+
+-- Resolve vertices at the ENTITY position (mirror zone_dummy.spawn_proxy).
+-- Never feed lvid >= 0xFFFFFFFE or gvid 0 into alife():create.
+-- Returns entity, nil on success or nil, reason on failure ("gvid" means the
+-- spawn must be deferred until the entity is closer to the actor).
+local function try_spawn(eid, section, faction, ent_pos, name, packet_gvid)
+    if not ent_pos then return nil, "pos" end
+
+    local lvid = nil
+    pcall(function()
+        if level and level.vertex_id then
+            lvid = level.vertex_id(ent_pos)
+        end
+    end)
+    if lvid == nil or lvid >= 0xFFFFFFFE then return nil, "lvid" end
+
+    local gvid = resolve_gvid(ent_pos, packet_gvid)
+    if gvid == nil or gvid <= 0 then return nil, "gvid" end
+
+    if (tonumber(packet_gvid) or 0) <= 0 and not gvid_fallback_logged[eid] then
+        gvid_fallback_logged[eid] = true
+        printf("[zone_ai_proxy] entity %u using actor game_vertex_id %u (fallback, within %d m)",
+            tonumber(eid) or 0, tonumber(gvid) or 0, GVID_FALLBACK_MAX_DIST)
+    end
+
+    -- L-17: Validate section name in system_ini before alife():create
+    local sec = section
+    if not (system_ini() and system_ini():section_exist(sec)) then
+        printf("[zone_ai_proxy] Warning: Section '%s' does not exist in system_ini! Falling back to sim_default_stalker_0", tostring(sec))
+        sec = "sim_default_stalker_0"
+        if not (system_ini() and system_ini():section_exist(sec)) then
+            printf("[zone_ai_proxy] Error: Fallback section '%s' does not exist in system_ini!", sec)
+            return nil, "section"
+        end
+    end
+
+    local sim = get_alife()
+    if not sim then return nil, "alife" end
+
+    local se_obj = nil
+    pcall(function() se_obj = sim:create(sec, ent_pos, lvid, gvid) end)
+    if not se_obj then return nil, "create" end
+
+    local entity = {
+        se_id = se_obj.id,
+        section = sec,
+        pos = ent_pos,
+        faction = faction,
+        name = name,
+        action = 0,
+        target_id = 0,
+        anim = 0,
+        target_pos = nil,
+        target_yaw = 0,
+        last_state_tg = nil,
+        prev_pos = nil,
+        stall = 0,
+        dying = false,
+    }
+    ai_entities[eid] = entity
+    pcall(function() se_obj.is_zone_ai_proxy = true end)
+    return entity, nil
+end
+
+local function try_pending_spawn(eid, tg)
+    local p = pending_spawns[eid]
+    if not p then return nil end
+    local pos = nil
+    pcall(function() pos = vector():set(p.x, p.y, p.z) end)
+    local entity = try_spawn(eid, p.section, p.faction, pos, p.name, p.packet_gvid)
+    if entity then
+        pending_spawns[eid] = nil
+        printf("[zone_ai_proxy] deferred entity %u spawned on state update", tonumber(eid) or 0)
+        return entity
+    end
+    return nil
+end
+
+local function prune_pending(tg)
+    if type(tg) ~= "number" or tg <= 0 then return end
+    for eid, p in pairs(pending_spawns) do
+        if (tg - (p.t or 0)) > PENDING_SPAWN_TTL_MS then
+            pending_spawns[eid] = nil
+            printf("[zone_ai_proxy] pending spawn for entity %u expired", tonumber(eid) or 0)
+        end
+    end
+end
+
+local function process_state(eid, x, y, z, yaw_raw, anim, tg)
+    if pending_spawns[eid] then
+        local p = pending_spawns[eid]
+        p.x, p.y, p.z = x, y, z
+        if not try_pending_spawn(eid, tg) then return end
+    end
+
+    local entity = ai_entities[eid]
+    if not entity then return end
+
+    local target = nil
+    pcall(function() target = vector():set(x, y, z) end)
+    if not target then return end
+    entity.target_pos = target
+    entity.target_yaw = (tonumber(yaw_raw) or 0) * 360.0 / 65536.0
+    entity.anim = anim
+
+    if anim == 4 then
+        schedule_despawn(eid, entity)
+        return
+    end
+
+    local obj = nil
+    pcall(function() obj = level.object_by_id(entity.se_id) end)
+    if not obj then return end
+
+    -- Freeze cap: after more than 4 s without state, the first packet back is
+    -- treated as a resync (body state only, no movement calls); steering
+    -- resumes with the next continuous packet.
+    local stale = entity.last_state_tg ~= nil and (tg - entity.last_state_tg) > FREEZE_MS
+    entity.last_state_tg = tg
+
+    apply_anim_state(obj, anim)
+
+    if stale then
+        pcall(function() obj:set_desired_direction(yaw_direction(yaw_raw)) end)
+        return
+    end
+
+    if anim == 3 then
+        face_actor(obj)
+    else
+        steer_puppet(entity, obj, target, yaw_direction(yaw_raw))
+    end
+end
+
+function on_ai_state(pkt, offset)
+    if xrr_active() then return end
+    if not pkt or not offset then return end
+
+    local len = string.len(pkt)
+    if len < offset then return end
+    local count, pos = zone_net.read_uint8(pkt, offset)
+    if not count then return end
+    if len < offset + count * STATE_ENTRY_BYTES then
+        printf("[zone_ai_proxy] dropped truncated AI_STATE packet (count %d, %d bytes)",
+            count, len)
+        return
+    end
+
+    local tg = 0
+    pcall(function() tg = time_global() end)
+
+    prune_pending(tg)
+
+    for _ = 1, count do
+        local eid, p = zone_net.read_uint32_le(pkt, pos)
+        local x, p = zone_net.read_float_le(pkt, p)
+        local y, p = zone_net.read_float_le(pkt, p)
+        local z, p = zone_net.read_float_le(pkt, p)
+        local yaw_raw, p = zone_net.read_uint16_le(pkt, p)
+        local anim, p = zone_net.read_uint8(pkt, p)
+        pos = p
+        if eid and x and y and z then
+            process_state(eid, x, y, z, yaw_raw or 0, anim or 0, tg)
+        end
+    end
+end
+
 function on_entity_enter(pkt, offset)
     if xrr_active() then return end
     if not pkt or not offset then return end
@@ -24,11 +392,11 @@ function on_entity_enter(pkt, offset)
     local typ, pos = zone_net.read_uint8(pkt, pos)
     local section, pos = zone_net.read_string(pkt, pos, 64)
     section = section:gsub("%z+", "")
-    
+
     local x, pos = zone_net.read_float_le(pkt, pos)
     local y, pos = zone_net.read_float_le(pkt, pos)
     local z, pos = zone_net.read_float_le(pkt, pos)
-    
+
     local faction, pos = zone_net.read_string(pkt, pos, 16)
     faction = faction:gsub("%z+", "")
     local health, pos = zone_net.read_uint8(pkt, pos)
@@ -37,107 +405,83 @@ function on_entity_enter(pkt, offset)
     -- it so the v3 bounds/cursor stay aligned.
     local name, pos = zone_net.read_string(pkt, pos, 32)
     name = name:gsub("%z+", "")
-    
+
     -- typ 0 = AI squad (wire EntityType), 2/3 = legacy NPC/Mutant values.
     if typ == 0 or typ == 2 or typ == 3 then
         local existing = ai_entities[eid]
         if existing then
             existing.faction = faction
+            if name ~= "" then existing.name = name end
             return
         end
-        -- Resolve vertices at the ENTITY position (mirror zone_dummy.spawn_proxy).
-        -- gvid is packet-authoritative; never fall back to the actor.
-        -- No movement code here (server batch stream 0x0014 doesn't exist yet).
-        if not gvid or gvid == 0 then return end
+
+        local pending = pending_spawns[eid]
+        if pending then
+            pending.faction = faction
+            if name ~= "" then pending.name = name end
+            try_pending_spawn(eid, time_global())
+            return
+        end
+
         local ent_pos = nil
         pcall(function() ent_pos = vector():set(x, y, z) end)
         if not ent_pos then return end
-        local lvid = nil
-        pcall(function()
-            if level and level.vertex_id then
-                lvid = level.vertex_id(ent_pos)
-            end
-        end)
-        -- level.vertex_id returns u32(-1) off-graph; never feed that to create.
-        if lvid == nil or lvid >= 0xFFFFFFFE then return end
-        
-        -- L-17: Validate section name in system_ini before alife():create
-        local sec = section
-        if not (system_ini() and system_ini():section_exist(sec)) then
-            printf("[zone_ai_proxy] Warning: Section '%s' does not exist in system_ini! Falling back to sim_default_stalker_0", tostring(sec))
-            sec = "sim_default_stalker_0"
-            if not (system_ini() and system_ini():section_exist(sec)) then
-                printf("[zone_ai_proxy] Error: Fallback section '%s' does not exist in system_ini!", sec)
-                return
-            end
-        end
-        
-        local sim = nil
-        pcall(function() sim = alife() end)
-        if not sim then return end
-        
-        local se_obj = nil
-        pcall(function() se_obj = sim:create(sec, ent_pos, lvid, gvid) end)
-        if se_obj then
-            ai_entities[eid] = {
-                se_id = se_obj.id,
-                section = sec,
-                pos = ent_pos,
+
+        local entity, reason = try_spawn(eid, section, faction, ent_pos, name, gvid)
+        if not entity and reason == "gvid" then
+            -- Server has no graph data (gvid 0) and the entity is still out of
+            -- fallback range: defer, retry on the next state update when the
+            -- entity is closer to the actor.
+            pending_spawns[eid] = {
+                section = section,
                 faction = faction,
-                action = 0,
-                target_id = 0
+                name = name,
+                x = x, y = y, z = z,
+                packet_gvid = gvid or 0,
+                t = time_global(),
             }
-            pcall(function() se_obj.is_zone_ai_proxy = true end)
+            printf("[zone_ai_proxy] entity %u spawn deferred (gvid unresolved, >%d m from actor)",
+                tonumber(eid) or 0, GVID_FALLBACK_MAX_DIST)
         end
     end
 end
 
 function on_ai_action(pkt, offset)
+    if xrr_active() then return end
+    if not pkt or not offset then return end
+    if string.len(pkt) < offset + 9 - 1 then return end
     local eid, pos = zone_net.read_uint32_le(pkt, offset)
     local action, pos = zone_net.read_uint8(pkt, pos)
     local target_id, pos = zone_net.read_uint32_le(pkt, pos)
-    
+
     local entity = ai_entities[eid]
     if not entity then return end
-    
+
     entity.action = action
     entity.target_id = target_id
-    
-    local obj = level.object_by_id(entity.se_id)
-    if obj then
-        if action == 4 then -- DEATH
-            if obj:alive() then
-                obj:kill(obj, false)
-            end
-            -- Delay release
-            local release_time = time_global() + 5000
-            local function release_corpse()
-                pcall(function()
-                    local sim = nil
-                    if alife then
-                        local ok, res = pcall(alife)
-                        if ok then sim = res end
-                    end
-                    if sim then
-                        local se = nil
-                        pcall(function() se = sim:object(entity.se_id) end)
-                        if se then
-                            pcall(function() sim:release(se, true) end)
-                        end
-                    end
-                end)
-                ai_entities[eid] = nil
-                return true
-            end
-            level.add_call(function() return time_global() > release_time end, release_corpse)
-        elseif action == 2 then -- ATTACK
-            -- Face target if known
-            -- Target facing logic requires target position, we simplify by facing actor if target is actor
-            -- L-16: Check db.actor ~= nil before checking target_id == db.actor:id()
-            -- L-01: Fix in-place actor position mutation
-            if db.actor and (target_id == 0 or target_id == db.actor:id()) then
-                local dir = vector():set(db.actor:position()):sub(obj:position()):normalize()
-                obj:set_desired_direction(dir)
+
+    local obj = nil
+    pcall(function() obj = level.object_by_id(entity.se_id) end)
+    if not obj then return end
+
+    if action == 4 then -- DEATH
+        schedule_despawn(eid, entity)
+    elseif action == 2 then -- ATTACK
+        -- Face target if known. Target facing logic requires target position;
+        -- simplified by facing the actor when target is the actor.
+        -- L-16: Check db.actor ~= nil before checking target_id == db.actor:id()
+        if db.actor and (target_id == 0 or target_id == db.actor:id()) then
+            local op = nil
+            local ap = nil
+            pcall(function() op = obj:position() end)
+            pcall(function() ap = db.actor:position() end)
+            if op and ap then
+                local dir = vector():set(ap.x - op.x, ap.y - op.y, ap.z - op.z)
+                local len = math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z)
+                if len > 0.0001 then
+                    dir.x, dir.y, dir.z = dir.x / len, dir.y / len, dir.z / len
+                    pcall(function() obj:set_desired_direction(dir) end)
+                end
             end
         end
     end
@@ -148,46 +492,27 @@ function on_entity_leave(pkt, offset)
     local eid = nil
     pcall(function() eid = zone_net.read_uint32_le(pkt, offset) end)
     if not eid then return end
+    pending_spawns[eid] = nil
     local entity = ai_entities[eid]
     if entity then
         -- Guarded: alife() is nil during level change (CTD today without this).
-        pcall(function()
-            local sim = nil
-            if alife then
-                local ok, res = pcall(alife)
-                if ok then sim = res end
-            end
-            if sim and entity.se_id then
-                local se = nil
-                pcall(function() se = sim:object(entity.se_id) end)
-                if se then
-                    pcall(function() sim:release(se, true) end)
-                end
-            end
-        end)
+        release_one(get_alife(), entity)
         ai_entities[eid] = nil
+        gvid_fallback_logged[eid] = nil
     end
 end
 
 -- Release all puppets (shared by level-change and disconnect cleanup).
 local function release_all_puppets()
     pcall(function()
-        local sim = nil
-        if alife then
-            local ok, res = pcall(alife)
-            if ok then sim = res end
-        end
-        for eid, entity in pairs(ai_entities) do
-            if sim and entity and entity.se_id then
-                local se = nil
-                pcall(function() se = sim:object(entity.se_id) end)
-                if se then
-                    pcall(function() sim:release(se, true) end)
-                end
-            end
+        local sim = get_alife()
+        for _, entity in pairs(ai_entities) do
+            release_one(sim, entity)
         end
     end)
     ai_entities = {}
+    pending_spawns = {}
+    gvid_fallback_logged = {}
 end
 
 -- Public release entry so zone_net can reap puppets on co-op takeover.

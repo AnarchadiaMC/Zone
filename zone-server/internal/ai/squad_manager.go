@@ -51,6 +51,26 @@ type Squad struct {
 	Health    float32
 	Faction   string
 	SpawnedAt time.Time
+
+	// Puppet replication metadata (wave A). Puppet squads are simulated by
+	// TickPuppets along Loop and replicated to clients through OpAIState. The
+	// legacy Tick path skips them, so OpAIActionEvent traffic is unchanged for
+	// non-puppet squads. No combat AI exists in this wave: State stays
+	// AIStatePatrol and damage is never applied to puppets.
+	Puppet       bool
+	Label        string
+	Section      string
+	Spawn        [3]float32
+	PatrolRadius float32
+	WalkSpeed    float32 // m/s, used while patrolling (default 1.5)
+	RunSpeed     float32 // m/s, used while runUntil is in the future (default 3.0)
+	Yaw          float32 // radians, faces the current movement direction
+	Anim         uint8   // AnimIdle/AnimWalk/AnimRun wire value
+	Online       bool    // true when a player is within the replication radius
+	Loop         []Waypoint
+	LoopIndex    int
+	lastStep     time.Time
+	runUntil     time.Time
 }
 
 // SquadManager manages all active AI squads.
@@ -168,6 +188,11 @@ func (sm *SquadManager) Tick(_ time.Time, broadcastFn func(squadID uint32, state
 	}
 
 	for _, sq := range sm.squads {
+		if sq.Puppet {
+			// Puppet squads are advanced by TickPuppets; the legacy
+			// OpAIActionEvent path must not move or announce them.
+			continue
+		}
 		if sq.State == AIStateDead {
 			continue
 		}

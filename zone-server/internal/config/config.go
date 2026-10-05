@@ -31,6 +31,21 @@ type Config struct {
 	LagswitchStrikes     int     `yaml:"lagswitch_strikes"`
 	DamageBudgetPerS     float64 `yaml:"damage_budget_per_s"`
 	ItemRatePerS         float64 `yaml:"item_rate_per_s"`
+
+	// AI replication knobs. AIEnabled is a pointer so an omitted key keeps the
+	// documented default (true) while an explicit `ai_enabled: false` disables
+	// every AI entity and packet.
+	AIEnabled       *bool   `yaml:"ai_enabled"`
+	AIOnlineRadiusM float64 `yaml:"ai_online_radius_m"`
+}
+
+// AIEnabledOrDefault reports whether AI replication is enabled, defaulting to
+// true when the key is absent (or the whole config is nil, as in tests).
+func (c *Config) AIEnabledOrDefault() bool {
+	if c == nil || c.AIEnabled == nil {
+		return true
+	}
+	return *c.AIEnabled
 }
 
 // SetDefaults sets sensible defaults for optional or missing fields.
@@ -80,6 +95,9 @@ func (c *Config) SetDefaults() {
 	}
 	if c.ItemRatePerS <= 0 {
 		c.ItemRatePerS = 5
+	}
+	if c.AIOnlineRadiusM <= 0 {
+		c.AIOnlineRadiusM = 220
 	}
 }
 

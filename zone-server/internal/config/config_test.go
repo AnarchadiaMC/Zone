@@ -206,3 +206,56 @@ func TestValidate_MaxPlayers48And64(t *testing.T) {
 		}
 	}
 }
+
+// ai_enabled defaults to true and ai_online_radius_m defaults to 220 when the
+// YAML omits both keys.
+func TestConfigAIDefaults(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !cfg.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = false, want true when ai_enabled is omitted")
+	}
+	if cfg.AIOnlineRadiusM != 220 {
+		t.Errorf("AIOnlineRadiusM default = %v, want 220", cfg.AIOnlineRadiusM)
+	}
+}
+
+// Explicit ai keys must override the defaults in both directions.
+func TestConfigAIKeysLoaded(t *testing.T) {
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+ai_enabled: false
+ai_online_radius_m: 180.5
+`
+	tmpfile, err := os.CreateTemp("", "config_ai_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = true, want false from explicit ai_enabled: false")
+	}
+	if cfg.AIOnlineRadiusM != 180.5 {
+		t.Errorf("AIOnlineRadiusM = %v, want 180.5", cfg.AIOnlineRadiusM)
+	}
+
+	enabled := true
+	cfg2 := &Config{AIEnabled: &enabled}
+	cfg2.SetDefaults()
+	if !cfg2.AIEnabledOrDefault() {
+		t.Error("AIEnabledOrDefault = false, want true from explicit ai_enabled: true")
+	}
+}

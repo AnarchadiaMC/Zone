@@ -806,6 +806,41 @@ local function on_actor_item_take(item)
     send_item_action(2, item_id, section, count, x, y, z, item_condition_u8(cond))
 end
 
+-- Post-use hook (protocol v5 Action=3 = consume). Fired by the base scripts
+-- after the actor uses an item (axr_main.script:70 declares
+-- actor_on_item_use(item, section); bind_stalker_ext.script:162-179
+-- dispatches it from the engine use_object callback). Only CEatableItem
+-- consumables are reported: cast_EatableItem is a script-exposed safe cast
+-- (script_game_object_script3.cpp:570). Count is always one use; removal is
+-- server-authoritative and the local effect stays local.
+local function on_actor_item_use(item, section)
+    if not item then return end
+    if not item_send_allowed() then return end
+
+    local sec = section
+    if type(sec) ~= "string" or sec == "" then
+        pcall(function() sec = item:section() end)
+    end
+    if type(sec) ~= "string" or sec == "" then return end
+
+    local eatable = nil
+    pcall(function() eatable = item:cast_EatableItem() end)
+    if eatable == nil then return end
+
+    local cond = nil
+    pcall(function() cond = item:condition() end)
+    local local_se_id = nil
+    pcall(function() local_se_id = item:id() end)
+
+    local x, y, z = 0, 0, 0
+    pcall(function()
+        local p = db.actor:position()
+        x, y, z = p.x, p.y, p.z
+    end)
+
+    send_item_action(3, 0, sec, 1, x, y, z, item_condition_u8(cond), local_se_id)
+end
+
 local function on_item_update(pkt, offset)
     local len = string.len(pkt)
     if len < offset + 89 - 1 then
@@ -1054,6 +1089,44 @@ function dispatch_packet(pkt)
                 safe_call("position_correction_dummy", zone_dummy.on_position_correction, x, y, z)
             end
         end)
+    elseif opcode == 0x007C then
+        -- OpAIState (S->C unreliable, protocol v5): count u8, then per entity
+        -- 19 bytes (EntityID u32, X/Y/Z f32, Yaw u16, Anim u8). Multiple
+        -- packets per tick, chunks of <= 32. Strict bounds: 1 + count*19.
+        -- No behavior while disconnected or while xrRazom co-op owns the world.
+        if zone_ai_proxy and zone_ai_proxy.on_ai_state then
+            local connected = false
+            pcall(function() connected = ZoneNet:IsConnected() and true or false end)
+            local co_op = false
+            pcall(function()
+                if _G.XrrIsConnected and _G.XrrIsConnected() then co_op = true end
+                if _G.XrrIsHosted and _G.XrrIsHosted() then co_op = true end
+            end)
+            if connected and not co_op then
+                safe_call("ai_state", function()
+                    local len = string.len(pkt)
+                    if len < offset then
+                        log_dispatch_once("short_007C",
+                            "Zone: dropped short AI_STATE packet (%d bytes)", len)
+                        return
+                    end
+                    local count = string.byte(pkt, offset) or 0
+                    if len < offset + count * 19 then
+                        log_dispatch_once("short_007C",
+                            "Zone: dropped truncated AI_STATE packet (count %d, %d bytes)",
+                            count, len)
+                        return
+                    end
+                    zone_ai_proxy.on_ai_state(pkt, offset)
+                end)
+            end
+        end
+    elseif opcode == 0x007F then
+        -- TODO(protocol v5): container opcode 0x007F. Client container UI is
+        -- out of scope for this wave; reserved dispatch hook, not implemented.
+    elseif opcode == 0x0080 then
+        -- TODO(protocol v5): container opcode 0x0080. Client container UI is
+        -- out of scope for this wave; reserved dispatch hook, not implemented.
     elseif opcode == 0x007E then
         -- OpItemUpdate (S->C reliable, 89 B). Prefer an external zone_item
         -- module when present; otherwise the ledger section in this file.
@@ -1630,6 +1703,7 @@ function register_level_callbacks()
             -- dispatched by bind_stalker_ext.script:142/156.
             RegisterScriptCallback("actor_on_item_take", on_actor_item_take)
             RegisterScriptCallback("actor_on_item_drop", on_actor_item_drop)
+            RegisterScriptCallback("actor_on_item_use", on_actor_item_use)
         end
     end)
     pcall(send_level_change, true)

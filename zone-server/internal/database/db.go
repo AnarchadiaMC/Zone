@@ -37,6 +37,9 @@ func Open(dbPath string) (*DB, error) {
 	if err := migrateInventoryColumns(db); err != nil {
 		return nil, err
 	}
+	if err := migrateAISquadColumns(db); err != nil {
+		return nil, err
+	}
 
 	return &DB{db: db}, nil
 }
@@ -266,6 +269,45 @@ func migrateInventoryColumns(db *sql.DB) error {
 	return nil
 }
 
+// migrateAISquadColumns adds the AI replication metadata columns (label,
+// patrol_radius, walk_speed, run_speed) to databases created before the AI
+// puppet wave. Fresh databases get them from SchemaSQL.
+func migrateAISquadColumns(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(ai_squads)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	adds := map[string]string{
+		"label":         "ALTER TABLE ai_squads ADD COLUMN label TEXT NOT NULL DEFAULT ''",
+		"patrol_radius": "ALTER TABLE ai_squads ADD COLUMN patrol_radius REAL NOT NULL DEFAULT 32.0",
+		"walk_speed":    "ALTER TABLE ai_squads ADD COLUMN walk_speed REAL NOT NULL DEFAULT 1.5",
+		"run_speed":     "ALTER TABLE ai_squads ADD COLUMN run_speed REAL NOT NULL DEFAULT 3.0",
+	}
+	for col, stmt := range adds {
+		if !have[col] {
+			if _, err := db.Exec(stmt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (d *DB) HasCharacter(uuid string) (bool, error) {
 	var one int
 	err := d.db.QueryRow("SELECT 1 FROM characters WHERE client_uuid=?", uuid).Scan(&one)
@@ -444,7 +486,8 @@ func (d *DB) AvailableItemCount(uuid, section string) (int, error) {
 // DropItemToWorld atomically removes count copies of section from the
 // character's inventory and inserts one world_items row. It returns the new
 // world item id and the number of copies left in the inventory. Insufficient
-// stock returns ErrInsufficientItems and leaves the inventory untouched.
+// stock returns ErrInsufficientItems (with the total held as the second value)
+// and leaves the inventory untouched.
 func (d *DB) DropItemToWorld(uuid, level, section string, count int, x, y, z, condition float32) (int64, int, error) {
 	if count <= 0 {
 		return 0, 0, ErrInsufficientItems
@@ -455,53 +498,12 @@ func (d *DB) DropItemToWorld(uuid, level, section string, count int, x, y, z, co
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query("SELECT id, item_count FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id", uuid, section)
+	total, err := removeInventoryItemsLocked(tx, uuid, section, count)
 	if err != nil {
+		if errors.Is(err, ErrInsufficientItems) {
+			return 0, total, ErrInsufficientItems
+		}
 		return 0, 0, err
-	}
-	type invRow struct {
-		id    int
-		count int
-	}
-	var held []invRow
-	total := 0
-	for rows.Next() {
-		var r invRow
-		if err := rows.Scan(&r.id, &r.count); err != nil {
-			rows.Close()
-			return 0, 0, err
-		}
-		held = append(held, r)
-		total += r.count
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, 0, err
-	}
-	rows.Close()
-	if total < count {
-		return 0, total, ErrInsufficientItems
-	}
-
-	remaining := count
-	for _, r := range held {
-		if remaining <= 0 {
-			break
-		}
-		take := r.count
-		if take > remaining {
-			take = remaining
-		}
-		if take == r.count {
-			if _, err := tx.Exec("DELETE FROM character_inventory WHERE id=?", r.id); err != nil {
-				return 0, 0, err
-			}
-		} else {
-			if _, err := tx.Exec("UPDATE character_inventory SET item_count = item_count - ? WHERE id=?", take, r.id); err != nil {
-				return 0, 0, err
-			}
-		}
-		remaining -= take
 	}
 
 	res, err := tx.Exec(`INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -517,6 +519,85 @@ func (d *DB) DropItemToWorld(uuid, level, section string, count int, x, y, z, co
 		return 0, 0, err
 	}
 	return newID, total - count, nil
+}
+
+// ConsumeItem atomically removes count copies of section from the character's
+// inventory inside one transaction (OpItemAction action=3). It returns the
+// remaining inventory count. Insufficient stock returns ErrInsufficientItems
+// (with the total held as the first value) and removes nothing.
+func (d *DB) ConsumeItem(uuid, section string, count int) (int, error) {
+	if count <= 0 {
+		return 0, ErrInsufficientItems
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	total, err := removeInventoryItemsLocked(tx, uuid, section, count)
+	if err != nil {
+		return total, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return total - count, nil
+}
+
+// removeInventoryItemsLocked removes count copies of section from
+// character_inventory inside tx, consuming rows in id order. It returns the
+// total held before removal. ErrInsufficientItems means nothing was removed.
+func removeInventoryItemsLocked(tx *sql.Tx, uuid, section string, count int) (int, error) {
+	rows, err := tx.Query("SELECT id, item_count FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id", uuid, section)
+	if err != nil {
+		return 0, err
+	}
+	type invRow struct {
+		id    int
+		count int
+	}
+	var held []invRow
+	total := 0
+	for rows.Next() {
+		var r invRow
+		if err := rows.Scan(&r.id, &r.count); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		held = append(held, r)
+		total += r.count
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if total < count {
+		return total, ErrInsufficientItems
+	}
+
+	remaining := count
+	for _, r := range held {
+		if remaining <= 0 {
+			break
+		}
+		take := r.count
+		if take > remaining {
+			take = remaining
+		}
+		if take == r.count {
+			if _, err := tx.Exec("DELETE FROM character_inventory WHERE id=?", r.id); err != nil {
+				return 0, err
+			}
+		} else {
+			if _, err := tx.Exec("UPDATE character_inventory SET item_count = item_count - ? WHERE id=?", take, r.id); err != nil {
+				return 0, err
+			}
+		}
+		remaining -= take
+	}
+	return total, nil
 }
 
 // GetWorldItem loads one world item row.

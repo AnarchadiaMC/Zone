@@ -1,6 +1,7 @@
 package game
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"math"
@@ -41,9 +42,14 @@ type StashData struct {
 	UpdatedAt int64   `json:"updated_at"`
 }
 
+// StashItem is one entry of a stash contents_json array. Condition is the
+// 0-100 wire bucket used by OpContainerAction deposit merges; legacy rows
+// without the field decode to bucket 0 and the legacy stash APIs keep their
+// section-only matching semantics.
 type StashItem struct {
-	Section string `json:"section"`
-	Count   int    `json:"count"`
+	Section   string `json:"section"`
+	Count     int    `json:"count"`
+	Condition uint8  `json:"condition,omitempty"`
 }
 
 type StashManager struct {
@@ -355,4 +361,213 @@ func (m *StashManager) StoreStashItem(stashID uint32, ownerUUID, itemSection str
 		return err
 	}
 	return tx.Commit()
+}
+
+// DepositItem moves count copies of section from the character inventory into
+// the stash JSON in ONE transaction (OpContainerAction deposit). Stacks merge
+// by section + condition bucket. Insufficient inventory returns
+// database.ErrInsufficientItems and changes nothing.
+func (m *StashManager) DepositItem(stashID uint32, ownerUUID, level, section string, count int, condition uint8) error {
+	if count < 1 || count > 65535 {
+		return ErrInvalidStashCount
+	}
+	db, err := m.getDB()
+	if err != nil {
+		return err
+	}
+
+	// Serialize read-modify-write against the other stash APIs.
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
+
+	tx, err := db.RawDB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var levelName, contentsJSON string
+	err = tx.QueryRow(`SELECT level_name, contents_json FROM world_stashes WHERE stash_id=?`, stashID).Scan(&levelName, &contentsJSON)
+	if err == sql.ErrNoRows {
+		return ErrStashNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if levelName != level {
+		return ErrStashWrongLevel
+	}
+
+	rows, err := tx.Query(`SELECT id, item_count FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id`, ownerUUID, section)
+	if err != nil {
+		return err
+	}
+	type invRow struct {
+		id    int
+		count int
+	}
+	var held []invRow
+	total := 0
+	for rows.Next() {
+		var r invRow
+		if err := rows.Scan(&r.id, &r.count); err != nil {
+			rows.Close()
+			return err
+		}
+		held = append(held, r)
+		total += r.count
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if total < count {
+		return database.ErrInsufficientItems
+	}
+	remaining := count
+	for _, r := range held {
+		if remaining <= 0 {
+			break
+		}
+		take := r.count
+		if take > remaining {
+			take = remaining
+		}
+		if take == r.count {
+			if _, err := tx.Exec(`DELETE FROM character_inventory WHERE id=?`, r.id); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.Exec(`UPDATE character_inventory SET item_count = item_count - ? WHERE id=?`, take, r.id); err != nil {
+				return err
+			}
+		}
+		remaining -= take
+	}
+
+	items, err := parseStashItems(contentsJSON)
+	if err != nil {
+		return err
+	}
+	if idx := findStashItem(items, section, condition); idx >= 0 {
+		items[idx].Count += count
+	} else {
+		items = append(items, StashItem{Section: section, Count: count, Condition: condition})
+	}
+	updatedBytes, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+	if len(updatedBytes) > 4096 || len(items) > 256 {
+		return ErrStashContentsTooLarge
+	}
+	if _, err := tx.Exec(`UPDATE world_stashes SET contents_json=?, updated_at=? WHERE stash_id=?`, string(updatedBytes), time.Now().Unix(), stashID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// WithdrawItem moves count copies of section (matching condition bucket) out of
+// the stash JSON and credits the character inventory in ONE transaction
+// (OpContainerAction withdraw). Missing entries return ErrItemNotFoundStash,
+// short stacks ErrInsufficientCount, and neither changes state.
+func (m *StashManager) WithdrawItem(stashID uint32, ownerUUID, level, section string, count int, condition uint8) error {
+	if count < 1 || count > 65535 {
+		return ErrInvalidStashCount
+	}
+	db, err := m.getDB()
+	if err != nil {
+		return err
+	}
+
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
+
+	tx, err := db.RawDB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var levelName, contentsJSON string
+	err = tx.QueryRow(`SELECT level_name, contents_json FROM world_stashes WHERE stash_id=?`, stashID).Scan(&levelName, &contentsJSON)
+	if err == sql.ErrNoRows {
+		return ErrStashNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if levelName != level {
+		return ErrStashWrongLevel
+	}
+
+	items, err := parseStashItems(contentsJSON)
+	if err != nil {
+		return err
+	}
+	idx := findStashItem(items, section, condition)
+	if idx < 0 {
+		return ErrItemNotFoundStash
+	}
+	if items[idx].Count < count {
+		return ErrInsufficientCount
+	}
+	items[idx].Count -= count
+	if items[idx].Count == 0 {
+		items = append(items[:idx], items[idx+1:]...)
+	}
+	updatedBytes, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE world_stashes SET contents_json=?, updated_at=? WHERE stash_id=?`, string(updatedBytes), time.Now().Unix(), stashID); err != nil {
+		return err
+	}
+
+	// Credit the owner's inventory, merging into an existing stack of the same
+	// section when one exists (mirrors PickupWorldItem).
+	var invID int
+	err = tx.QueryRow(`SELECT id FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id LIMIT 1`, ownerUUID, section).Scan(&invID)
+	switch {
+	case err == sql.ErrNoRows:
+		cond := float64(condition) / 100.0
+		if _, err := tx.Exec(`INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)`,
+			ownerUUID, section, count, cond); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	default:
+		if _, err := tx.Exec(`UPDATE character_inventory SET item_count = item_count + ? WHERE id=?`, count, invID); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// parseStashItems decodes a stash contents_json string into items, tolerating
+// empty/NULL contents.
+func parseStashItems(contentsJSON string) ([]StashItem, error) {
+	if contentsJSON == "" {
+		return nil, nil
+	}
+	var items []StashItem
+	if err := json.Unmarshal([]byte(contentsJSON), &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// findStashItem returns the index of the section + condition bucket entry, or
+// -1 when absent. Entries written before the condition field existed match
+// bucket 0.
+func findStashItem(items []StashItem, section string, condition uint8) int {
+	for i := range items {
+		if items[i].Section == section && items[i].Condition == condition {
+			return i
+		}
+	}
+	return -1
 }

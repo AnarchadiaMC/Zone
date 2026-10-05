@@ -81,22 +81,27 @@ type EventManager struct{}
 func NewEventManager() *EventManager { return &EventManager{} }
 
 type Server struct {
-	cfg                   *config.Config
-	db                    *database.DB
-	dbQueue               chan *database.DBWriteJob
-	udp                   *network.UDPListener
-	udpMu                 sync.RWMutex
-	nickMu                sync.Mutex
-	sessions              *network.SessionManager
-	grid                  *SpatialGrid
-	events                *EventManager
-	economy               *EconomyManager
-	stashMgr              *StashManager
-	anticheat             *AntiCheatManager
-	aoi                   *AoIManager
-	squads                *ai.SquadManager
-	logger                *zap.Logger
-	seq                   atomic.Uint32
+	cfg       *config.Config
+	db        *database.DB
+	dbQueue   chan *database.DBWriteJob
+	udp       *network.UDPListener
+	udpMu     sync.RWMutex
+	nickMu    sync.Mutex
+	sessions  *network.SessionManager
+	grid      *SpatialGrid
+	events    *EventManager
+	economy   *EconomyManager
+	stashMgr  *StashManager
+	anticheat *AntiCheatManager
+	aoi       *AoIManager
+	squads    *ai.SquadManager
+	aiRepl    *aiReplication
+	logger    *zap.Logger
+	seq       atomic.Uint32
+	// sessionIDSeq allocates session IDs independently of the packet sequence
+	// counter so AI entity IDs (base 1_000_000) can never collide with a
+	// session ID.
+	sessionIDSeq          atomic.Uint32
 	ackQueue              *network.AckQueue
 	emissionMgr           *EmissionOrchestrator
 	damageHandler         *DamageHandler
@@ -181,6 +186,30 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 		itemRate = cfg.ItemRatePerS
 	}
 	s.itemLedger = NewItemLedger(itemRate)
+
+	// AI replication wiring: puppet squads are loaded from ai_squads (seeding
+	// the default l01_escape set when the table is empty) only while
+	// ai_enabled is true. Disabled means no AI entities, no counters, no
+	// packets. Wave A replication is patrol-only; combat/damage are roadmap.
+	aiRadius := float32(AoIRadius)
+	if cfg != nil && cfg.AIOnlineRadiusM > 0 {
+		aiRadius = float32(cfg.AIOnlineRadiusM)
+	}
+	s.aiRepl = newAIReplication(aiRadius)
+	if db != nil && cfg.AIEnabledOrDefault() {
+		if err := SeedAISquads(db); err != nil && s.logger != nil {
+			s.logger.Warn("Failed to seed AI squads", zap.Error(err))
+		}
+		if defs, err := loadAISquads(db); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("Failed to load AI squads", zap.Error(err))
+			}
+		} else {
+			for _, def := range defs {
+				s.registerAIPuppet(def)
+			}
+		}
+	}
 
 	if db != nil {
 		if err := LoadSafeZones(db.RawDB()); err != nil && s.logger != nil {
@@ -469,7 +498,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if nick == "" {
 				nick = "Stalker"
 			}
-			sessID := s.seq.Add(1)
+			sessID := s.sessionIDSeq.Add(1)
 			token, _ := GenerateSessionToken()
 			sess := &network.PlayerSession{
 				SessionID:         sessID,
@@ -1351,6 +1380,8 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.maybeBroadcastEntityEnter(sess)
 	case protocol.OpItemAction:
 		s.handleItemAction(addr, buf)
+	case protocol.OpContainerAction:
+		s.handleContainerAction(addr, buf)
 	case OpAck:
 		// Client ACK of a reliable server packet is liveness evidence for the
 		// anti-lag-switch alive check.
@@ -1964,6 +1995,9 @@ func (s *Server) Tick(now time.Time) {
 			})
 		}
 	}
+
+	// Wave A AI replication: puppet patrolsim + AoI enter/leave + OpAIState.
+	s.tickAIReplication(now)
 
 	// Periodic safe-zone state: every connected client receives a fresh
 	// snapshot every 2 seconds, in addition to the immediate send on join,

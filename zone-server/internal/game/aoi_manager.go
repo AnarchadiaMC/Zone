@@ -256,6 +256,10 @@ func (a *AoIManager) NotifyEntityEnter(session *network.PlayerSession, info Enti
 	var buf bytes.Buffer
 	seqID := seq.Add(1)
 	if err := protocol.WritePacket(&buf, protocol.OpEntityEnterAoI, seqID, protocol.FlagReliable, pkt); err == nil {
+		// activeSink is the test/telemetry recorder hook; nil in production.
+		if activeSink != nil {
+			activeSink.Record(buf.Bytes())
+		}
 		_ = udp.Send(udpAddr, buf.Bytes())
 	}
 }
@@ -283,6 +287,9 @@ func (a *AoIManager) NotifyEntityLeave(session *network.PlayerSession, entityID 
 	pkt := protocol.EntityLeaveAoI{EntityID: entityID}
 	seqID := seq.Add(1)
 	if err := protocol.WritePacket(&buf, protocol.OpEntityLeaveAoI, seqID, protocol.FlagReliable, pkt); err == nil {
+		if activeSink != nil {
+			activeSink.Record(buf.Bytes())
+		}
 		_ = udp.Send(udpAddr, buf.Bytes())
 	}
 }

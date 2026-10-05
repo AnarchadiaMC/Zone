@@ -40,8 +40,11 @@ const (
 	OpGroupResponse      = 0x0079
 	OpGroupState         = 0x007A
 	OpPositionCorrection = 0x007B
+	OpAIState            = 0x007C
 	OpItemAction         = 0x007D
 	OpItemUpdate         = 0x007E
+	OpContainerAction    = 0x007F
+	OpContainerUpdate    = 0x0080
 )
 
 type PacketHeader struct {

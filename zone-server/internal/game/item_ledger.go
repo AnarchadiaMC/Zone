@@ -35,15 +35,33 @@ type cachedItemResult struct {
 	packet   protocol.ItemUpdatePacket
 }
 
+// cachedContainerResult is the OpContainerUpdate twin of cachedItemResult.
+// Both caches share the per-session monotonic ActionID floor and rate window,
+// so 0x007D and 0x007F cannot replay each other's action IDs.
+type cachedContainerResult struct {
+	actionID uint32
+	packet   protocol.ContainerUpdatePacket
+}
+
 // itemActionState is the per-session ledger bookkeeping: monotonic ActionID
-// floor, a fixed-size LRU of recent results, and the rate-limit window.
+// floor, fixed-size LRUs of recent item and container results, and the
+// rate-limit window.
 type itemActionState struct {
-	lastActionID uint32
-	hasLast      bool
-	cache        [itemActionCacheSize]cachedItemResult
-	cachePos     int
-	cacheLen     int
-	rate         []time.Time
+	lastActionID   uint32
+	hasLast        bool
+	cache          [itemActionCacheSize]cachedItemResult
+	cachePos       int
+	cacheLen       int
+	containerCache [itemActionCacheSize]cachedContainerResult
+	containerPos   int
+	containerLen   int
+	rate           []time.Time
+}
+
+// recordFloor advances the shared monotonic ActionID floor.
+func (st *itemActionState) recordFloor(actionID uint32) {
+	st.lastActionID = actionID
+	st.hasLast = true
 }
 
 // ItemLedger provides dupe-proof idempotency and per-session rate limiting for
@@ -132,12 +150,42 @@ func (l *ItemLedger) Record(sessionID, actionID uint32, result protocol.ItemUpda
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	st := l.stateLocked(sessionID)
-	st.lastActionID = actionID
-	st.hasLast = true
+	st.recordFloor(actionID)
 	st.cache[st.cachePos] = cachedItemResult{actionID: actionID, packet: result}
 	st.cachePos = (st.cachePos + 1) % itemActionCacheSize
 	if st.cacheLen < itemActionCacheSize {
 		st.cacheLen++
+	}
+}
+
+// LookupContainer returns the cached OpContainerUpdate for a replayed
+// ActionID. The cache shares the item ledger's monotonic floor.
+func (l *ItemLedger) LookupContainer(sessionID, actionID uint32) (protocol.ContainerUpdatePacket, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.sessions[sessionID]
+	if st == nil {
+		return protocol.ContainerUpdatePacket{}, false
+	}
+	for i := 0; i < st.containerLen; i++ {
+		if st.containerCache[i].actionID == actionID {
+			return st.containerCache[i].packet, true
+		}
+	}
+	return protocol.ContainerUpdatePacket{}, false
+}
+
+// RecordContainer advances the shared monotonic floor and caches an
+// OpContainerUpdate result for retransmit echo.
+func (l *ItemLedger) RecordContainer(sessionID, actionID uint32, result protocol.ContainerUpdatePacket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.stateLocked(sessionID)
+	st.recordFloor(actionID)
+	st.containerCache[st.containerPos] = cachedContainerResult{actionID: actionID, packet: result}
+	st.containerPos = (st.containerPos + 1) % itemActionCacheSize
+	if st.containerLen < itemActionCacheSize {
+		st.containerLen++
 	}
 }
 
@@ -215,7 +263,7 @@ func (s *Server) handleItemAction(addr *net.UDPAddr, buf *bytes.Reader) {
 		return
 	}
 
-	if pkt.Action != protocol.ItemActionDrop && pkt.Action != protocol.ItemActionPickup {
+	if pkt.Action != protocol.ItemActionDrop && pkt.Action != protocol.ItemActionPickup && pkt.Action != protocol.ItemActionConsume {
 		s.replyItemUpdate(sess, protocol.ItemUpdatePacket{
 			ActionID: pkt.ActionID,
 			Result:   protocol.ItemResultRejected,
@@ -278,6 +326,10 @@ func (s *Server) handleItemAction(addr *net.UDPAddr, buf *bytes.Reader) {
 
 	if pkt.Action == protocol.ItemActionDrop {
 		s.handleItemDrop(sess, uuid, level, section, pkt)
+		return
+	}
+	if pkt.Action == protocol.ItemActionConsume {
+		s.handleItemConsume(sess, uuid, section, pkt)
 		return
 	}
 	s.handleItemPickup(sess, uuid, level, playerPos, pkt)

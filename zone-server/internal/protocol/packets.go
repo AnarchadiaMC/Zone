@@ -324,16 +324,91 @@ type PositionCorrection struct {
 
 // Item action identifiers for OpItemAction/OpItemUpdate.
 const (
-	ItemActionDrop   uint8 = 1
-	ItemActionPickup uint8 = 2
+	ItemActionDrop    uint8 = 1
+	ItemActionPickup  uint8 = 2
+	ItemActionConsume uint8 = 3
 )
 
-// Item update result codes for OpItemUpdate.
+// Container action identifiers for OpContainerAction.
+const (
+	ContainerActionDeposit  uint8 = 1
+	ContainerActionWithdraw uint8 = 2
+)
+
+// AIStateEntry is one 19-byte AI puppet entry of OpAIState (0x007C):
+// EntityID u32(0), X f32(4), Y f32(8), Z f32(12), Yaw u16(16), Anim u8(18).
+// Anim values: 0=idle, 1=walk, 2=run, 3=attack, 4=death. Yaw is a full circle
+// in 65536 units (0..65535, 0 = facing +Z, increasing counter-clockwise).
+type AIStateEntry struct {
+	EntityID uint32
+	X        float32
+	Y        float32
+	Z        float32
+	Yaw      uint16
+	Anim     uint8
+}
+
+// AIStateEntryWireSize is the fixed on-wire size of one AIStateEntry.
+const AIStateEntryWireSize = 19
+
+// MaxAIStateEntries is the per-packet cap of OpAIState entities; larger online
+// sets are chunked across packets like snapshots.
+const MaxAIStateEntries = 32
+
+// AIStatePacket is the OpAIState (0x007C) server->client payload: a u8 count
+// followed by exactly Count 19-byte entries (1 + 19*Count bytes on the wire,
+// 1 + 32*19 maximum). Entries beyond Count are not serialised.
+type AIStatePacket struct {
+	Count   uint8
+	Entries [MaxAIStateEntries]AIStateEntry
+}
+
+// AI animation wire values used by AIStateEntry.Anim.
+const (
+	AIAnimIdle   uint8 = 0
+	AIAnimWalk   uint8 = 1
+	AIAnimRun    uint8 = 2
+	AIAnimAttack uint8 = 3
+	AIAnimDeath  uint8 = 4
+)
+
+// Item update result codes for OpItemUpdate and OpContainerUpdate.
 const (
 	ItemResultOK        uint8 = 0
 	ItemResultRejected  uint8 = 1
 	ItemResultCorrected uint8 = 2
 )
+
+// ContainerActionPacket is the OpContainerAction (0x007F) client->server
+// payload: 88 bytes. ActionID is client-monotonic and shares the OpItemAction
+// replay floor; Action is ContainerActionDeposit or ContainerActionWithdraw;
+// ContainerID is the numeric world_stashes.stash_id (SQLite rowid); Count is
+// the requested amount; Condition is 0-100.
+type ContainerActionPacket struct {
+	ActionID    uint32
+	ContainerID uint32
+	Action      uint8
+	Section     [64]byte
+	Count       uint16
+	X           float32
+	Y           float32
+	Z           float32
+	Condition   uint8
+}
+
+// ContainerUpdatePacket is the OpContainerUpdate (0x0080) server->client
+// payload: 77 bytes. Result is ItemResultOK/Rejected/Corrected; Count is the
+// signed delta applied to the client's container/inventory view (negative =
+// removed from inventory on deposit, positive = credited on withdraw).
+type ContainerUpdatePacket struct {
+	ActionID    uint32
+	Result      uint8
+	Action      uint8
+	ContainerID uint32
+	Count       int16
+	Section     [64]byte
+	Condition   uint8
+}
 
 // ItemActionPacket is the OpItemAction (0x007D) client->server payload:
 // 88 bytes. ActionID is client-monotonic; Action is ItemActionDrop or
@@ -404,6 +479,14 @@ func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload in
 			}
 		case GroupState:
 			if err := writeGroupState(&buf, &p); err != nil {
+				return err
+			}
+		case *AIStatePacket:
+			if err := writeAIState(&buf, p); err != nil {
+				return err
+			}
+		case AIStatePacket:
+			if err := writeAIState(&buf, &p); err != nil {
 				return err
 			}
 		default:
@@ -619,6 +702,51 @@ func ReadServerSnapshot(r io.Reader) (*ServerSnapshot, error) {
 		snap.Entries[i] = decodeSnapshotEntry(entry[:])
 	}
 	return &snap, nil
+}
+
+// writeAIState serialises only the populated AI entries instead of the fixed
+// [32] backing array, so the payload is 1 + 19*Count bytes. Count is clamped
+// to MaxAIStateEntries.
+func writeAIState(w io.Writer, state *AIStatePacket) error {
+	count := 0
+	if state != nil {
+		count = int(state.Count)
+		if count > MaxAIStateEntries {
+			count = MaxAIStateEntries
+		}
+		if count < 0 {
+			count = 0
+		}
+	}
+	if 1+count*AIStateEntryWireSize > MaxSafeUDPPacketSize {
+		return ErrPayloadExceedsMTU
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint8(count)); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	return binary.Write(w, binary.LittleEndian, state.Entries[:count])
+}
+
+// ReadAIStatePacket decodes an OpAIState payload with its variable-length entry
+// list. A count above MaxAIStateEntries is clamped defensively.
+func ReadAIStatePacket(r io.Reader) (*AIStatePacket, error) {
+	var state AIStatePacket
+	if err := binary.Read(r, binary.LittleEndian, &state.Count); err != nil {
+		return nil, err
+	}
+	count := int(state.Count)
+	if count > MaxAIStateEntries {
+		count = MaxAIStateEntries
+	}
+	for i := 0; i < count; i++ {
+		if err := binary.Read(r, binary.LittleEndian, &state.Entries[i]); err != nil {
+			return nil, err
+		}
+	}
+	return &state, nil
 }
 
 // readServerSnapshotReader is ReadServerSnapshot specialised for a concrete

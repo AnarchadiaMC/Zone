@@ -99,7 +99,11 @@ CREATE TABLE IF NOT EXISTS ai_squads (
     pos_y REAL NOT NULL,
     pos_z REAL NOT NULL,
     patrol_path TEXT,
-    is_online INTEGER NOT NULL DEFAULT 0
+    is_online INTEGER NOT NULL DEFAULT 0,
+    label TEXT NOT NULL DEFAULT '',
+    patrol_radius REAL NOT NULL DEFAULT 32.0,
+    walk_speed REAL NOT NULL DEFAULT 1.5,
+    run_speed REAL NOT NULL DEFAULT 3.0
 );
 -- Performance indexes (idempotent; safe for existing DBs on Open).
 -- NOTE: this schema uses client_uuid as the account/character key, so
