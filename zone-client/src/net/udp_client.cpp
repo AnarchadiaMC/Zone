@@ -60,6 +60,11 @@ namespace
     std::string g_Nick;
     
     std::atomic<uint32_t> g_Sequence = 0;
+
+    constexpr uint8_t FlagReliable = 0x01;
+    constexpr uint8_t FlagUnreliable = 0x02;
+
+    constexpr int kMaxRawPayload = 1200;
     
     int g_ConnectRetries = 0;
     int g_ConnectBackoffMs = 1000;
@@ -801,6 +806,33 @@ namespace NetClient
         memcpy(buf + sizeof(hdr), &cs, sizeof(cs));
         SendPacket(buf, sizeof(buf));
         return true;
+    }
+
+    int SendRaw(uint16_t opcode, const char* payload, int payloadLen, bool reliable)
+    {
+        if (opcode == 0 || payloadLen < 0 || payloadLen > kMaxRawPayload)
+            return -1;
+        if (payloadLen > 0 && !payload)
+            return -1;
+        if (g_State != CONNECTED)
+            return -2;
+
+        ZO_Header hdr = { 0x5A4F, 1,
+                          reliable ? FlagReliable : FlagUnreliable,
+                          ++g_Sequence, opcode, (uint16_t)payloadLen };
+        char buf[sizeof(ZO_Header) + kMaxRawPayload];
+        memcpy(buf, &hdr, sizeof(hdr));
+        if (payloadLen > 0)
+        {
+            memcpy(buf + sizeof(hdr), payload, (size_t)payloadLen);
+        }
+        SendPacket(buf, (int)sizeof(hdr) + payloadLen);
+
+        // NOTE: reliability here only marks the packet so the server ACKs the
+        // inbound datagram. The client has no unacked-raw table and performs no
+        // retransmit for ZN_SendRaw; outbound loss recovery for raw opcodes is
+        // a documented limitation, not a feature of this send path.
+        return 0;
     }
 
     int QueryServer(const std::string& ip, uint16_t port, char* outBuf, int outBufLen, int timeoutMs)

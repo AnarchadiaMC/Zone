@@ -18,10 +18,11 @@ const AoIRadius float32 = 220.0
 // the supported player caps.
 //
 // Worst-case bandwidth at 48 players all inside one AoI (47 neighbours):
-//   entries per tick   = 47
-//   packets per tick   = ceil(47 / 32) = 2
-//   bytes per tick     = 47*22 (entries) + 2*1 (counts) + 2*12 (headers) = 1060
-//   bytes per second   = 1060 * 30 = 31,800 B/s ~= 31.1 KiB/s
+//
+//	entries per tick   = 47
+//	packets per tick   = ceil(47 / 32) = 2
+//	bytes per tick     = 47*22 (entries) + 2*1 (counts) + 2*12 (headers) = 1060
+//	bytes per second   = 1060 * 30 = 31,800 B/s ~= 31.1 KiB/s
 //
 // That is well under a 100 KiB/s budget, so no cap is applied by default.
 // Raising MaxPlayers past ~150 in a single AoI would warrant setting this to

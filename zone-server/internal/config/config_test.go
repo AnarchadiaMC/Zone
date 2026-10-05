@@ -126,6 +126,69 @@ func TestGroupMaxPlayersClampedToProtocolCap(t *testing.T) {
 	}
 }
 
+// Frozen netcode/ledger keys must default even when the YAML omits them.
+func TestConfigNetcodeAndLedgerDefaults(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.MaxSpeedMPS != 25 {
+		t.Errorf("MaxSpeedMPS default = %v, want 25", cfg.MaxSpeedMPS)
+	}
+	if cfg.CorrectionToleranceM != 2.0 {
+		t.Errorf("CorrectionToleranceM default = %v, want 2.0", cfg.CorrectionToleranceM)
+	}
+	if cfg.LagswitchGapMS != 1500 {
+		t.Errorf("LagswitchGapMS default = %d, want 1500", cfg.LagswitchGapMS)
+	}
+	if cfg.LagswitchStrikes != 3 {
+		t.Errorf("LagswitchStrikes default = %d, want 3", cfg.LagswitchStrikes)
+	}
+	if cfg.DamageBudgetPerS != 400 {
+		t.Errorf("DamageBudgetPerS default = %v, want 400", cfg.DamageBudgetPerS)
+	}
+	if cfg.ItemRatePerS != 5 {
+		t.Errorf("ItemRatePerS default = %v, want 5", cfg.ItemRatePerS)
+	}
+}
+
+func TestConfigNetcodeAndLedgerKeysLoaded(t *testing.T) {
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+max_speed_mps: 18.5
+correction_tolerance_m: 1.25
+lagswitch_gap_ms: 900
+lagswitch_strikes: 4
+damage_budget_per_s: 275.5
+item_rate_per_s: 2.5
+`
+	tmpfile, err := os.CreateTemp("", "config_netcode_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.MaxSpeedMPS != 18.5 || cfg.CorrectionToleranceM != 1.25 {
+		t.Errorf("movement keys = %v/%v, want 18.5/1.25", cfg.MaxSpeedMPS, cfg.CorrectionToleranceM)
+	}
+	if cfg.LagswitchGapMS != 900 || cfg.LagswitchStrikes != 4 {
+		t.Errorf("lagswitch keys = %d/%d, want 900/4", cfg.LagswitchGapMS, cfg.LagswitchStrikes)
+	}
+	if cfg.DamageBudgetPerS != 275.5 || cfg.ItemRatePerS != 2.5 {
+		t.Errorf("ledger keys = %v/%v, want 275.5/2.5", cfg.DamageBudgetPerS, cfg.ItemRatePerS)
+	}
+}
+
 // Validate accepts the supported 48/64 player caps and rejects non-positive
 // values, so the handshake full-path can rely on MaxPlayers being sane.
 func TestValidate_MaxPlayers48And64(t *testing.T) {

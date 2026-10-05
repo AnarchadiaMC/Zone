@@ -11,3 +11,9 @@ mode: 0
 locked: false
 group_max_players: 4
 invite_ttl_sec: 60
+max_speed_mps: 25
+correction_tolerance_m: 2.0
+lagswitch_gap_ms: 1500
+lagswitch_strikes: 3
+damage_budget_per_s: 400
+item_rate_per_s: 5

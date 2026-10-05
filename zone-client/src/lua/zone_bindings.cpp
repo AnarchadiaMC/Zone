@@ -201,4 +201,21 @@ extern "C" {
         return true;
     }
 
+    // Generic reliable/unreliable send for opcodes that have no typed C++
+    // binding yet (item actions, fire events, future features). Validates the
+    // frame, then routes through NetClient::SendRaw on the session socket.
+    // Returns 0 on success; -1 invalid argument; -2 not connected.
+    // LIMITATION: reliable=1 marks the packet and the server ACKs the inbound
+    // datagram, but the client does not retransmit outbound raw packets.
+    __declspec(dllexport) int ZN_SendRaw(uint16_t opcode, const char* payload, int payloadLen, int reliable)
+    {
+        if (opcode == 0)
+            return -1;
+        if (payloadLen < 0 || payloadLen > 1200)
+            return -1;
+        if (payloadLen > 0 && !payload)
+            return -1;
+        return NetClient::SendRaw(opcode, payload, payloadLen, reliable != 0);
+    }
+
 }

@@ -312,6 +312,64 @@ type EntityAoIPayload struct {
 	PosZ       float32
 }
 
+// PositionCorrection is the OpPositionCorrection (0x007B) server->client
+// payload, sent unreliable: 12 bytes (x f32, y f32, z f32). It carries the
+// last server-validated position so a client that failed movement validation
+// snaps back instead of keeping a rejected position.
+type PositionCorrection struct {
+	X float32
+	Y float32
+	Z float32
+}
+
+// Item action identifiers for OpItemAction/OpItemUpdate.
+const (
+	ItemActionDrop   uint8 = 1
+	ItemActionPickup uint8 = 2
+)
+
+// Item update result codes for OpItemUpdate.
+const (
+	ItemResultOK        uint8 = 0
+	ItemResultRejected  uint8 = 1
+	ItemResultCorrected uint8 = 2
+)
+
+// ItemActionPacket is the OpItemAction (0x007D) client->server payload:
+// 88 bytes. ActionID is client-monotonic; Action is ItemActionDrop or
+// ItemActionPickup; ItemID is 0 for drops (server assigns the world id) and
+// the world_items.id for pickups; Count is the requested stack size; X/Y/Z is
+// the requested drop position or ignored for pickups; Condition is 0-100.
+type ItemActionPacket struct {
+	ActionID  uint32
+	Action    uint8
+	ItemID    uint32
+	Section   [64]byte
+	Count     uint16
+	X         float32
+	Y         float32
+	Z         float32
+	Condition uint8
+}
+
+// ItemUpdatePacket is the OpItemUpdate (0x007E) server->client payload:
+// 89 bytes. Result is ItemResultOK, ItemResultRejected or ItemResultCorrected;
+// Count is a signed delta (negative = removed from the receiver's inventory,
+// positive = added); Section/position/condition are echoed from server state
+// (never from the client for pickups).
+type ItemUpdatePacket struct {
+	ActionID  uint32
+	Result    uint8
+	Action    uint8
+	ItemID    uint32
+	Count     int16
+	Section   [64]byte
+	X         float32
+	Y         float32
+	Z         float32
+	Condition uint8
+}
+
 func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload interface{}) error {
 	// Snapshots are the 30Hz hot path: encode them directly onto the writer
 	// with fixed stack buffers instead of binary.Write reflection, so no

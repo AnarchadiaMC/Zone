@@ -29,16 +29,24 @@ type PlayerSession struct {
 	LastSeen          time.Time
 	LastSequence      uint32
 	LastTransformTime time.Time
-	LastRejectedPos   [3]float32
-	RejectConfirm     int
-	HasRejected       bool
-	SessionToken      uint64
-	Dirty             bool
-	LastCheckpoint    time.Time
-	InCombatUntil     time.Time
-	ChatTimestamps    []time.Time
-	PendingCreate     bool
-	Faction           string
+	// LastHeartbeat is the arrival time of the most recent heartbeat or client
+	// ACK (any traffic that proves the link is alive without a transform).
+	// Anti-lag-switch uses it to distinguish a deliberately stalled transform
+	// stream from plain packet loss.
+	LastHeartbeat time.Time
+	// TransformHistory is the rolling ring of accepted transforms (last ~2 s).
+	// Mutated only while the session lock is held.
+	TransformHistory TransformRing
+	LastRejectedPos  [3]float32
+	RejectConfirm    int
+	HasRejected      bool
+	SessionToken     uint64
+	Dirty            bool
+	LastCheckpoint   time.Time
+	InCombatUntil    time.Time
+	ChatTimestamps   []time.Time
+	PendingCreate    bool
+	Faction          string
 	// EnterBroadcastLevel is the level for which ENTITY_ENTER_AOI has been
 	// broadcast to same-level peers. Empty until a broadcast happens with a
 	// valid gvid and visual; reset on level change.

@@ -436,9 +436,9 @@ func TestLifecycle_StaleSessionTimeout(t *testing.T) {
 		CurrentLevel: "l01_escape",
 		// Inside sz_cordon_rookie so timeout does NOT spawn a sleeper
 		// (sleepers re-insert the entity ID into the grid by design).
-		Position:     [3]float32{-211.3, -20.2, -145.8},
-		Health:       100.0,
-		LastSeen:     time.Now().Add(-35 * time.Second),
+		Position: [3]float32{-211.3, -20.2, -145.8},
+		Health:   100.0,
+		LastSeen: time.Now().Add(-35 * time.Second),
 	}
 	s.sessions.AddSession(sess)
 	s.grid.Insert(sessID, -211.3, -145.8)

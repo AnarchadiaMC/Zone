@@ -35,12 +35,24 @@ CREATE TABLE IF NOT EXISTS character_inventory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     client_uuid TEXT NOT NULL REFERENCES characters(client_uuid) ON DELETE CASCADE,
     item_section TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 1,
     condition REAL NOT NULL DEFAULT 1.0,
     ammo_current INTEGER NOT NULL DEFAULT 0,
     addon_flags INTEGER NOT NULL DEFAULT 0,
     slot INTEGER NOT NULL DEFAULT -1,
     grid_x INTEGER NOT NULL DEFAULT 0,
     grid_y INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS world_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level_name TEXT NOT NULL,
+    pos_x REAL NOT NULL,
+    pos_y REAL NOT NULL,
+    pos_z REAL NOT NULL,
+    section TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 1,
+    condition REAL NOT NULL DEFAULT 1.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS world_stashes (
     stash_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,5 +107,6 @@ CREATE TABLE IF NOT EXISTS ai_squads (
 CREATE INDEX IF NOT EXISTS idx_char_account ON characters(client_uuid);
 CREATE INDEX IF NOT EXISTS idx_inv_char ON character_inventory(client_uuid);
 CREATE INDEX IF NOT EXISTS idx_stashes_level ON world_stashes(level_name);
+CREATE INDEX IF NOT EXISTS idx_world_items_level ON world_items(level_name);
 CREATE INDEX IF NOT EXISTS idx_zones_level ON safe_zones(level_name);
 `

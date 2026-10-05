@@ -100,6 +100,8 @@ type Server struct {
 	ackQueue              *network.AckQueue
 	emissionMgr           *EmissionOrchestrator
 	damageHandler         *DamageHandler
+	movementGuard         *MovementGuard
+	itemLedger            *ItemLedger
 	sleepers              *SleeperManager
 	groups                *GroupManager
 	startTime             time.Time
@@ -165,6 +167,20 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	}
 	s.groups = NewGroupManager(groupMax, inviteTTL)
 	s.damageHandler.SetGroupManager(s.groups)
+
+	// Server-authoritative movement + item ledger wiring. Defaults apply when
+	// cfg is nil (tests) or a key is unset.
+	s.movementGuard = NewMovementGuard(cfg)
+	s.damageHandler.SetMovementGuard(s.movementGuard)
+	s.damageHandler.SetAntiCheatManager(s.anticheat)
+	if cfg != nil && cfg.DamageBudgetPerS > 0 {
+		s.damageHandler.SetDamageBudgetPerS(cfg.DamageBudgetPerS)
+	}
+	itemRate := 5.0
+	if cfg != nil && cfg.ItemRatePerS > 0 {
+		itemRate = cfg.ItemRatePerS
+	}
+	s.itemLedger = NewItemLedger(itemRate)
 
 	if db != nil {
 		if err := LoadSafeZones(db.RawDB()); err != nil && s.logger != nil {
@@ -649,6 +665,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			s.broadcastEntityLeaveToPeers(sessID, level)
 
 			s.sessions.RemoveSession(sessID)
+			s.clearSessionTracking(sessID)
 			s.logger.Info("Client disconnected",
 				zap.Uint32("session_id", sessID),
 				zap.String("addr", addr.String()),
@@ -660,6 +677,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
 				sess.LastSeen = time.Now()
+				sess.LastHeartbeat = time.Now()
 				sess.Unlock()
 				s.SendToSession(sess, protocol.OpHeartbeat, protocol.FlagUnreliable, hb)
 			}
@@ -668,6 +686,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
 				sess.Lock()
 				sess.LastSeen = time.Now()
+				sess.LastHeartbeat = time.Now()
 				sess.Unlock()
 			}
 		}
@@ -696,62 +715,131 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				}
 
 				now := time.Now()
+				newPos := [3]float32{ct.PosX, ct.PosY, ct.PosZ}
+
 				sess.Lock()
-				dt := float32(now.Sub(sess.LastTransformTime).Seconds())
+				lastPos := sess.Position
+				lastTransform := sess.LastTransformTime
+				lastAlive := sess.LastHeartbeat
+				if lastAlive.IsZero() {
+					lastAlive = sess.LastSeen
+				}
+				hasHistory := sess.TransformHistory.Len() > 0
 				sess.Unlock()
 
-				// Speedhack and movement sanity check (Issue 17)
-				if s.anticheat != nil {
-					newPos := [3]float32{ct.PosX, ct.PosY, ct.PosZ}
-					valid, reason := s.anticheat.ValidateMove(sess, newPos, dt)
-					if !valid {
-						sess.Lock()
-						dx := float64(newPos[0] - sess.LastRejectedPos[0])
-						dy := float64(newPos[1] - sess.LastRejectedPos[1])
-						dz := float64(newPos[2] - sess.LastRejectedPos[2])
-						dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-						if sess.HasRejected && dist <= 5.0 {
-							sess.RejectConfirm++
-						} else {
-							sess.LastRejectedPos = newPos
-							sess.HasRejected = true
-							sess.RejectConfirm = 1
-						}
-						confirm := sess.RejectConfirm
-						sess.Unlock()
-						if confirm >= 4 {
+				dt := now.Sub(lastTransform).Seconds()
+				firstTransform := lastTransform.IsZero()
+
+				// Lag-switch signature: transform gap beyond lagswitch_gap_ms
+				// while heartbeats/ACKs prove the session is otherwise alive.
+				// Repeated signatures inside a rolling 60 s window kick. Plain
+				// packet loss (no heartbeat/ACK during the gap) never strikes.
+				if !firstTransform && s.movementGuard != nil && s.anticheat != nil {
+					gap := now.Sub(lastTransform)
+					if s.movementGuard.IsLagswitchSignature(gap, hasHistory, now.Sub(lastAlive)) {
+						strikes := s.anticheat.RecordLagswitchStrike(sess.SessionID, now)
+						if strikes >= s.movementGuard.StrikesLimit() {
 							sess.Lock()
-							sess.Position = newPos
-							sess.LastTransformTime = now
-							sess.HasRejected = false
-							sess.RejectConfirm = 0
+							uuid := sess.AccountID
 							sess.Unlock()
+							s.audit(uuid, "lagswitch_kick",
+								fmt.Sprintf("session=%d strikes=%d gap_ms=%d reason=network abuse suspected",
+									sess.SessionID, strikes, gap.Milliseconds()))
+							if s.logger != nil {
+								s.logger.Warn("Kicking player for suspected network abuse",
+									zap.Uint32("session", sess.SessionID),
+									zap.Int("strikes", strikes),
+									zap.Duration("gap", gap),
+								)
+							}
+							s.KickSession(sess.SessionID)
+							return
+						}
+					}
+				}
+
+				// Server-authoritative movement validation: displacement must
+				// fit the speed budget (max_speed_mps + correction_tolerance_m)
+				// over the real elapsed time. On top of that, keep the legacy
+				// vertical/speed anticheat as a second gate.
+				valid := true
+				reason := ""
+				if !firstTransform {
+					dist := Displacement(lastPos, newPos)
+					if s.movementGuard != nil && !s.movementGuard.ValidDisplacement(dist, dt) {
+						valid = false
+						reason = "speed violation"
+					} else if s.anticheat != nil {
+						var acValid bool
+						acValid, reason = s.anticheat.ValidateMove(sess, newPos, float32(dt))
+						if !acValid {
+							valid = false
+						}
+					}
+				}
+
+				if !valid {
+					sess.Lock()
+					dx := float64(newPos[0] - sess.LastRejectedPos[0])
+					dy := float64(newPos[1] - sess.LastRejectedPos[1])
+					dz := float64(newPos[2] - sess.LastRejectedPos[2])
+					dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+					if sess.HasRejected && dist <= 5.0 {
+						sess.RejectConfirm++
+					} else {
+						sess.LastRejectedPos = newPos
+						sess.HasRejected = true
+						sess.RejectConfirm = 1
+					}
+					confirm := sess.RejectConfirm
+					lastValid := sess.Position
+					sess.Unlock()
+					if confirm >= 4 {
+						sess.Lock()
+						sess.Position = newPos
+						sess.LastTransformTime = now
+						sess.HasRejected = false
+						sess.RejectConfirm = 0
+						sess.Unlock()
+						if s.anticheat != nil {
 							s.anticheat.Reset(sess.SessionID)
+						}
+						if s.logger != nil {
 							s.logger.Info("accepted client relocation (level change/load?)",
 								zap.Uint32("session", sess.SessionID),
 								zap.Any("pos", newPos),
 							)
-						} else {
-							violations := s.anticheat.RecordViolation(sess.SessionID, reason)
-							if s.anticheat.ShouldKick(violations) {
+						}
+					} else {
+						var violations int
+						if s.anticheat != nil {
+							violations = s.anticheat.RecordViolation(sess.SessionID, reason)
+						}
+						if s.anticheat != nil && s.anticheat.ShouldKick(violations) {
+							if s.logger != nil {
 								s.logger.Warn("Kicking player for repeated anticheat violations",
 									zap.Uint32("session", sess.SessionID),
 									zap.String("reason", reason),
 									zap.Int("violations", violations),
 								)
-								s.KickSession(sess.SessionID)
-								return
 							}
-							// Rubberband: drop packet and do not update position
+							s.KickSession(sess.SessionID)
 							return
 						}
-					} else {
-						s.anticheat.Reset(sess.SessionID)
-						sess.Lock()
-						sess.HasRejected = false
-						sess.RejectConfirm = 0
-						sess.Unlock()
+						// Correction packet: do not update the server position;
+						// tell the client where it actually is.
+						s.SendToSession(sess, protocol.OpPositionCorrection, protocol.FlagUnreliable,
+							protocol.PositionCorrection{X: lastValid[0], Y: lastValid[1], Z: lastValid[2]})
+						return
 					}
+				} else {
+					if s.anticheat != nil {
+						s.anticheat.Reset(sess.SessionID)
+					}
+					sess.Lock()
+					sess.HasRejected = false
+					sess.RejectConfirm = 0
+					sess.Unlock()
 				}
 
 				sess.Lock()
@@ -763,6 +851,13 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.Gvid = ct.Gvid
 				sess.LastSeen = now
 				sess.LastTransformTime = now
+				sess.TransformHistory.Push(network.TransformSample{
+					At:   now,
+					X:    ct.PosX,
+					Y:    ct.PosY,
+					Z:    ct.PosZ,
+					Gvid: ct.Gvid,
+				})
 				uuid := sess.AccountID
 				health := sess.Health
 				level := sess.CurrentLevel
@@ -1254,7 +1349,18 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 		sess.Unlock()
 		s.maybeBroadcastEntityEnter(sess)
+	case protocol.OpItemAction:
+		s.handleItemAction(addr, buf)
 	case OpAck:
+		// Client ACK of a reliable server packet is liveness evidence for the
+		// anti-lag-switch alive check.
+		if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
+			now := time.Now()
+			sess.Lock()
+			sess.LastSeen = now
+			sess.LastHeartbeat = now
+			sess.Unlock()
+		}
 		if s.ackQueue != nil {
 			var ackSeq uint32
 			if binary.Read(buf, binary.LittleEndian, &ackSeq) == nil && ackSeq != 0 {
@@ -1452,7 +1558,16 @@ func (s *Server) sendInventorySync(sess *network.PlayerSession) bool {
 			}
 			var entry protocol.InventoryItemPayload
 			copy(entry.Section[:], it.ItemSection)
-			entry.Count = 1
+			// Stack size comes from the ledger column so the client's count
+			// matches what drops/pickups enforce server-side.
+			stack := it.ItemCount
+			if stack < 1 {
+				stack = 1
+			}
+			if stack > 65535 {
+				stack = 65535
+			}
+			entry.Count = uint16(stack)
 			cond := float64(it.Condition) * 100.0
 			if cond < 0 {
 				cond = 0
@@ -1789,9 +1904,7 @@ func (s *Server) Tick(now time.Time) {
 				s.ackQueue.RemoveByAddr(addrStr)
 			}
 			s.sessions.RemoveSession(sessID)
-			if s.anticheat != nil {
-				s.anticheat.ViolationReset(sessID)
-			}
+			s.clearSessionTracking(sessID)
 			if uuid != "" && (dirty || health <= 0) {
 				s.SyncFlushPlayerTransform(uuid, pos[0], pos[1], pos[2], yaw, health)
 				if s.db != nil {
@@ -2057,9 +2170,7 @@ func (s *Server) cleanupEvictedSession(evicted *network.PlayerSession) {
 	if s.ackQueue != nil && addrStr != "" {
 		s.ackQueue.RemoveByAddr(addrStr)
 	}
-	if s.anticheat != nil {
-		s.anticheat.ViolationReset(sessID)
-	}
+	s.clearSessionTracking(sessID)
 }
 
 // removeFromGroup detaches a disconnecting/timed-out session from its party
@@ -2121,12 +2232,24 @@ func (s *Server) KickSession(sessionID uint32) bool {
 	s.grid.Remove(sessionID)
 	s.aoi.RemoveSession(sessionID)
 	s.sessions.RemoveSession(sessionID)
-	// Violation state is keyed by session ID: clear it so a later session
-	// reusing this ID starts clean (see AntiCheatManager.ViolationReset).
-	if s.anticheat != nil {
-		s.anticheat.ViolationReset(sessionID)
-	}
+	// Violation/ledger state is keyed by session ID: clear it so a later
+	// session reusing this ID starts clean.
+	s.clearSessionTracking(sessionID)
 	return true
+}
+
+// clearSessionTracking drops per-session anticheat, item-ledger and damage
+// budget state on every disconnect/kick/timeout path.
+func (s *Server) clearSessionTracking(sessionID uint32) {
+	if s.anticheat != nil {
+		s.anticheat.Reset(sessionID)
+	}
+	if s.itemLedger != nil {
+		s.itemLedger.Remove(sessionID)
+	}
+	if s.damageHandler != nil {
+		s.damageHandler.ClearBudget(sessionID)
+	}
 }
 
 func (s *Server) BanPlayer(uuid string, reason string) error {

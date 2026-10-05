@@ -3,6 +3,7 @@ package game
 import (
 	"math"
 	"sync"
+	"time"
 
 	"zone-online/zone-server/internal/network"
 
@@ -13,12 +14,23 @@ const (
 	acMaxHorizontalSpeed      = 25.0 // m/s — generous cap above X-Ray sprint (~8 m/s)
 	acMaxVerticalDelta        = 15.0 // metres — permits falls but blocks fly hacks
 	MaxViolationsBeforeAction = 5
+
+	// LagswitchStrikeWindow is the rolling window over which repeated
+	// stall signatures count toward a kick.
+	LagswitchStrikeWindow = 60 * time.Second
+
+	// violationLogInterval rate-limits the per-violation warning so a spamming
+	// cheater cannot flood the log; the counter itself is unaffected.
+	violationLogInterval = time.Second
 )
 
-// AntiCheatManager tracks per-session violation counts and validates movement.
+// AntiCheatManager tracks per-session violation and lag-switch strike counts
+// and validates movement.
 type AntiCheatManager struct {
 	mu         sync.Mutex
 	violations map[uint32]int
+	lagswitch  map[uint32][]time.Time
+	lastLog    map[uint32]time.Time
 	logger     *zap.Logger
 }
 
@@ -26,6 +38,8 @@ type AntiCheatManager struct {
 func NewAntiCheatManager(logger ...*zap.Logger) *AntiCheatManager {
 	ac := &AntiCheatManager{
 		violations: make(map[uint32]int),
+		lagswitch:  make(map[uint32][]time.Time),
+		lastLog:    make(map[uint32]time.Time),
 	}
 	if len(logger) > 0 && logger[0] != nil {
 		ac.logger = logger[0]
@@ -84,14 +98,25 @@ func (ac *AntiCheatManager) ShouldKick(violations int) bool {
 	return violations >= MaxViolationsBeforeAction
 }
 
-// RecordViolation increments the violation count for sessionID and returns the new total.
+// RecordViolation increments the violation count for sessionID and returns the
+// new total. Logging is rate-limited to one warning per second per session so
+// a violation spammer cannot flood the log; the count stays exact.
 func (ac *AntiCheatManager) RecordViolation(sessionID uint32, reason string) int {
+	now := time.Now()
 	ac.mu.Lock()
 	ac.violations[sessionID]++
 	count := ac.violations[sessionID]
+	shouldLog := ac.logger != nil
+	if shouldLog {
+		if last, ok := ac.lastLog[sessionID]; ok && now.Sub(last) < violationLogInterval {
+			shouldLog = false
+		} else {
+			ac.lastLog[sessionID] = now
+		}
+	}
 	ac.mu.Unlock()
 
-	if ac.logger != nil {
+	if shouldLog {
 		ac.logger.Warn("anticheat violation recorded",
 			zap.Uint32("session", sessionID),
 			zap.String("reason", reason),
@@ -101,6 +126,68 @@ func (ac *AntiCheatManager) RecordViolation(sessionID uint32, reason string) int
 	return count
 }
 
+// RecordLagswitchStrike appends a strike timestamp for sessionID and returns
+// the number of strikes still inside the rolling 60 s window. Call only when
+// the stall signature is detected (long transform gap while heartbeats/ACKs
+// remain fresh); plain packet loss below the gap threshold never records one.
+func (ac *AntiCheatManager) RecordLagswitchStrike(sessionID uint32, now time.Time) int {
+	cutoff := now.Add(-LagswitchStrikeWindow)
+	ac.mu.Lock()
+	kept := ac.lagswitch[sessionID][:0]
+	for _, t := range ac.lagswitch[sessionID] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	ac.lagswitch[sessionID] = kept
+	count := len(kept)
+	ac.mu.Unlock()
+
+	if ac.logger != nil {
+		ac.logger.Warn("lag-switch strike recorded",
+			zap.Uint32("session", sessionID),
+			zap.Int("strikes", count),
+		)
+	}
+	return count
+}
+
+// LagswitchStrikeCount returns the live strike count inside the rolling window.
+func (ac *AntiCheatManager) LagswitchStrikeCount(sessionID uint32, now time.Time) int {
+	cutoff := now.Add(-LagswitchStrikeWindow)
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	n := 0
+	for _, t := range ac.lagswitch[sessionID] {
+		if t.After(cutoff) {
+			n++
+		}
+	}
+	return n
+}
+
+// HasRecentLagswitchStrike reports whether a strike happened within the last
+// `within` duration, used to reject damage in the post-stall kill window.
+func (ac *AntiCheatManager) HasRecentLagswitchStrike(sessionID uint32, now time.Time, within time.Duration) bool {
+	cutoff := now.Add(-within)
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	for _, t := range ac.lagswitch[sessionID] {
+		if t.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+// LagswitchReset clears the strike history for a session.
+func (ac *AntiCheatManager) LagswitchReset(sessionID uint32) {
+	ac.mu.Lock()
+	delete(ac.lagswitch, sessionID)
+	ac.mu.Unlock()
+}
+
 // ViolationCount returns the accumulated violation count for sessionID.
 func (ac *AntiCheatManager) ViolationCount(sessionID uint32) int {
 	ac.mu.Lock()
@@ -108,10 +195,13 @@ func (ac *AntiCheatManager) ViolationCount(sessionID uint32) int {
 	return ac.violations[sessionID]
 }
 
-// Reset clears the violation record for a session (call on disconnect).
+// Reset clears the violation, lag-switch and log-throttle records for a
+// session (call on disconnect).
 func (ac *AntiCheatManager) Reset(sessionID uint32) {
 	ac.mu.Lock()
 	delete(ac.violations, sessionID)
+	delete(ac.lagswitch, sessionID)
+	delete(ac.lastLog, sessionID)
 	ac.mu.Unlock()
 }
 

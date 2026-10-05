@@ -23,6 +23,14 @@ type Config struct {
 	Locked              bool   `yaml:"locked"`
 	GroupMaxPlayers     int    `yaml:"group_max_players"`
 	InviteTTLSec        int    `yaml:"invite_ttl_sec"`
+
+	// Server-authoritative movement / anti-lag-switch knobs.
+	MaxSpeedMPS          float64 `yaml:"max_speed_mps"`
+	CorrectionToleranceM float64 `yaml:"correction_tolerance_m"`
+	LagswitchGapMS       int     `yaml:"lagswitch_gap_ms"`
+	LagswitchStrikes     int     `yaml:"lagswitch_strikes"`
+	DamageBudgetPerS     float64 `yaml:"damage_budget_per_s"`
+	ItemRatePerS         float64 `yaml:"item_rate_per_s"`
 }
 
 // SetDefaults sets sensible defaults for optional or missing fields.
@@ -54,6 +62,24 @@ func (c *Config) SetDefaults() {
 	}
 	if c.InviteTTLSec <= 0 {
 		c.InviteTTLSec = 60
+	}
+	if c.MaxSpeedMPS <= 0 {
+		c.MaxSpeedMPS = 25
+	}
+	if c.CorrectionToleranceM <= 0 {
+		c.CorrectionToleranceM = 2.0
+	}
+	if c.LagswitchGapMS <= 0 {
+		c.LagswitchGapMS = 1500
+	}
+	if c.LagswitchStrikes <= 0 {
+		c.LagswitchStrikes = 3
+	}
+	if c.DamageBudgetPerS <= 0 {
+		c.DamageBudgetPerS = 400
+	}
+	if c.ItemRatePerS <= 0 {
+		c.ItemRatePerS = 5
 	}
 }
 

@@ -17,6 +17,26 @@ local PENDING_PEER_CAP = 32
 local PENDING_PEER_TTL_MS = 120000
 local pending_prune_logged = false
 
+-- Snapshot-gap extrapolation (v4 smoothing): when no snapshot arrived for a
+-- proxy for > 150 ms, continue along the last known velocity for at most
+-- 250 ms / 1.5 m, then blend back to authoritative data over 150 ms.
+local EXTRAPOLATE_START_MS = 150
+local EXTRAPOLATE_STOP_MS = 2000
+local EXTRAPOLATE_CAP_MS = 250
+local EXTRAPOLATE_MAX_DIST = 1.5
+local EXTRAPOLATE_BLEND_MS = 150
+
+-- Local player position correction (OpPositionCorrection 0x007B).
+local CORRECTION_DEADZONE_M = 1.0
+local CORRECTION_HARD_SNAP_M = 8.0
+local CORRECTION_BLEND_MS = 500
+local CORRECTION_BLEND_STEP = 0.2
+local CORRECTION_FINAL_EPS_M = 0.25
+local CORRECTION_NOTICE_MS = 5000
+local corr_x, corr_y, corr_z = nil, nil, nil
+local corr_deadline = 0
+local corr_last_notice = 0
+
 -- Ring buffer helper functions (L-30: avoid table.remove(tbl, 1) in hot path)
 local function add_history_sample(proxy, sample)
     if proxy.hist_count < MAX_HISTORY then
@@ -254,12 +274,35 @@ end
 function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     local proxy = spawned_proxies[session_id]
     if not proxy then return end
-    
+
+    local tg = time_global()
     add_history_sample(proxy, {
-        x = x, y = y, z = z, yaw = yaw, pitch = pitch, animflags = animflags, health = health, t = time_global()
+        x = x, y = y, z = z, yaw = yaw, pitch = pitch, animflags = animflags, health = health, t = tg
     })
-    
-    proxy.last_update = time_global()
+
+    -- Last known velocity in m/ms from the two newest samples (scalars only).
+    if proxy.hist_count >= 2 then
+        local latest = get_history_sample(proxy, proxy.hist_count)
+        local prev = get_history_sample(proxy, proxy.hist_count - 1)
+        local dtms = latest.t - prev.t
+        if dtms > 0 then
+            proxy.vel_x = (latest.x - prev.x) / dtms
+            proxy.vel_y = (latest.y - prev.y) / dtms
+            proxy.vel_z = (latest.z - prev.z) / dtms
+        end
+    end
+
+    -- Fresh authoritative data after an extrapolation gap: blend from the last
+    -- rendered position instead of popping to the new sample.
+    if proxy.extrapolating then
+        proxy.blend_start = tg
+        proxy.blend_from_x = proxy.render_x or x
+        proxy.blend_from_y = proxy.render_y or y
+        proxy.blend_from_z = proxy.render_z or z
+        proxy.extrapolating = false
+    end
+
+    proxy.last_update = tg
     
     -- Resolve game_id once online and apply the peer's real visual.
     if not proxy.game_id and level and level.object_by_id then
@@ -292,11 +335,115 @@ local function reap_stale_proxies(tg)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Local player correction (OpPositionCorrection 0x007B)
+-- ---------------------------------------------------------------------------
+local function zone_connected()
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then
+            connected = ZoneNet:IsConnected() and true or false
+        end
+    end)
+    return connected
+end
+
+local function game_loaded()
+    local present = false
+    pcall(function() present = (level ~= nil and level.present() == true) end)
+    return present
+end
+
+local function clear_local_correction()
+    corr_x, corr_y, corr_z = nil, nil, nil
+    corr_deadline = 0
+end
+
+local function correction_notice(dist, snapped)
+    local tg = time_global()
+    if tg - corr_last_notice < CORRECTION_NOTICE_MS then return end
+    corr_last_notice = tg
+    printf("[zone_dummy] position correction applied: %.2f m (%s)",
+        dist, snapped and "hard snap" or "smooth")
+end
+
+-- Called from zone_net dispatch for 0x007B. Ignores corrections under the
+-- 1 m deadzone (player is already where the server wants), hard-snaps above
+-- 8 m, blends the rest over ~0.5 s from the tick.
+function on_position_correction(x, y, z)
+    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then return end
+    if not game_loaded() or not zone_connected() then return end
+    local actor = db and db.actor
+    if not actor then return end
+
+    local cur = nil
+    pcall(function() cur = actor:position() end)
+    if not cur then return end
+
+    local dx, dy, dz = x - cur.x, y - cur.y, z - cur.z
+    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if dist < CORRECTION_DEADZONE_M then return end
+
+    if dist > CORRECTION_HARD_SNAP_M then
+        local applied = false
+        pcall(function()
+            actor:set_actor_position(vector():set(x, y, z), false, false)
+            applied = true
+        end)
+        if applied then
+            clear_local_correction()
+            correction_notice(dist, true)
+        end
+        return
+    end
+
+    corr_x, corr_y, corr_z = x, y, z
+    corr_deadline = time_global() + CORRECTION_BLEND_MS
+    correction_notice(dist, false)
+end
+
+-- Runs every frame from interpolate_proxies. Moves the actor toward the
+-- corrected position in ~20% steps; the final step keeps momentum.
+local function update_local_correction(tg)
+    if corr_x == nil then return end
+    if not game_loaded() then
+        clear_local_correction()
+        return
+    end
+    local actor = db and db.actor
+    if not actor then
+        clear_local_correction()
+        return
+    end
+
+    local cur = nil
+    pcall(function() cur = actor:position() end)
+    if not cur then return end
+
+    local dx, dy, dz = corr_x - cur.x, corr_y - cur.y, corr_z - cur.z
+    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if dist < CORRECTION_FINAL_EPS_M or tg >= corr_deadline then
+        pcall(function()
+            actor:set_actor_position(vector():set(corr_x, corr_y, corr_z), false, true)
+        end)
+        clear_local_correction()
+        return
+    end
+
+    local nx = cur.x + dx * CORRECTION_BLEND_STEP
+    local ny = cur.y + dy * CORRECTION_BLEND_STEP
+    local nz = cur.z + dz * CORRECTION_BLEND_STEP
+    pcall(function()
+        actor:set_actor_position(vector():set(nx, ny, nz), false, false)
+    end)
+end
+
 -- Hermite spline interpolation for smooth proxy movement (L-05 & L-24)
 function interpolate_proxies()
     local tg = time_global()
     local target_t = tg - JITTER_BUFFER_MS
 
+    pcall(update_local_correction, tg)
     reap_stale_proxies(tg)
 
     for sid, proxy in pairs(spawned_proxies) do
@@ -384,7 +531,41 @@ function interpolate_proxies()
             local ix = h00 * p1.x + h10 * m1x + h01 * p2.x + h11 * m2x
             local iy = h00 * p1.y + h10 * m1y + h01 * p2.y + h11 * m2y
             local iz = h00 * p1.z + h10 * m1z + h01 * p2.z + h11 * m2z
-            
+
+            -- Snapshot-gap extrapolation: no packet for > 150 ms, continue on
+            -- the last velocity (caps: 250 ms / 1.5 m); stop past 2 s.
+            local gap = tg - (proxy.last_update or 0)
+            if proxy.vel_x and gap > EXTRAPOLATE_START_MS and gap < EXTRAPOLATE_STOP_MS then
+                local dt = gap - EXTRAPOLATE_START_MS
+                if dt > EXTRAPOLATE_CAP_MS then dt = EXTRAPOLATE_CAP_MS end
+                local dxv = proxy.vel_x * dt
+                local dyv = proxy.vel_y * dt
+                local dzv = proxy.vel_z * dt
+                local dlen = math.sqrt(dxv * dxv + dyv * dyv + dzv * dzv)
+                if dlen > EXTRAPOLATE_MAX_DIST then
+                    local k = EXTRAPOLATE_MAX_DIST / dlen
+                    dxv, dyv, dzv = dxv * k, dyv * k, dzv * k
+                end
+                ix, iy, iz = s_last.x + dxv, s_last.y + dyv, s_last.z + dzv
+                proxy.extrapolating = true
+            else
+                proxy.extrapolating = false
+            end
+
+            -- Blend back to authoritative interpolation after a new snapshot.
+            if proxy.blend_start then
+                local bt = tg - proxy.blend_start
+                if bt < EXTRAPOLATE_BLEND_MS then
+                    local a = bt / EXTRAPOLATE_BLEND_MS
+                    ix = proxy.blend_from_x + (ix - proxy.blend_from_x) * a
+                    iy = proxy.blend_from_y + (iy - proxy.blend_from_y) * a
+                    iz = proxy.blend_from_z + (iz - proxy.blend_from_z) * a
+                else
+                    proxy.blend_start = nil
+                end
+            end
+            proxy.render_x, proxy.render_y, proxy.render_z = ix, iy, iz
+
             if proxy.game_id and level and level.object_by_id then
                 pcall(function()
                     local obj = level.object_by_id(proxy.game_id)
@@ -395,6 +576,7 @@ function interpolate_proxies()
             end
         elseif count == 1 then
             local p1 = get_history_sample(proxy, 1)
+            proxy.render_x, proxy.render_y, proxy.render_z = p1.x, p1.y, p1.z
             if proxy.game_id and level and level.object_by_id then
                 pcall(function()
                     local obj = level.object_by_id(proxy.game_id)
@@ -598,6 +780,7 @@ function on_entity_leave(pkt, offset)
 end
 
 function on_level_changing()
+    clear_local_correction()
     pcall(function()
         local sim = nil
         if alife then

@@ -273,4 +273,7 @@
     <string id="ui_zone_event_notify_failed">
         <text>Не удалось показать уведомление мирового события</text>
     </string>
+    <string id="ui_zone_item_action_rejected">
+        <text>Сервер отклонил действие с предметом: %s</text>
+    </string>
 </string_table>

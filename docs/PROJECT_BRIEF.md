@@ -122,6 +122,10 @@ Six parallel audits cross-checked every engine call, hook, and path:
 - **48-player scalability** — done: chunked nearest-first snapshots (no peer drop),
   pooled buffers, zero-alloc snapshot paths; 48-session tick 0.98 ms (~3% of budget),
   5 allocs/tick; worst case ~31 KiB/s per client with 48 players in one AoI.
+- **Authority wave (v0.5)**: movement guard + position corrections, lag-switch
+  strike detection, damage budgets and movement-history validation, and an
+  authoritative item ledger (drop/pickup, idempotent ActionIDs, race-safe SQL)
+  with duplicate-pickup rejection verified end-to-end. See `docs/AUTHORITY_MODEL.md`.
 - **Error handling polish**: every failure surfaced in UI/chat, no silent drops.
 - **Master server** for public server lists (HTTP announce + JSON list).
 - **Arbitrary level hosting** (engine limitation; needs xrRazom-style engine support or

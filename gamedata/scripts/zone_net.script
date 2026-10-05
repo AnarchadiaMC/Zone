@@ -26,6 +26,12 @@ local apply_inventory_pending = false
 local level_start_issued = false
 local JOIN_MARKER = "zone_pending_join.ltx"
 
+-- Item ledger state (OpItemAction 0x007D / OpItemUpdate 0x007E, protocol v4).
+-- Declared here (before reset_state) so disconnect/reset can clear it.
+local next_item_action_id = 0
+local pending_item_actions = {}
+local spawned_world_items = {}
+
 -- Forward declarations: dispatch_packet references these but they are defined
 -- after it (they need the parse helpers declared further down). clear_pending_join
 -- is forward-declared so reset_state can disarm the on-disk join marker.
@@ -92,6 +98,7 @@ ffi.cdef[[
     bool ZN_SendCharacterSelect(const char* faction, double money, const char* items_str);
     void ZN_SendLevelChange(const char* level);
     void ZN_SendPlayerVisual(const char* visual);
+    int ZN_SendRaw(uint16_t opcode, const char* payload, int payloadLen, int reliable);
     int ZN_QueryServer(const char* ip, int port, char* out, int outLen, int timeoutMs);
     int ZN_QueryStart(const char* ip, int port, int timeoutMs);
     int ZN_QueryPoll(int queryId, char* out, int outLen, int* outRttMs);
@@ -236,6 +243,12 @@ function reset_state()
     apply_inventory_pending = false
     level_start_issued = false
     inv_parse_notified = false
+    -- Item ledger: drop pending actions and tracking. Visual world items made
+    -- for remote drops stay in the level until the engine clears them; the
+    -- server re-tells them after a reconnect (0x007E), so no release here.
+    next_item_action_id = 0
+    pending_item_actions = {}
+    spawned_world_items = {}
     if clear_pending_join then pcall(clear_pending_join) end
 end
 
@@ -270,6 +283,22 @@ function ZoneNet:SendPlayerVisual(visual)
         zone_client.ZN_SendPlayerVisual(visual or "")
     end)
     return ok
+end
+-- Raw opcode send (protocol v4). Payload may be a Lua string or an FFI
+-- char buffer. Returns true only when the DLL reported success (>= 0), false
+-- on any failure (missing export on an older DLL raises inside pcall).
+function ZoneNet:SendRaw(opcode, payload, len, reliable)
+    if not zone_client then return false end
+    local op = tonumber(opcode)
+    if not op or op < 0 or op > 65535 then return false end
+    local n = tonumber(len) or 0
+    if n < 0 or n > 4096 then return false end
+    local rel = reliable and 1 or 0
+    local ok, res = pcall(function()
+        return zone_client.ZN_SendRaw(math.floor(op), payload, math.floor(n), rel)
+    end)
+    if not ok then return false end
+    return (type(res) == "number" and res >= 0)
 end
 -- Synchronous server query (server browser). Returns the parsed
 -- OpServerQueryRes payload table plus measured ping, or nil, error.
@@ -506,6 +535,358 @@ function read_string(pkt, pos, len)
     return string.sub(pkt, pos, pos + len - 1), pos + len
 end
 
+-- ---------------------------------------------------------------------------
+-- Item ledger (OpItemAction 0x007D C->S / OpItemUpdate 0x007E S->C, v4).
+-- Small zone_item section kept INSIDE this file: creating a new .script would
+-- require an embedding manifest update. Dispatch prefers an external
+-- _G.zone_item module when one exists, otherwise uses these. Everything is
+-- pcall-wrapped and gated off while xrRazom co-op owns the session.
+-- Wire layouts:
+--   0x007D 88 B: ActionID u32, Action u8, ItemID u32, Section[64], Count u16,
+--                X f32, Y f32, Z f32, Condition u8
+--   0x007E 89 B: ActionID u32, Result u8, Action u8, ItemID u32, Count i16,
+--                Section[64], X f32, Y f32, Z f32, Condition u8
+-- Condition is u8 0..100 (matches the 0x0076 inventory-sync convention).
+-- ---------------------------------------------------------------------------
+local ITEM_ACTION_TTL_MS = 30000
+local ITEM_ACTION_PAYLOAD_LEN = 88
+local ITEM_DROP_FORWARD = 1.0
+local g_item_payload = ffi.new("char[88]")
+
+local function item_payload_u8(buf, off, v)
+    buf[off] = bit.band(tonumber(v) or 0, 0xFF)
+end
+
+local function item_payload_u16(buf, off, v)
+    v = bit.band(tonumber(v) or 0, 0xFFFF)
+    buf[off] = v % 256
+    buf[off + 1] = math.floor(v / 256) % 256
+end
+
+local function item_payload_u32(buf, off, v)
+    v = (tonumber(v) or 0) % 4294967296
+    buf[off] = v % 256
+    buf[off + 1] = math.floor(v / 256) % 256
+    buf[off + 2] = math.floor(v / 65536) % 256
+    buf[off + 3] = math.floor(v / 16777216) % 256
+end
+
+local function item_payload_f32(buf, off, v)
+    g_float_cast.f = tonumber(v) or 0
+    for i = 0, 3 do buf[off + i] = g_float_cast.b[i] end
+end
+
+local function item_payload_section(buf, off, section)
+    local n = 0
+    if type(section) == "string" then
+        n = string.len(section)
+        if n > 64 then n = 64 end
+    end
+    for i = 1, 64 do
+        local b = 0
+        if i <= n then b = string.byte(section, i) or 0 end
+        buf[off + i - 1] = b
+    end
+end
+
+-- Wire condition is 0..100. item:condition() is 0..1.
+local function item_condition_u8(cond)
+    if type(cond) ~= "number" then return 100 end
+    local v = math.floor(cond * 100 + 0.5)
+    if v < 0 then v = 0 end
+    if v > 100 then v = 100 end
+    return v
+end
+
+-- Stack count when the game object exposes it (ammo); 1 otherwise.
+local function item_stack_count(item)
+    local count = 1
+    pcall(function()
+        if item.is_ammo and item:is_ammo() and item.ammo_get_count then
+            local c = item:ammo_get_count()
+            if type(c) == "number" and c > 1 then count = math.floor(c) end
+        end
+    end)
+    if count > 65535 then count = 65535 end
+    if count < 1 then count = 1 end
+    return count
+end
+
+-- Sends are legal only while connected and outside an xrRazom co-op session.
+local function item_send_allowed()
+    local connected = false
+    pcall(function()
+        connected = ZoneNet and ZoneNet.IsConnected and ZoneNet:IsConnected() and true or false
+    end)
+    if not connected then return false end
+    local co_op = false
+    pcall(function()
+        if zone_main and type(zone_main.xrr_is_active) == "function" then
+            co_op = zone_main.xrr_is_active() and true or false
+        end
+    end)
+    if co_op then return false end
+    return (db and db.actor) ~= nil
+end
+
+local function prune_pending_item_actions(tg)
+    local stale = nil
+    for id, entry in pairs(pending_item_actions) do
+        if tg - (entry.time or 0) > ITEM_ACTION_TTL_MS then
+            if not stale then stale = {} end
+            stale[#stale + 1] = id
+        end
+    end
+    if stale then
+        for i = 1, #stale do pending_item_actions[stale[i]] = nil end
+    end
+end
+
+local function send_item_action(action, item_id, section, count, x, y, z, condition, local_se_id)
+    if not item_send_allowed() then return nil end
+    if type(section) ~= "string" or section == "" then return nil end
+    if not (ZoneNet and type(ZoneNet.SendRaw) == "function") then
+        log_dispatch_once("item_no_raw", "Zone: ZN_SendRaw unavailable; item action dropped")
+        return nil
+    end
+
+    next_item_action_id = next_item_action_id + 1
+    if next_item_action_id > 0x7FFFFFFF then next_item_action_id = 1 end
+    local action_id = next_item_action_id
+
+    local buf = g_item_payload
+    item_payload_u32(buf, 0, action_id)
+    item_payload_u8(buf, 4, action)
+    item_payload_u32(buf, 5, item_id or 0)
+    item_payload_section(buf, 9, section)
+    item_payload_u16(buf, 73, count or 1)
+    item_payload_f32(buf, 75, x or 0)
+    item_payload_f32(buf, 79, y or 0)
+    item_payload_f32(buf, 83, z or 0)
+    item_payload_u8(buf, 87, condition or 0)
+
+    local sent = ZoneNet:SendRaw(0x007D, buf, ITEM_ACTION_PAYLOAD_LEN, 1)
+    if not sent then
+        printf("Zone: failed to send item action %d for section %s",
+            tonumber(action) or 0, section)
+        return nil
+    end
+
+    local tg = time_global()
+    prune_pending_item_actions(tg)
+    pending_item_actions[action_id] = {
+        action = action, section = section, count = count or 1,
+        time = tg, local_se_id = local_se_id,
+    }
+    return action_id
+end
+
+local function release_world_item_visual(entry)
+    if not entry or not entry.se_id then return end
+    pcall(function()
+        local sim = alife()
+        if not sim then return end
+        local se = sim:object(entry.se_id)
+        if se then sim:release(se, true) end
+    end)
+end
+
+-- Visual world item for a remote drop. lvid is queried at the packet
+-- position; gvid falls back to the local actor's (packet carries none).
+local function spawn_world_item_visual(item_id, section, x, y, z, condition)
+    if type(section) ~= "string" or section == "" then return false end
+    local sim = nil
+    pcall(function() sim = alife() end)
+    if not sim then return false end
+
+    local pos = nil
+    pcall(function() pos = vector():set(x, y, z) end)
+    if not pos then return false end
+
+    local lvid = nil
+    pcall(function()
+        if level and level.vertex_id then lvid = level.vertex_id(pos) end
+    end)
+    if lvid == nil or lvid >= 0xFFFFFFFE then return false end
+
+    local gvid = 0
+    pcall(function()
+        if db and db.actor then gvid = db.actor:game_vertex_id() or 0 end
+    end)
+    if gvid <= 0 then
+        printf("Zone: item update: no game vertex for world item %s", section)
+        return false
+    end
+
+    local se = nil
+    pcall(function() se = sim:create(section, pos, lvid, gvid) end)
+    if not se then
+        printf("Zone: item update: failed to create world item %s", section)
+        return false
+    end
+    local sid = nil
+    pcall(function() sid = (type(se.id) == "function") and se:id() or se.id end)
+    spawned_world_items[item_id] = { se_id = sid, section = section }
+    if sid and type(condition) == "number" and condition > 0 then
+        pcall(function()
+            local obj = level.object_by_id(sid)
+            if obj and obj.set_condition then
+                local c = condition / 100
+                if c > 1 then c = 1 end
+                obj:set_condition(c)
+            end
+        end)
+    end
+    return true
+end
+
+-- Post-drop hook. Fires after the engine moved the item to the world;
+-- position is recomputed from the actor + forward offset (the callback does
+-- not hand us the dropped position). Never fatal.
+local function on_actor_item_drop(item)
+    if not item then return end
+    if not item_send_allowed() then return end
+    local actor = db.actor
+
+    local section, cond, local_se_id = nil, nil, nil
+    pcall(function() section = item:section() end)
+    if type(section) ~= "string" or section == "" then return end
+    pcall(function() cond = item:condition() end)
+    pcall(function() local_se_id = item:id() end)
+    local count = item_stack_count(item)
+
+    local x, y, z = 0, 0, 0
+    pcall(function()
+        local p = actor:position()
+        local d = actor:direction()
+        x = p.x + (d.x or 0) * ITEM_DROP_FORWARD
+        y = p.y + (d.y or 0) * ITEM_DROP_FORWARD
+        z = p.z + (d.z or 0) * ITEM_DROP_FORWARD
+    end)
+
+    send_item_action(1, 0, section, count, x, y, z, item_condition_u8(cond), local_se_id)
+end
+
+-- Post-take hook. ItemID is the server id when we tracked the world object
+-- (we or the server made it), otherwise 0 so the server can reject/ignore
+-- without breaking the local pickup that already happened.
+local function on_actor_item_take(item)
+    if not item then return end
+    if not item_send_allowed() then return end
+
+    local section, cond, local_id = nil, nil, nil
+    pcall(function() section = item:section() end)
+    if type(section) ~= "string" or section == "" then return end
+    pcall(function() cond = item:condition() end)
+    pcall(function() local_id = item:id() end)
+    local count = item_stack_count(item)
+
+    local item_id = 0
+    if local_id then
+        for sid, entry in pairs(spawned_world_items) do
+            if entry.se_id == local_id then
+                item_id = sid
+                break
+            end
+        end
+    end
+
+    local x, y, z = 0, 0, 0
+    pcall(function()
+        local p = item:position()
+        x, y, z = p.x, p.y, p.z
+    end)
+    if x == 0 and y == 0 and z == 0 then
+        pcall(function()
+            local p = db.actor:position()
+            x, y, z = p.x, p.y, p.z
+        end)
+    end
+
+    send_item_action(2, item_id, section, count, x, y, z, item_condition_u8(cond))
+end
+
+local function on_item_update(pkt, offset)
+    local len = string.len(pkt)
+    if len < offset + 89 - 1 then
+        log_dispatch_once("short_007E", "Zone: dropped short ITEM_UPDATE packet (%d bytes)", len)
+        return
+    end
+
+    local action_id, pos = read_uint32_le(pkt, offset)
+    local result, pos = read_uint8(pkt, pos)
+    local action, pos = read_uint8(pkt, pos)
+    local item_id, pos = read_uint32_le(pkt, pos)
+    local count_raw, pos = read_uint16_le(pkt, pos)
+    local count = count_raw
+    if count > 32767 then count = count - 65536 end
+    local section, pos = read_string(pkt, pos, 64)
+    section = clean_cstring(section)
+    local x, pos = read_float_le(pkt, pos)
+    local y, pos = read_float_le(pkt, pos)
+    local z, pos = read_float_le(pkt, pos)
+    local condition, _ = read_uint8(pkt, pos)
+
+    local own = pending_item_actions[action_id]
+    if own then pending_item_actions[action_id] = nil end
+    prune_pending_item_actions(time_global())
+
+    if result == 1 then
+        if own then
+            local tmpl = tr("ui_zone_item_action_rejected", "Server rejected item action: %s")
+            surface_message(string.format(tmpl, tostring(section)))
+            printf("Zone: item action rejected (ActionID %u action %d section %s count %d); no inventory resync request path exists (0x0076 is server->client only)",
+                tonumber(action_id) or 0, tonumber(action) or 0, tostring(section), tonumber(count) or 0)
+        end
+        return
+    end
+
+    if action == 1 then
+        if own then
+            -- Our own drop: the engine already created the object locally.
+            -- Bind the server ItemID to the local object id captured at drop
+            -- time so a later pickup can reference it.
+            if item_id ~= 0 and own.local_se_id and not spawned_world_items[item_id] then
+                spawned_world_items[item_id] = { se_id = own.local_se_id, section = section, own = true }
+            end
+            if result == 2 then
+                printf("Zone: server corrected our drop of %s (ItemID %u); local object kept",
+                    tostring(section), tonumber(item_id) or 0)
+            end
+        else
+            if result == 2 and spawned_world_items[item_id] then
+                release_world_item_visual(spawned_world_items[item_id])
+                spawned_world_items[item_id] = nil
+            end
+            if not spawned_world_items[item_id] then
+                spawn_world_item_visual(item_id, section, x, y, z, condition)
+            end
+        end
+    elseif action == 2 then
+        local entry = spawned_world_items[item_id]
+        if entry then
+            if (not own) or result == 2 then
+                release_world_item_visual(entry)
+            end
+            spawned_world_items[item_id] = nil
+        end
+        if own and result == 2 then
+            printf("Zone: server corrected pickup of %s (ItemID %u); awaiting server inventory sync if one follows",
+                tostring(section), tonumber(item_id) or 0)
+        end
+    end
+end
+
+-- External consumers (and the dispatch fallback) reach the ledger through
+-- this global. An external zone_item module (loaded at any point) keeps
+-- precedence: only install the local table when none is present.
+if type(_G.zone_item) ~= "table" or type(_G.zone_item.on_item_update) ~= "function" then
+    _G.zone_item = {
+        on_item_update = on_item_update,
+        send_item_action = send_item_action,
+    }
+end
+
 -- ENTITY_ENTER_AOI v3 carries section[64] and a trailing name[32]
 -- (entityID u32, type u8, section[64], x/y/z f32, faction[16], health u8,
 -- gvid u16, name[32], 132-byte payload). Consumers (zone_dummy/zone_ai_proxy)
@@ -659,6 +1040,31 @@ function dispatch_packet(pkt)
         if zone_hud and zone_hud.on_group_state then
             safe_call("group_state", zone_hud.on_group_state, pkt, offset)
         end
+    elseif opcode == 0x007B then
+        -- OpPositionCorrection (S->C unreliable, 12 B): x f32, y f32, z f32.
+        safe_call("position_correction", function()
+            if string.len(pkt) < offset + 12 - 1 then
+                log_dispatch_once("short_007B", "Zone: dropped short POSITION_CORRECTION packet (%d bytes)", string.len(pkt))
+                return
+            end
+            local x, p2 = read_float_le(pkt, offset)
+            local y, p3 = read_float_le(pkt, p2)
+            local z, _ = read_float_le(pkt, p3)
+            if zone_dummy and zone_dummy.on_position_correction then
+                safe_call("position_correction_dummy", zone_dummy.on_position_correction, x, y, z)
+            end
+        end)
+    elseif opcode == 0x007E then
+        -- OpItemUpdate (S->C reliable, 89 B). Prefer an external zone_item
+        -- module when present; otherwise the ledger section in this file.
+        safe_call("item_update", function()
+            local mod = _G.zone_item
+            if mod and type(mod.on_item_update) == "function" then
+                mod.on_item_update(pkt, offset)
+            else
+                on_item_update(pkt, offset)
+            end
+        end)
     else
         log_dispatch_once(string.format("unknown_%04X", opcode),
             "Zone: unknown opcode 0x%04X ignored (%d payload bytes)", opcode, paylen)
@@ -1201,6 +1607,9 @@ local function on_level_changing()
     last_level_sent = nil
     last_visual_sent = nil
     last_visual_check = 0
+    -- Level change destroys every online world item; tracking becomes stale.
+    pending_item_actions = {}
+    spawned_world_items = {}
 end
 
 local function on_actor_net_destroy()
@@ -1217,6 +1626,10 @@ function register_level_callbacks()
             RegisterScriptCallback("actor_on_first_update", on_actor_first_update)
             RegisterScriptCallback("on_level_changing", on_level_changing)
             RegisterScriptCallback("actor_on_net_destroy", on_actor_net_destroy)
+            -- Verified base callbacks: declared in axr_main.script:66/69 and
+            -- dispatched by bind_stalker_ext.script:142/156.
+            RegisterScriptCallback("actor_on_item_take", on_actor_item_take)
+            RegisterScriptCallback("actor_on_item_drop", on_actor_item_drop)
         end
     end)
     pcall(send_level_change, true)

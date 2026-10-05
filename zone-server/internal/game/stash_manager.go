@@ -11,16 +11,16 @@ import (
 )
 
 var (
-	ErrStashNotFound      = errors.New("stash not found")
-	ErrItemNotFoundStash  = errors.New("item not found in stash")
-	ErrInsufficientCount  = errors.New("insufficient item count in stash")
-	ErrStashAccessDenied  = errors.New("stash access denied")
-	ErrStashWrongLevel    = errors.New("player on wrong level for stash")
-	ErrStashTooFar        = errors.New("player too far from stash")
-	ErrStashWrongPasscode = errors.New("invalid stash passcode")
-	ErrInvalidStashSection = errors.New("invalid stash item section")
-	ErrInvalidStashCount = errors.New("invalid stash count")
-	ErrInvalidItemCondition = errors.New("invalid item condition")
+	ErrStashNotFound         = errors.New("stash not found")
+	ErrItemNotFoundStash     = errors.New("item not found in stash")
+	ErrInsufficientCount     = errors.New("insufficient item count in stash")
+	ErrStashAccessDenied     = errors.New("stash access denied")
+	ErrStashWrongLevel       = errors.New("player on wrong level for stash")
+	ErrStashTooFar           = errors.New("player too far from stash")
+	ErrStashWrongPasscode    = errors.New("invalid stash passcode")
+	ErrInvalidStashSection   = errors.New("invalid stash item section")
+	ErrInvalidStashCount     = errors.New("invalid stash count")
+	ErrInvalidItemCondition  = errors.New("invalid item condition")
 	ErrStashContentsTooLarge = errors.New("stash contents too large")
 )
 
@@ -118,7 +118,6 @@ func (m *StashManager) SaveStash(stashID uint32, level string, x, y, z float32, 
 
 	return db.SaveStash(stashID, level, x, y, z, contentsJSON)
 }
-
 
 // ValidateAccess enforces proximity, level, and passcode checks for a stash.
 // It returns nil when playerPos/playerLevel/passcode are authorized to

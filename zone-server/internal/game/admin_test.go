@@ -11,20 +11,20 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"golang.org/x/sys/windows"
 	"zone-online/zone-server/internal/config"
 	"zone-online/zone-server/internal/database"
 	"zone-online/zone-server/internal/network"
-	"go.uber.org/zap"
-	"golang.org/x/sys/windows"
 )
 
 func setupTestServer(t *testing.T) (*Server, *database.DB) {
 	t.Helper()
 	cfg := &config.Config{
-		Port:        27015,
-		TickRateHz:  30,
-		MaxPlayers:  64,
-		AdminPipe:   `\\.\pipe\zone_admin_test`,
+		Port:       27015,
+		TickRateHz: 30,
+		MaxPlayers: 64,
+		AdminPipe:  `\\.\pipe\zone_admin_test`,
 	}
 	db, err := database.Open(":memory:")
 	if err != nil {

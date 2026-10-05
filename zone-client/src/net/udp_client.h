@@ -42,6 +42,25 @@ namespace NetClient
     void SendChatText(const std::string& text);
     bool SendCharacterSelect(const std::string& faction, uint32_t money, const std::string& items);
 
+    // Generic escape hatch for new client->server opcodes (item actions, fire
+    // events, future features) without a typed helper per feature. Builds a
+    // ZO_Header with the given opcode/payload/flags and sends it on the
+    // existing session socket. The sequence comes from the same atomic counter
+    // as every other send, and the socket write goes through the shared
+    // g_SendMutex path, so this is safe to call from any thread and never
+    // blocks beyond a normal non-blocking send.
+    //
+    // reliable != 0 sets flag 0x01 (reliable), otherwise flag 0x02
+    // (unreliable); see ZO_Header in protocol/packets.h.
+    //
+    // Returns 0 on success; -1 invalid argument (opcode 0, null payload with
+    // payloadLen > 0, or payloadLen outside [0, 1200]); -2 when not connected.
+    //
+    // LIMITATION: reliable outbound raw packets are marked and the server ACKs
+    // them inbound, but the client keeps no unacked-packet table and does not
+    // retransmit. Loss recovery for reliable raw sends is not implemented.
+    int SendRaw(uint16_t opcode, const char* payload, int payloadLen, bool reliable);
+
     // One-shot server query on a dedicated temporary UDP socket. Does not touch
     // the session socket or the event ring. Sends OpServerQuery and waits up to
     // timeoutMs for OpServerQueryRes. Copies the raw payload into outBuf and

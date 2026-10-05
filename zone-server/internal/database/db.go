@@ -34,6 +34,9 @@ func Open(dbPath string) (*DB, error) {
 	if err := migrateCharacterColumns(db); err != nil {
 		return nil, err
 	}
+	if err := migrateInventoryColumns(db); err != nil {
+		return nil, err
+	}
 
 	return &DB{db: db}, nil
 }
@@ -62,9 +65,22 @@ type Character struct {
 type InventoryItem struct {
 	ID          int
 	ItemSection string
+	ItemCount   int
 	Condition   float32
 	AmmoCurrent int
 	Slot        int
+}
+
+// WorldItem is one server-authoritative item stack lying in the world.
+type WorldItem struct {
+	ID        int64
+	LevelName string
+	PosX      float32
+	PosY      float32
+	PosZ      float32
+	Section   string
+	Count     int
+	Condition float32
 }
 
 type DBWriteJob struct {
@@ -220,6 +236,36 @@ func migrateCharacterColumns(db *sql.DB) error {
 	return nil
 }
 
+// migrateInventoryColumns adds the stacking count column to databases created
+// before the world-item ledger existed. Fresh databases get it from SchemaSQL.
+func migrateInventoryColumns(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(character_inventory)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !have["item_count"] {
+		if _, err := db.Exec("ALTER TABLE character_inventory ADD COLUMN item_count INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (d *DB) HasCharacter(uuid string) (bool, error) {
 	var one int
 	err := d.db.QueryRow("SELECT 1 FROM characters WHERE client_uuid=?", uuid).Scan(&one)
@@ -294,7 +340,7 @@ func (d *DB) FlushPlayerTransform(uuid string, x, y, z, yaw float32, health floa
 }
 
 func (d *DB) GetCharacterInventory(uuid string) ([]InventoryItem, error) {
-	rows, err := d.db.Query("SELECT id, item_section, condition, ammo_current, slot FROM character_inventory WHERE client_uuid=?", uuid)
+	rows, err := d.db.Query("SELECT id, item_section, item_count, condition, ammo_current, slot FROM character_inventory WHERE client_uuid=?", uuid)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +348,7 @@ func (d *DB) GetCharacterInventory(uuid string) ([]InventoryItem, error) {
 	var items []InventoryItem
 	for rows.Next() {
 		var i InventoryItem
-		if err := rows.Scan(&i.ID, &i.ItemSection, &i.Condition, &i.AmmoCurrent, &i.Slot); err != nil {
+		if err := rows.Scan(&i.ID, &i.ItemSection, &i.ItemCount, &i.Condition, &i.AmmoCurrent, &i.Slot); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -376,6 +422,178 @@ func (d *DB) UpdateStashContents(stashID uint32, contentsJSON string) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// Ledger sentinel errors. Callers map these onto OpItemUpdate results.
+var (
+	ErrInsufficientItems = errors.New("insufficient items")
+	ErrWorldItemNotFound = errors.New("world item not found")
+)
+
+// AvailableItemCount returns how many copies of section the character holds
+// across all inventory rows, used to build correction payloads.
+func (d *DB) AvailableItemCount(uuid, section string) (int, error) {
+	var total sql.NullInt64
+	err := d.db.QueryRow("SELECT COALESCE(SUM(item_count), 0) FROM character_inventory WHERE client_uuid=? AND item_section=?", uuid, section).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return int(total.Int64), nil
+}
+
+// DropItemToWorld atomically removes count copies of section from the
+// character's inventory and inserts one world_items row. It returns the new
+// world item id and the number of copies left in the inventory. Insufficient
+// stock returns ErrInsufficientItems and leaves the inventory untouched.
+func (d *DB) DropItemToWorld(uuid, level, section string, count int, x, y, z, condition float32) (int64, int, error) {
+	if count <= 0 {
+		return 0, 0, ErrInsufficientItems
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT id, item_count FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id", uuid, section)
+	if err != nil {
+		return 0, 0, err
+	}
+	type invRow struct {
+		id    int
+		count int
+	}
+	var held []invRow
+	total := 0
+	for rows.Next() {
+		var r invRow
+		if err := rows.Scan(&r.id, &r.count); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		held = append(held, r)
+		total += r.count
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
+	rows.Close()
+	if total < count {
+		return 0, total, ErrInsufficientItems
+	}
+
+	remaining := count
+	for _, r := range held {
+		if remaining <= 0 {
+			break
+		}
+		take := r.count
+		if take > remaining {
+			take = remaining
+		}
+		if take == r.count {
+			if _, err := tx.Exec("DELETE FROM character_inventory WHERE id=?", r.id); err != nil {
+				return 0, 0, err
+			}
+		} else {
+			if _, err := tx.Exec("UPDATE character_inventory SET item_count = item_count - ? WHERE id=?", take, r.id); err != nil {
+				return 0, 0, err
+			}
+		}
+		remaining -= take
+	}
+
+	res, err := tx.Exec(`INSERT INTO world_items (level_name, pos_x, pos_y, pos_z, section, item_count, condition) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		level, x, y, z, section, count, condition)
+	if err != nil {
+		return 0, 0, err
+	}
+	newID, err := res.LastInsertId()
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return newID, total - count, nil
+}
+
+// GetWorldItem loads one world item row.
+func (d *DB) GetWorldItem(itemID int64) (*WorldItem, error) {
+	row := d.db.QueryRow("SELECT id, level_name, pos_x, pos_y, pos_z, section, item_count, condition FROM world_items WHERE id=?", itemID)
+	var wi WorldItem
+	err := row.Scan(&wi.ID, &wi.LevelName, &wi.PosX, &wi.PosY, &wi.PosZ, &wi.Section, &wi.Count, &wi.Condition)
+	if err == sql.ErrNoRows {
+		return nil, ErrWorldItemNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &wi, nil
+}
+
+// PickupWorldItem atomically deletes a world item and credits its server-side
+// stack (section and count come from the DB row, never from the client) into
+// character_inventory. A concurrent second pickup sees ErrWorldItemNotFound
+// because the DELETE reports zero affected rows; the first transaction wins.
+func (d *DB) PickupWorldItem(uuid string, itemID int64) (*WorldItem, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var wi WorldItem
+	err = tx.QueryRow("SELECT id, level_name, pos_x, pos_y, pos_z, section, item_count, condition FROM world_items WHERE id=?", itemID).
+		Scan(&wi.ID, &wi.LevelName, &wi.PosX, &wi.PosY, &wi.PosZ, &wi.Section, &wi.Count, &wi.Condition)
+	if err == sql.ErrNoRows {
+		return nil, ErrWorldItemNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := tx.Exec("DELETE FROM world_items WHERE id=?", itemID)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, ErrWorldItemNotFound
+	}
+
+	var invID int
+	err = tx.QueryRow("SELECT id FROM character_inventory WHERE client_uuid=? AND item_section=? ORDER BY id LIMIT 1", uuid, wi.Section).Scan(&invID)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := tx.Exec("INSERT INTO character_inventory (client_uuid, item_section, item_count, condition) VALUES (?, ?, ?, ?)",
+			uuid, wi.Section, wi.Count, wi.Condition); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
+	default:
+		if _, err := tx.Exec("UPDATE character_inventory SET item_count = item_count + ? WHERE id=?", wi.Count, invID); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &wi, nil
+}
+
+// InsertAudit appends one audit_log row for security-relevant events
+// (item ledger actions, lag-switch kicks).
+func (d *DB) InsertAudit(clientUUID, eventType, detail string) error {
+	_, err := d.db.Exec("INSERT INTO audit_log (timestamp, client_uuid, event_type, detail) VALUES (?, ?, ?, ?)",
+		time.Now().Unix(), clientUUID, eventType, detail)
+	return err
 }
 
 func (d *DB) StartWriteQueue(ctx context.Context) chan *DBWriteJob {
