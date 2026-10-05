@@ -2,6 +2,7 @@
 -- Zone Bootstrap
 
 local config = {}
+local input_callbacks_registered = false
 
 local function generate_random_uuid()
     math.randomseed(os.time() + (time_global and time_global() or 0))
@@ -64,7 +65,7 @@ local function load_config()
     file:close()
 
     local updated = false
-    if not config.client_uuid or config.client_uuid == "default_uuid" or config.client_uuid == "" then
+    if not config.client_uuid or config.client_uuid == "default_uuid" or config.client_uuid == "" or config.client_uuid == "anonymous" then
         config.client_uuid = generate_random_uuid()
         printf("Zone: [WARNING] Unconfigured client_uuid. Generated random UUID: %s", config.client_uuid)
         updated = true
@@ -100,6 +101,15 @@ function on_game_start()
         end
     end)
 
+    -- Register the save/load veto callbacks (declared in axr_main.script:217-218).
+    -- The engine dispatch honours flags.ret_value=false; a plain bool return is
+    -- ignored, so the veto must go through flags.
+    if RegisterScriptCallback and not input_callbacks_registered then
+        input_callbacks_registered = true
+        pcall(RegisterScriptCallback, "on_before_save_input", on_before_save_input)
+        pcall(RegisterScriptCallback, "on_before_load_input", on_before_load_input)
+    end
+
     if not (zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded()) then
         printf("Zone: ZoneClient.dll native library not loaded! Inject the DLL first.")
         return
@@ -109,6 +119,12 @@ function on_game_start()
     -- registers it). Register first, connect second.
     if RegisterScriptCallback and zone_net and zone_net.on_tick then
         pcall(RegisterScriptCallback, "actor_on_update", zone_net.on_tick)
+    end
+
+    -- Level-load/spawn callbacks belong to zone_net; ensure they are registered
+    -- for browser-initiated joins as well as auto-dial sessions.
+    if zone_net and zone_net.register_level_callbacks then
+        pcall(zone_net.register_level_callbacks)
     end
 
     -- Already connected from the main-menu browser: keep that session, don't
@@ -153,33 +169,96 @@ end
 function get_config()
     return config
 end
--- on_show_start is owned by zone_net (ZoneNet polyfill already exists).
--- Delegate here instead of opening the peer-faction UI a second time.
-function on_show_start()
+-- Public identity gate for the server browser: initializes/loads
+-- zone_identity.ltx (generating uuid/hwid when missing and persisting them)
+-- and returns the config table, or nil when no usable identity is available.
+-- The browser must call this before Connect so a first-run client never
+-- connects as a shared anonymous account.
+function ensure_identity()
+    if not load_config() then return nil end
+    local uuid = config.client_uuid
+    local hwid = tonumber(config.hwid_hash) or 0
+    if type(uuid) ~= "string" or uuid == "" or uuid == "anonymous" or hwid == 0 then
+        return nil
+    end
+    -- Guard against a silently failed write: require the uuid to be readable
+    -- back from the identity file before allowing a connection.
+    local fs = getFS and getFS()
+    local path = fs and fs:update_path("$app_data_root$", "zone_identity.ltx")
+    if not path then return nil end
+    local persisted = false
     pcall(function()
-        if zone_net and zone_net.on_show_start then zone_net.on_show_start() end
+        local f = io.open(path, "r")
+        if not f then return end
+        for line in f:lines() do
+            local v = string.match(line, "^%s*client_uuid%s*=%s*(.+)%s*$")
+            if v and v == uuid then
+                persisted = true
+                break
+            end
+        end
+        f:close()
+    end)
+    if not persisted then return nil end
+    return config
+end
+-- Single owner of OpShowStart (0x0071): only open the faction/loadout dialog
+-- when the server says this player still needs a character (SHOW_START).
+-- The server browser (if visible) is hidden first and restored by the dialog's
+-- Back button, so the whole flow stays in the menu until a level is started.
+function on_show_start(pkt, offset)
+    local pending = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsPendingCreate then
+            pending = ZoneNet:IsPendingCreate() and true or false
+        end
+    end)
+    if not pending then return end
+
+    local browser = nil
+    pcall(function()
+        if zone_ui_server_list and zone_ui_server_list.get_dialog then
+            browser = zone_ui_server_list.get_dialog()
+        end
+    end)
+    if browser then
+        pcall(function() browser:HideDialog() end)
+        pcall(function() browser:Show(false) end)
+    end
+
+    pcall(function()
+        local open_fn = _G.open_peer_faction
+        if type(open_fn) ~= "function" and zone_ui_peer_faction then
+            open_fn = zone_ui_peer_faction.open_peer_faction
+        end
+        if type(open_fn) == "function" then
+            open_fn(browser)
+        end
     end)
 end
-function on_before_save_input()
+local function zone_is_connected()
     local connected = false
     pcall(function()
-        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+        if ZoneNet and ZoneNet.IsConnected then
+            connected = ZoneNet:IsConnected() and true or false
+        end
     end)
-    if connected then return true end
-    return false
+    return connected
 end
-function on_before_load_input()
-    local connected = false
-    pcall(function()
-        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
-    end)
-    if connected then
+function on_before_save_input(dik, action, flags)
+    if type(flags) ~= "table" then return true end
+    if zone_is_connected() then flags.ret_value = false end
+    return flags.ret_value
+end
+function on_before_load_input(dik, action, flags)
+    if type(flags) ~= "table" then return true end
+    if zone_is_connected() then
         pcall(function()
             if db and db.actor then db.actor:give_game_news("Zone", "Disconnect before loading.", "ui_inGame2_PDA_icon", 0, 3000, 0) end
         end)
-        return true
+        flags.ret_value = false
     end
-    return false
+    return flags.ret_value
 end
 function get_server_spawn()
     local x, y, z = 0, 0, 0

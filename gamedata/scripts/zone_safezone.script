@@ -1,8 +1,9 @@
 -- zone_safezone.script
 -- Safe zone enforcement. The server owns the authoritative locked state
 -- (SAFEZONE_STATE 0x0020 plus the ZoneNet:IsInSafeZone() client atomic);
--- this script reconciles both, holsters the weapon, blocks offensive input
--- and hard-cancels damage involving protected actors.
+-- this script reconciles both, holsters the weapon, blocks offensive input,
+-- hard-cancels damage involving protected actors and suppresses AI
+-- hostility (enemy acquisition) for anyone standing inside a safe zone.
 
 local SAFE_ZONES = {
     { id = "sz_cordon_rookie", level = "l01_escape", x = -211.3, y = -20.2, z = -145.8, r = 65.0, h = 20.0 },
@@ -47,6 +48,12 @@ local registered = false
 local fire_hook_installed = false
 local prev_CActor_Fire = nil
 
+-- AI zone-membership cache. xr_combat_ignore.is_enemy is a hot path, so a
+-- per-object result lives for ~1 s. Wiped on reset/level change.
+local zone_cache = {}
+local zone_cache_count = 0
+local ZONE_CACHE_MS = 1000
+
 local function pos_in_safezone(pos, cur_level)
     if not pos then return false end
     local px = tonumber(pos.x)
@@ -68,6 +75,17 @@ local function pos_in_safezone(pos, cur_level)
     return false
 end
 
+-- Exported helper (pcall-safe, always a boolean): true when pos lies inside
+-- one of the safe zones on the current level.
+function is_position_in_safezone(pos)
+    if not pos then return false end
+    local cur_level = nil
+    pcall(function() cur_level = level.name() end)
+    if type(cur_level) ~= "string" or cur_level == "" then return false end
+    local ok, inside = pcall(pos_in_safezone, pos, cur_level)
+    return (ok and inside == true) and true or false
+end
+
 local function same_object(a, b)
     if a == b then return true end
     local same = false
@@ -80,11 +98,50 @@ local function object_in_safezone(obj)
     if enforced and db and db.actor and same_object(obj, db.actor) then return true end
     local ok_pos, pos = pcall(function() return obj:position() end)
     if not ok_pos or not pos then return false end
-    local cur_level = nil
-    pcall(function() cur_level = level.name() end)
-    if type(cur_level) ~= "string" or cur_level == "" then return false end
-    local ok_geo, inside = pcall(pos_in_safezone, pos, cur_level)
-    return ok_geo and inside == true
+    return is_position_in_safezone(pos)
+end
+
+local function wipe_zone_cache()
+    zone_cache = {}
+    zone_cache_count = 0
+end
+
+local function ai_in_safezone(obj)
+    if not obj then return false end
+    local id = nil
+    pcall(function() id = obj:id() end)
+    if id == nil then return false end
+    local now = nil
+    pcall(function() now = time_global() end)
+    if type(now) ~= "number" then
+        return object_in_safezone(obj)
+    end
+    local e = zone_cache[id]
+    if e and (now - e.t) < ZONE_CACHE_MS then
+        return e.z == true
+    end
+    local z = object_in_safezone(obj)
+    if not e then
+        zone_cache_count = zone_cache_count + 1
+        if zone_cache_count > 128 then
+            local kept = 0
+            for k, v in pairs(zone_cache) do
+                if (now - v.t) >= ZONE_CACHE_MS then
+                    zone_cache[k] = nil
+                else
+                    kept = kept + 1
+                end
+            end
+            zone_cache_count = kept + 1
+        end
+    end
+    zone_cache[id] = { t = now, z = z }
+    return z
+end
+
+-- True when either side of a potential enemy pair is inside a safe zone.
+local function safezone_pair_blocked(a, b)
+    return ai_in_safezone(a) or ai_in_safezone(b)
 end
 
 local function build_blocklist()
@@ -119,6 +176,16 @@ local function install_fire_hook()
     fire_hook_installed = true
 end
 
+local function actor_weapon_lowered()
+    local lowered = false
+    pcall(function()
+        if level and level.actor_weapon_lowered then
+            lowered = level.actor_weapon_lowered() and true or false
+        end
+    end)
+    return lowered
+end
+
 local function set_weapon_locked(locked)
     -- Never touch Actor() when no actor exists (menu / net_destroy / level
     -- change): the engine binding dereferences Actor() without a null check.
@@ -126,20 +193,18 @@ local function set_weapon_locked(locked)
         if not locked then weapon_hidden = false end
         return
     end
-    -- level.actor_set_safemode is the Anomaly scripting alias; the engine
-    -- binding is game.actor_lower_weapon (same C function). Call both
-    -- defensively so whichever table exists does the work.
-    pcall(function() if level and level.actor_set_safemode then level.actor_set_safemode(locked) end end)
-    pcall(function() if game and game.actor_lower_weapon then game.actor_lower_weapon(locked) end end)
+    -- level.actor_lower_weapon / level.actor_weapon_lowered are the real
+    -- engine bindings (level_script.cpp:2843-2844 registered into the "level"
+    -- table at level_script.cpp:2486). There is no level.actor_set_safemode,
+    -- no game.actor_lower_weapon and no game.actor_weapon_lowered.
+    pcall(function()
+        if level and level.actor_lower_weapon then
+            level.actor_lower_weapon(locked and true or false)
+        end
+    end)
 
     if locked then
-        local lowered = false
-        pcall(function()
-            if game and game.actor_weapon_lowered then
-                lowered = game.actor_weapon_lowered() and true or false
-            end
-        end)
-        if not lowered then
+        if not actor_weapon_lowered() then
             pcall(function() db.actor:hide_weapon() end)
             weapon_hidden = true
         end
@@ -147,6 +212,101 @@ local function set_weapon_locked(locked)
         pcall(function() db.actor:restore_weapon() end)
         weapon_hidden = false
     end
+end
+
+-- Re-holster enforcement: the engine clears safemode on weapon actions
+-- (Weapon.cpp:3195-3196, WeaponMagazined.cpp:1191), so a 1 Hz reconcile plus
+-- the actor_on_changed_slot hook (Inventory.cpp:872, forwarded by
+-- callbacks_gameobject.script:224-227) keeps the weapon down/hidden.
+local function enforce_weapon_lock()
+    if not enforced then return end
+    if weapon_hidden then return end
+    if not (db and db.actor) then return end
+    if not actor_weapon_lowered() then
+        set_weapon_locked(true)
+    end
+end
+
+local function on_actor_changed_slot(new_slot, new_obj, prev_slot, prev_obj)
+    pcall(function()
+        if enforced then set_weapon_locked(true) end
+    end)
+end
+
+-- AI hostility suppression. xr_combat_ignore.is_enemy is Anomaly's enemy
+-- gate; wrap it with the same save/chain pattern xrRazom uses
+-- (xrr_patch_common.script:232-256). Returns false when EITHER side stands in
+-- a safe zone, otherwise chain-calls the original pcall-wrapped.
+local combat_ignore_hooked = false
+local orig_combat_is_enemy = nil
+
+local function install_combat_ignore_hook()
+    if combat_ignore_hooked then return end
+    if type(xr_combat_ignore) ~= "table" then return end
+    local orig = xr_combat_ignore.is_enemy
+    if type(orig) ~= "function" then return end
+    orig_combat_is_enemy = orig
+    xr_combat_ignore.is_enemy = function(obj, enemy, no_memory)
+        local ok_zone, blocked = pcall(safezone_pair_blocked, obj, enemy)
+        if ok_zone and blocked then return false end
+        local ok, result = pcall(orig_combat_is_enemy, obj, enemy, no_memory)
+        if ok then return result end
+        -- A wrapper failure must not globally disable enemy acquisition;
+        -- fall back to the engine default (hostile).
+        return true
+    end
+    combat_ignore_hooked = true
+end
+
+-- Secondary layer for bases that dispatch on_enemy_eval from within
+-- is_enemy. Flag convention verified against xrr_patch_pba.script:29-34 and
+-- xrr_patch_common.script:237-246 (flags.override / flags.result).
+local function on_enemy_eval(obj, enemy, flags)
+    pcall(function()
+        if type(flags) ~= "table" then return end
+        if not safezone_pair_blocked(obj, enemy) then return end
+        flags.override = true
+        flags.result = false
+    end)
+end
+
+-- Engine-level veto for mutants: every CCustomMonster consults its
+-- memory().enemy() useful callback before acquiring a target
+-- (enemy_manager.cpp:76-118, invoked at line 109). Stalkers are already
+-- covered by the is_enemy wrap.
+--
+-- LIMITATION: set_enemy_callback is a single-slot setter with no getter in the
+-- engine binding (script_game_object_use.cpp:177-211; luabind overloads at
+-- script_game_object_script2.cpp:177-182 only set/clear). A previously
+-- installed callback cannot be read back, so it cannot be chained; installing
+-- this wrapper replaces any other mod's callback for that monster. Install
+-- only once per spawned monster so repeated net-spawn callbacks cannot
+-- re-wrap it.
+local enemy_cb_installed = {}
+local enemy_cb_count = 0
+
+local function monster_useful_enemy(monster, enemy)
+    local ok, blocked = pcall(safezone_pair_blocked, monster, enemy)
+    if ok and blocked then return false end
+    return true
+end
+
+local function on_monster_net_spawn(monster, se_obj)
+    pcall(function()
+        if not (monster and monster.set_enemy_callback) then return end
+        local id = nil
+        pcall(function() id = monster:id() end)
+        if id ~= nil then
+            if enemy_cb_installed[id] then return end
+            if enemy_cb_count > 256 then
+                enemy_cb_installed = {}
+                enemy_cb_count = 0
+            end
+            enemy_cb_installed[id] = true
+            enemy_cb_count = enemy_cb_count + 1
+        end
+        monster:set_enemy_callback(monster_useful_enemy)
+    end)
 end
 
 local function notify_hud(locked)
@@ -225,6 +385,8 @@ local function on_actor_update()
     if tg - last_poll < POLL_INTERVAL_MS then return end
     last_poll = tg
     pcall(poll_authoritative)
+    pcall(enforce_weapon_lock)
+    pcall(install_combat_ignore_hook)
 end
 
 -- Hard damage cancel when either the victim or (for direct hits) the
@@ -277,6 +439,9 @@ function reset()
     safe_zone_id = ""
     pcall(function() set_weapon_locked(false) end)
     notify_hud(false)
+    wipe_zone_cache()
+    enemy_cb_installed = {}
+    enemy_cb_count = 0
 end
 
 function on_disconnect()
@@ -296,6 +461,7 @@ function on_game_start()
     registered = true
     pcall(build_blocklist)
     pcall(install_fire_hook)
+    pcall(install_combat_ignore_hook)
 
     local function reg(name, fn)
         pcall(function()
@@ -313,4 +479,7 @@ function on_game_start()
     reg("on_before_key_press", on_before_key_press)
     reg("on_before_key_hold", on_before_key_hold)
     reg("actor_on_update", on_actor_update)
+    reg("on_enemy_eval", on_enemy_eval)
+    reg("actor_on_changed_slot", on_actor_changed_slot)
+    reg("monster_on_net_spawn", on_monster_net_spawn)
 end

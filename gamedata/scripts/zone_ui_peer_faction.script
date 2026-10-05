@@ -5,6 +5,11 @@
 
 local ini_itm = ini_file("items\\settings\\new_game_loadouts.ltx")
 
+-- CharacterSelect.items is a 256-byte buffer in the native client
+-- (protocol/packets.h: char items[256]); udp_client.cpp memcpy-truncates at
+-- 255 bytes, so the joined loadout must be validated before sending.
+local MAX_LOADOUT_BYTES = 255
+
 local function zone_eco_tier()
   local ok, tier = pcall(function()
     return ZoneNet and ZoneNet.HostEcoTier and ZoneNet:HostEcoTier() or 1
@@ -115,6 +120,11 @@ function UIZonePeerFaction:InitUI()
   btn = xml:Init3tButton("main_dialog:btn_faction", self.dialog)
   self:Register(btn, "btn_faction")
 
+  pcall(function()
+    self.text_error = xml:InitTextWnd("main_dialog:text_error", self.dialog)
+    if self.text_error then self.text_error:SetText("") end
+  end)
+
   self.CC = {}
   self.CC["inventory"] = utils_ui.UICellContainer("inventory", self, nil, "main_dialog:cont_inv", self.dialog)
   self.CC["loadout"]   = utils_ui.UICellContainer("loadout", self, nil, "main_dialog:cont_loadout", self.dialog)
@@ -156,6 +166,13 @@ end
 
 function UIZonePeerFaction:Update()
   CUIScriptWnd.Update(self)
+  -- Menu-safe pump: SHOW_START/LOAD_LEVEL/ERROR can arrive while the faction
+  -- dialog is up, when actor_on_update does not exist yet.
+  pcall(function()
+    if zone_net and type(zone_net.pump_menu) == "function" then
+      zone_net.pump_menu()
+    end
+  end)
 
   if not self.access then
     self.hint_wnd:Update()
@@ -483,18 +500,60 @@ end
 function UIZonePeerFaction:OnStartGame()
   if not self.access then return end
   if self.submitted then return end
-  if not (ZoneNet and ZoneNet.IsConnected and ZoneNet:IsConnected()) then return end
+  if not (ZoneNet and ZoneNet.IsConnected and ZoneNet:IsConnected()) then
+    self:ShowError(game.translate_string("ui_zone_error_not_connected"))
+    return
+  end
 
   self:SaveCoopOptions()
 
   local faction  = self.selected_faction or "stalker"
   local money    = math.floor(self.selected_money or 0)
   local items_str = self:BuildLoadoutItems()
+  if type(items_str) ~= "string" then items_str = "" end
+  if #items_str > MAX_LOADOUT_BYTES then
+    local msg = game.translate_string("ui_zone_error_loadout")
+    if type(msg) ~= "string" or msg == "" or msg == "ui_zone_error_loadout" then
+      msg = "Loadout is too large for the server."
+    end
+    self:ShowError(string.format("%s (%d/%d)", msg, #items_str, MAX_LOADOUT_BYTES))
+    return
+  end
+
+  local sent = ZoneNet:SendCharacterSelect(faction, money, items_str)
+  if not sent then
+    self:ShowError(game.translate_string("ui_zone_error_send"))
+    return
+  end
 
   self.submitted = true
-  ZoneNet:SendCharacterSelect(faction, money, items_str)
+  if self.text_error then self.text_error:SetText("") end
   self:HideDialog()
   CUIScriptWnd.Show(self, false)
+end
+
+-- Server-side failure (OpError 0x0077) or local precondition failure: reset the
+-- one-shot submit latch and surface the reason inside the dialog.
+function UIZonePeerFaction:ShowError(msg)
+  self.submitted = nil
+  msg = tostring(msg or "")
+  if msg == "" then msg = "Character creation failed." end
+  if self.text_error then
+    pcall(function()
+      self.text_error:SetText("%c[0,220,70,70]" .. msg)
+    end)
+  end
+  printf("Zone: faction dialog error: %s", msg)
+  pcall(function()
+    if not self:IsShown() then
+      self:ShowDialog(true)
+      self:Show(true)
+    end
+  end)
+end
+
+function UIZonePeerFaction:OnServerError(msg)
+  self:ShowError(msg)
 end
 
 -- Stripped: Zone has no per-client coop toggles here.

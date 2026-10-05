@@ -1,24 +1,124 @@
--- zone_ui_server_list.script
--- Native S.T.A.L.K.E.R. Anomaly Server Browser - Overhauled
--- Tactical amber/dark theming, tab filtering, search, details panel,
--- split favorites/history persistence, rename, themed status.
--- Persistence: %APPDATA%\zone_identity.ltx with [zone_favorites] + [zone_history]
--- Legacy [server_history] auto-migrated. No os.remove/rename (engine nils them).
+local DIALOG_XML = "zone_ui_server_list.xml"
+local FAVORITES_SEC = "zone_favorites"
+local HISTORY_SEC = "zone_history"
+local LEGACY_SEC = "server_history"
+local IDENTITY_SEC = "identity"
+local MAX_FAVORITES = 32
+local MAX_HISTORY = 20
+local ROW_H = 26
+local SCAN_TIMEOUT_MS = 450
+local SCAN_STEP_MS = 50
+local CONNECT_TIMEOUT_MS = 16000
+local CONNECT_POLL_MS = 500
+local LAN_PROBE_COUNT = 4
+local BROADCAST_ADDR = "255.255.255.255"
+local DEFAULT_PORT = 27015
+
+local STATE_IDLE = 0
+local STATE_SCANNING = 1
+local STATE_CONNECTING = 2
+local STATE_CONNECTED = 3
+local STATE_FAILED = 4
+
+local TAB_INTERNET = "tab_internet"
+local TAB_LAN = "tab_lan"
+local TAB_FAVORITES = "tab_favorites"
+local TAB_DIRECT = "tab_direct"
+
+local function argb(a, r, g, b)
+    if GetARGB then
+        local ok, c = pcall(GetARGB, a, r, g, b)
+        if ok and type(c) == "number" then return c end
+    end
+    return (a * 16777216) + (r * 65536) + (g * 256) + b
+end
+
+local AMBER = argb(255, 255, 195, 5)
+local GREEN = argb(255, 80, 220, 80)
+local RED = argb(255, 220, 70, 70)
+local GRAY = argb(255, 165, 165, 158)
+local WHITE = argb(255, 225, 225, 215)
+local DIM = argb(255, 140, 140, 134)
+
+local LAMP_OFF = "ui_inGame2_lamp_OFF"
+local LAMP_RED = "ui_inGame2_lamp_RED"
+local LAMP_GREEN = "ui_inGame2_lamp_GREEN"
 
 if not ui_events then ui_events = {} end
 
-local DIALOG_XML      = "zone_ui_server_list.xml"
-local FAVORITES_SEC   = "zone_favorites"
-local HISTORY_SEC     = "zone_history"
-local LEGACY_SEC      = "server_history"
-local IDENTITY_SEC    = "identity"
-local MAX_FAVORITES   = 32
-local MAX_HISTORY     = 20
+local function tr(id)
+    local ok, s = pcall(function() return game.translate_string(id) end)
+    if ok and type(s) == "string" and s ~= "" and s ~= id then return s end
+    return id
+end
 
--- Filter modes
-local FILTER_ALL  = 0
-local FILTER_FAV  = 1
-local FILTER_HIST = 2
+local function tr_or(id, fallback)
+    local s = tr(id)
+    if s == id then return fallback end
+    return s
+end
+
+-- Identity gate: zone_main owns zone_identity.ltx. Returns the config table
+-- with a real uuid/hwid, or nil when no identity could be established. The
+-- browser must never connect with the shared "anonymous" placeholder.
+local function client_identity()
+    local cfg = nil
+    pcall(function()
+        if not zone_main then return end
+        if type(zone_main.ensure_identity) == "function" then
+            cfg = zone_main.ensure_identity()
+        elseif type(zone_main.get_config) == "function" then
+            cfg = zone_main.get_config()
+        end
+    end)
+    if type(cfg) ~= "table" then return nil end
+    local uuid = cfg.client_uuid
+    if type(uuid) ~= "string" or uuid == "" or uuid == "anonymous" then return nil end
+    if not tonumber(cfg.hwid_hash) then return nil end
+    return cfg
+end
+
+local function set_widget_text(wnd, text, color)
+    if not wnd then return end
+    pcall(function()
+        local tc = nil
+        if wnd.TextControl then tc = wnd:TextControl() end
+        if tc then
+            if tc.SetText then tc:SetText(tostring(text)) end
+            if color and tc.SetTextColor then tc:SetTextColor(color) end
+        end
+        if wnd.SetText then wnd:SetText(tostring(text)) end
+        if color and wnd.SetTextColor then wnd:SetTextColor(color) end
+    end)
+end
+
+local function field_text(id, value)
+    return "%c[0,140,140,134]" .. tr(id) .. ": %c[0,225,225,215]" .. tostring(value)
+end
+
+local function clip_text(s, n)
+    if type(s) ~= "string" then return "" end
+    if #s <= n then return s end
+    return s:sub(1, n - 1) .. "."
+end
+
+local function mode_name(m)
+    m = tonumber(m) or 0
+    if m <= 0 then return "Co-op" end
+    return "M" .. tostring(math.floor(m))
+end
+
+local function valid_host(h)
+    if type(h) ~= "string" or h == "" or #h > 253 then return false end
+    if h:match("^%d+%.%d+%.%d+%.%d+$") then
+        for octet in h:gmatch("(%d+)") do
+            local n = tonumber(octet)
+            if not n or n < 0 or n > 255 then return false end
+        end
+        return true
+    end
+    return h:match("^[%w][%w%.%-]*[%w]$") ~= nil
+end
 
 local function get_identity_path()
     local fs = getFS and getFS()
@@ -52,233 +152,9 @@ local function sanitize_label(label, fallback_ip, fallback_port)
     return cleaned
 end
 
-local function sanitize_search(q)
-    if not q then return "" end
-    local s = q:match("^%s*(.-)%s*$") or ""
-    if #s > 32 then s = s:sub(1, 32) end
-    return s:lower()
-end
-
-local _server_browser_dlg = nil
-
-local function safe_init(xml, method, path, arg2, arg3)
-    if not xml or not xml[method] then return nil end
-    local ok, res
-    if arg3 ~= nil then
-        ok, res = pcall(function() return xml[method](xml, path, arg2, arg3) end)
-        if ok and res then return res end
-    end
-    if arg2 ~= nil then
-        ok, res = pcall(function() return xml[method](xml, path, arg2) end)
-        if ok and res then return res end
-    end
-    ok, res = pcall(function() return xml[method](xml, path) end)
-    if ok and res then return res end
-    return nil
-end
-
--- ============================================================
--- class UIZoneServerList (CUIScriptWnd)
--- ============================================================
-class "UIZoneServerList" (CUIScriptWnd)
-
-function UIZoneServerList:__init(owner)
-    super()
-    self.owner     = owner
-    local ok, rect = pcall(function() return Frect():set(0, 0, 1024, 768) end)
-    if ok and rect then
-        pcall(function() self:SetWndRect(rect) end)
-    else
-        pcall(function() self:SetWndRect(Frect():set(0, 0, 1024, 768)) end)
-    end
-    pcall(function() self:Enable(true) end)
-    -- Split storage: favorites (starred) vs history (recents)
-    self.favorites = {}   -- { label, ip, port, is_fav=true, status, lastSeen, added }
-    self.history   = {}   -- { label, ip, port, is_fav=false, status, lastSeen }
-    self.filtered  = {}   -- view after filter+search (refs to fav/history entries)
-    self.filter_mode = FILTER_ALL
-    self.search_query = ""
-    self.sel_idx   = nil  -- 0-based index into filtered
-    self.sel_entry = nil
-    self.uuid      = "anonymous"
-    self.hwid      = 0
-    self.nick      = "Stalker"
-    self.status_text     = "Ready"
-    self.connect_pending = false
-    self.connect_ip      = nil
-    self.connect_port    = nil
-    self.connect_start   = 0
-    self.last_status_poll = 0
-    self.last_search_poll = 0
-    -- Rename two-step state
-    self.rename_pending = false
-    self.rename_entry   = nil
-end
-
-function UIZoneServerList:__finalize()
-    _server_browser_dlg = nil
-end
-
--- ------------------------------------------------------------
--- InitControls - loads XML and binds widgets (nil-safe for missing new nodes)
--- ------------------------------------------------------------
-function UIZoneServerList:InitControls()
-    self:SetAutoDelete(true)
-
-    pcall(function()
-        if getFS then
-            local fs = getFS()
-            if fs then
-                if fs.path_exist then
-                    local ok_alias, has_alias = pcall(function() return fs:path_exist("$game_config$") end)
-                    if ok_alias and has_alias and fs.rescan_path then pcall(function() fs:rescan_path("$game_config$") end) end
-                end
-                if fs.rescan_pathes then pcall(function() fs:rescan_pathes() end) end
-            end
-        end
-    end)
-    local fs_ok = false
-    pcall(function()
-        local fs = getFS and getFS()
-        if fs and fs.exist then
-            local r = fs:exist("$game_config$", "ui\\zone_ui_server_list.xml")
-            if r then fs_ok = true end
-        end
-    end)
-    if not fs_ok then
-        printf("Zone UI: server list XML not in FS cache - restart game once after first inject")
-        return false
-    end
-
-    local xml = CScriptXmlInit()
-    local ok, _res = pcall(function() return xml:ParseFile(DIALOG_XML) end)
-    if not ok then return false end
-
-    pcall(function() self.background = xml:InitStatic("background", self) end)
-    pcall(function() xml:InitStatic("header_label", self) end)
-    pcall(function() xml:InitStatic("subtitle_label", self) end)
-    pcall(function() xml:InitStatic("accent_line", self) end)
-    pcall(function() xml:InitStatic("col_name", self) end)
-    pcall(function() xml:InitStatic("col_host", self) end)
-    pcall(function() xml:InitStatic("col_port", self) end)
-    pcall(function() xml:InitStatic("col_status", self) end)
-    pcall(function() xml:InitStatic("direct_label", self) end)
-    pcall(function() xml:InitStatic("direct_underline", self) end)
-    pcall(function() xml:InitStatic("ip_label", self) end)
-    pcall(function() xml:InitStatic("port_label", self) end)
-    pcall(function() xml:InitStatic("nick_label", self) end)
-    pcall(function() xml:InitStatic("search_label", self) end)
-    pcall(function() xml:InitStatic("details_bg", self) end)
-    pcall(function() xml:InitStatic("status_bg", self) end)
-
-    self.list_servers = nil
-    pcall(function() self.list_servers = xml:InitListBox("list", self) end)
-    if self.list_servers then self:Register(self.list_servers, "server_list") end
-
-    self.edit_ip = nil
-    pcall(function() self.edit_ip = xml:InitEditBox("edit_ip", self) end)
-    if self.edit_ip then self:Register(self.edit_ip, "edit_ip") end
-    self.edit_port = nil
-    pcall(function() self.edit_port = xml:InitEditBox("edit_port", self) end)
-    if self.edit_port then self:Register(self.edit_port, "edit_port") end
-    self.edit_nick = nil
-    pcall(function() self.edit_nick = xml:InitEditBox("edit_nick", self) end)
-    if self.edit_nick then self:Register(self.edit_nick, "edit_nick") end
-
-    self.edit_search = nil
-    pcall(function()
-        self.edit_search = xml:InitEditBox("edit_search", self)
-        if self.edit_search then self:Register(self.edit_search, "edit_search") end
-    end)
-
-    pcall(function() self.btn_connect = xml:Init3tButton("btn_connect", self) end)
-    if self.btn_connect then self:Register(self.btn_connect, "btn_connect") end
-    pcall(function() self.btn_add_fav = xml:Init3tButton("btn_add_fav", self) end)
-    if self.btn_add_fav then self:Register(self.btn_add_fav, "btn_add_fav") end
-    pcall(function() self.btn_del_fav = xml:Init3tButton("btn_del_fav", self) end)
-    if self.btn_del_fav then self:Register(self.btn_del_fav, "btn_del_fav") end
-    pcall(function() self.btn_back = xml:Init3tButton("btn_back", self) end)
-    if self.btn_back then self:Register(self.btn_back, "btn_back") end
-
-    -- New buttons (optional - nil-safe if older XML)
-    self.btn_tab_all = nil
-    self.btn_tab_fav = nil
-    self.btn_tab_hist = nil
-    self.btn_rename = nil
-    self.btn_refresh = nil
-    pcall(function() self.btn_tab_all = xml:Init3tButton("btn_tab_all", self) end)
-    if self.btn_tab_all then self:Register(self.btn_tab_all, "btn_tab_all") end
-    pcall(function() self.btn_tab_fav = xml:Init3tButton("btn_tab_fav", self) end)
-    if self.btn_tab_fav then self:Register(self.btn_tab_fav, "btn_tab_fav") end
-    pcall(function() self.btn_tab_hist = xml:Init3tButton("btn_tab_hist", self) end)
-    if self.btn_tab_hist then self:Register(self.btn_tab_hist, "btn_tab_hist") end
-    pcall(function() self.btn_rename = xml:Init3tButton("btn_rename", self) end)
-    if self.btn_rename then self:Register(self.btn_rename, "btn_rename") end
-    pcall(function() self.btn_refresh = xml:Init3tButton("btn_refresh", self) end)
-    if self.btn_refresh then self:Register(self.btn_refresh, "btn_refresh") end
-
-    self.status_label = nil
-    pcall(function() self.status_label = xml:InitStatic("status_label", self) end)
-    self.details_label = nil
-    pcall(function() self.details_label = xml:InitStatic("details_label", self) end)
-    self.details_hint = nil
-    pcall(function() self.details_hint = xml:InitStatic("details_hint", self) end)
-    self.empty_hint = nil
-    pcall(function() self.empty_hint = xml:InitStatic("empty_hint", self) end)
-
-    self:LoadFavorites()
-    pcall(function() self:SetStatus("Ready - select server or enter address") end)
-    pcall(function() self:UpdateTabVisuals() end)
-    pcall(function() self:UpdateDetails(nil) end)
-    return true
-end
-
-function UIZoneServerList:InitCallBacks()
-    if self.btn_connect then
-        self:AddCallback("btn_connect", ui_events.BUTTON_CLICKED, self.OnConnect, self)
-    end
-    if self.btn_add_fav then
-        self:AddCallback("btn_add_fav", ui_events.BUTTON_CLICKED, self.OnToggleFavorite, self)
-    end
-    if self.btn_del_fav then
-        self:AddCallback("btn_del_fav", ui_events.BUTTON_CLICKED, self.OnDelFavorite, self)
-    end
-    if self.btn_back then
-        self:AddCallback("btn_back", ui_events.BUTTON_CLICKED, self.OnBack, self)
-    end
-    if self.btn_tab_all then
-        self:AddCallback("btn_tab_all", ui_events.BUTTON_CLICKED, self.OnTabAll, self)
-    end
-    if self.btn_tab_fav then
-        self:AddCallback("btn_tab_fav", ui_events.BUTTON_CLICKED, self.OnTabFav, self)
-    end
-    if self.btn_tab_hist then
-        self:AddCallback("btn_tab_hist", ui_events.BUTTON_CLICKED, self.OnTabHist, self)
-    end
-    if self.btn_rename then
-        self:AddCallback("btn_rename", ui_events.BUTTON_CLICKED, self.OnRename, self)
-    end
-    if self.btn_refresh then
-        self:AddCallback("btn_refresh", ui_events.BUTTON_CLICKED, self.OnRefresh, self)
-    end
-    if self.edit_search and ui_events.EDIT_TEXT_COMMIT then
-        self:AddCallback("edit_search", ui_events.EDIT_TEXT_COMMIT, self.OnSearchCommit, self)
-    end
-    if self.list_servers and ui_events.LIST_ITEM_CLICKED then
-        self:AddCallback("server_list", ui_events.LIST_ITEM_CLICKED, self.OnListSelect, self)
-        if ui_events.WINDOW_LBUTTON_DB_CLICK then
-            self:AddCallback("server_list", ui_events.WINDOW_LBUTTON_DB_CLICK, self.OnConnect, self)
-        end
-    end
-end
-
--- ============================================================
--- Persistence helpers - robust splitter + entry parser
--- ============================================================
-
 local function split_pipe(s)
     local t = {}
-    for part in string.gmatch(s, "[^|]+") do t[#t+1] = part end
+    for part in string.gmatch(s, "[^|]+") do t[#t + 1] = part end
     return t
 end
 
@@ -288,14 +164,24 @@ local function now_timestamp()
     end)
     if ok and ts and type(ts) == "number" then return ts end
     local ok2, tg = pcall(function() return time_global and time_global() or 0 end)
-    if ok2 and tg then return math.floor(tg/1000) end
+    if ok2 and tg then return math.floor(tg / 1000) end
     return 0
+end
+
+local function age_text(ts)
+    ts = tonumber(ts) or 0
+    if ts <= 0 then return "-" end
+    local d = now_timestamp() - ts
+    if d < 0 then d = 0 end
+    if d < 60 then return string.format("%ds", math.floor(d)) end
+    if d < 3600 then return string.format("%dm", math.floor(d / 60)) end
+    if d < 86400 then return string.format("%dh", math.floor(d / 3600)) end
+    return string.format("%dd", math.floor(d / 86400))
 end
 
 local function parse_entry(raw, is_fav_default)
     if not raw or raw:match("^%s*$") then return nil end
     raw = raw:match("^%s*(.-)%s*$")
-    -- Split by |
     local parts = split_pipe(raw)
     if #parts == 0 then return nil end
 
@@ -305,7 +191,6 @@ local function parse_entry(raw, is_fav_default)
     local tsStr = nil
 
     if #parts == 1 then
-        -- legacy single token: "127.0.0.1:27015" or "My Server"
         local s = parts[1]
         if s:match(":%d+$") then
             ipport = s
@@ -314,10 +199,9 @@ local function parse_entry(raw, is_fav_default)
             return nil
         end
     elseif #parts == 2 then
-        -- label|ip:port
         label = parts[1]:match("^%s*(.-)%s*$")
         ipport = parts[2]:match("^%s*(.-)%s*$")
-    elseif #parts >= 3 then
+    else
         label = parts[1]:match("^%s*(.-)%s*$")
         ipport = parts[2]:match("^%s*(.-)%s*$")
         flagStr = parts[3]
@@ -336,14 +220,16 @@ local function parse_entry(raw, is_fav_default)
     local is_fav = is_fav_default
     if flagStr then
         flagStr = flagStr:match("^%s*(.-)%s*$")
-        if flagStr == "1" or flagStr:lower() == "fav" or flagStr:lower() == "true" then is_fav = true
-        elseif flagStr == "0" or flagStr:lower() == "hist" or flagStr:lower() == "false" then is_fav = false end
-        -- if flagStr is numeric timestamp and we have no tsStr, treat it as timestamp
+        if flagStr == "1" or flagStr:lower() == "fav" or flagStr:lower() == "true" then
+            is_fav = true
+        elseif flagStr == "0" or flagStr:lower() == "hist" or flagStr:lower() == "false" then
+            is_fav = false
+        end
         if tonumber(flagStr) and #parts == 3 and tonumber(flagStr) > 100000 then
             tsStr = flagStr
-            -- keep is_fav as default
         end
     end
+
     local lastSeen = 0
     if tsStr then
         lastSeen = tonumber(tsStr:match("^%s*(.-)%s*$")) or 0
@@ -351,28 +237,309 @@ local function parse_entry(raw, is_fav_default)
     if lastSeen == 0 then lastSeen = now_timestamp() end
 
     return {
-        label    = label,
-        ip       = ip,
-        port     = port,
-        is_fav   = is_fav,
-        status   = is_fav and "Favorite" or "Recent",
+        label = label,
+        ip = ip,
+        port = port,
+        is_fav = is_fav,
+        status = is_fav and "Favorite" or "Recent",
         lastSeen = lastSeen,
-        added    = lastSeen
+        added = lastSeen,
+        state = nil,
+        query = nil
     }
 end
 
--- Legacy single-field parser (kept for compat)
-local function parse_legacy_history(raw)
-    return parse_entry(raw, false)
+local function find_entry_by_addr(list, ip, port)
+    for idx, e in ipairs(list) do
+        if e.ip == ip and e.port == port then return e, idx end
+    end
+    return nil, nil
+end
+
+local _server_browser_dlg = nil
+
+class "UIZoneServerList" (CUIScriptWnd)
+
+function UIZoneServerList:__init(owner)
+    super()
+    self.owner = owner
+    local ok, rect = pcall(function() return Frect():set(0, 0, 1024, 768) end)
+    if ok and rect then
+        pcall(function() self:SetWndRect(rect) end)
+    end
+    pcall(function() self:Enable(true) end)
+
+    self.favorites = {}
+    self.history = {}
+    self.rows = {}
+    self.sel_entry = nil
+    self.tab_id = TAB_INTERNET
+
+    self.uuid = nil
+    self.hwid = 0
+    self.nick = "Stalker"
+    self.edit_focus = 0
+
+    self.state = STATE_IDLE
+    self.state_detail = ""
+
+    self.scan_active = false
+    self.scan_queue = nil
+    self.scan_index = nil
+    self.scan_discoveries = false
+    self.scan_prev_connected = false
+    self.broadcast_hit = nil
+
+    self.connect_ip = nil
+    self.connect_port = nil
+    self.connect_start = 0
+    self.last_connect_poll = 0
+
+    self.spinner_shown = false
+    self.spin_on = false
+    self.last_spin = 0
+end
+
+function UIZoneServerList:__finalize()
+    _server_browser_dlg = nil
+end
+
+function UIZoneServerList:Now()
+    local t = 0
+    pcall(function() if time_global then t = time_global() end end)
+    if not t or t == 0 then
+        pcall(function() if time_continual then t = time_continual() * 1000 end end)
+    end
+    return t or 0
+end
+
+function UIZoneServerList:NetAvailable()
+    local ok, avail = pcall(function()
+        return ZoneNet ~= nil and type(ZoneNet.QueryServer) == "function"
+    end)
+    return ok and avail and true or false
+end
+
+function UIZoneServerList:ClientLoaded()
+    local loaded = false
+    pcall(function()
+        if zone_net and type(zone_net.is_client_loaded) == "function" then
+            loaded = zone_net.is_client_loaded() and true or false
+        elseif ZoneNet and type(ZoneNet.IsClientLoaded) == "function" then
+            loaded = ZoneNet:IsClientLoaded() and true or false
+        end
+    end)
+    return loaded
+end
+
+local function xml_init(xml, method, path, parent)
+    local wnd = nil
+    pcall(function() wnd = xml[method](xml, path, parent) end)
+    return wnd
+end
+
+function UIZoneServerList:InitControls()
+    self:SetAutoDelete(true)
+
+    pcall(function()
+        if getFS then
+            local fs = getFS()
+            if fs then
+                if fs.path_exist then
+                    local ok_alias, has_alias = pcall(function() return fs:path_exist("$game_config$") end)
+                    if ok_alias and has_alias and fs.rescan_path then
+                        pcall(function() fs:rescan_path("$game_config$") end)
+                    end
+                end
+                if fs.rescan_pathes then pcall(function() fs:rescan_pathes() end) end
+            end
+        end
+    end)
+
+    local fs_ok = false
+    pcall(function()
+        local fs = getFS and getFS()
+        if fs and fs.exist then
+            fs_ok = fs:exist("$game_config$", "ui\\zone_ui_server_list.xml") and true or false
+        end
+    end)
+    if not fs_ok then
+        printf("Zone UI: server list XML not in FS cache - restart game once after first inject")
+        return false
+    end
+
+    local xml = CScriptXmlInit()
+    local parsed = false
+    pcall(function()
+        xml:ParseFile(DIALOG_XML)
+        parsed = true
+    end)
+    if not parsed then
+        printf("Zone UI: failed to parse " .. DIALOG_XML)
+        return false
+    end
+
+    self.background = xml_init(xml, "InitStatic", "background", self)
+    self.window_frame = xml_init(xml, "InitStatic", "window_frame", self)
+    self.title = xml_init(xml, "InitStatic", "title", self)
+    self.accent_line = xml_init(xml, "InitStatic", "accent_line", self)
+    self.header_lamp = xml_init(xml, "InitStatic", "header_lamp", self)
+    self.status_header = xml_init(xml, "InitStatic", "status_header", self)
+
+    self.tabs = xml_init(xml, "InitTab", "tabs", self)
+    if self.tabs then self:Register(self.tabs, "tabs") end
+
+    self.col_name = xml_init(xml, "InitStatic", "col_name", self)
+    self.col_map = xml_init(xml, "InitStatic", "col_map", self)
+    self.col_players = xml_init(xml, "InitStatic", "col_players", self)
+    self.col_ping = xml_init(xml, "InitStatic", "col_ping", self)
+    self.col_mode = xml_init(xml, "InitStatic", "col_mode", self)
+
+    self.list_frame = xml_init(xml, "InitFrame", "list_frame", self)
+    self.list_servers = xml_init(xml, "InitListBox", "list", self)
+    if self.list_servers then self:Register(self.list_servers, "server_list") end
+
+    self.empty_title = xml_init(xml, "InitStatic", "empty_title", self)
+    self.empty_hint = xml_init(xml, "InitStatic", "empty_hint", self)
+
+    self.details_bg = xml_init(xml, "InitFrame", "details_bg", self)
+    self.details_title = xml_init(xml, "InitStatic", "details_title", self)
+    self.details_body = xml_init(xml, "InitTextWnd", "details_body", self)
+    if self.details_body and self.details_body.SetTextComplexMode then
+        pcall(function() self.details_body:SetTextComplexMode(true) end)
+    end
+
+    self.direct_bg = xml_init(xml, "InitFrame", "direct_bg", self)
+    self.direct_title = xml_init(xml, "InitStatic", "direct_title", self)
+    self.host_label = xml_init(xml, "InitStatic", "host_label", self)
+    self.host_bg = xml_init(xml, "InitFrameLine", "host_bg", self)
+    self.edit_ip = xml_init(xml, "InitEditBox", "edit_ip", self)
+    self.port_label = xml_init(xml, "InitStatic", "port_label", self)
+    self.port_bg = xml_init(xml, "InitFrameLine", "port_bg", self)
+    self.edit_port = xml_init(xml, "InitEditBox", "edit_port", self)
+    self.nick_label = xml_init(xml, "InitStatic", "nick_label", self)
+    self.nick_bg = xml_init(xml, "InitFrameLine", "nick_bg", self)
+    self.edit_nick = xml_init(xml, "InitEditBox", "edit_nick", self)
+
+    if self.edit_ip then self:Register(self.edit_ip, "edit_ip") end
+    if self.edit_port then self:Register(self.edit_port, "edit_port") end
+    if self.edit_nick then self:Register(self.edit_nick, "edit_nick") end
+
+    self.status_bg = xml_init(xml, "InitFrameLine", "status_bg", self)
+    self.status_label = xml_init(xml, "InitStatic", "status_label", self)
+    self.spinner = xml_init(xml, "InitAnimStatic", "spinner", self)
+    if self.spinner then pcall(function() self.spinner:Show(false) end) end
+
+    self.btn_connect = xml_init(xml, "Init3tButton", "btn_connect", self)
+    self.btn_favorite = xml_init(xml, "Init3tButton", "btn_favorite", self)
+    self.btn_remove = xml_init(xml, "Init3tButton", "btn_remove", self)
+    self.btn_refresh = xml_init(xml, "Init3tButton", "btn_refresh", self)
+    self.btn_back = xml_init(xml, "Init3tButton", "btn_back", self)
+
+    if self.btn_connect then self:Register(self.btn_connect, "btn_connect") end
+    if self.btn_favorite then self:Register(self.btn_favorite, "btn_favorite") end
+    if self.btn_remove then self:Register(self.btn_remove, "btn_remove") end
+    if self.btn_refresh then self:Register(self.btn_refresh, "btn_refresh") end
+    if self.btn_back then self:Register(self.btn_back, "btn_back") end
+
+    if self.edit_ip and self.edit_port and self.edit_ip.SetNextFocusCapturer then
+        pcall(function() self.edit_ip:SetNextFocusCapturer(self.edit_port) end)
+    end
+    if self.edit_port and self.edit_nick and self.edit_port.SetNextFocusCapturer then
+        pcall(function() self.edit_port:SetNextFocusCapturer(self.edit_nick) end)
+    end
+    if self.edit_nick and self.edit_ip and self.edit_nick.SetNextFocusCapturer then
+        pcall(function() self.edit_nick:SetNextFocusCapturer(self.edit_ip) end)
+    end
+
+    self.tab_id = self:GetActiveTabId()
+    if self.tabs and self.tabs.SetActiveTab then
+        pcall(function() self.tabs:SetActiveTab(self.tab_id) end)
+    end
+    self:UpdateLabels()
+    self:LoadFavorites()
+    self:UpdateDirectVisibility()
+    self:UpdateStatus()
+    return true
+end
+
+function UIZoneServerList:InitCallBacks()
+    if self.btn_connect then
+        self:AddCallback("btn_connect", ui_events.BUTTON_CLICKED, self.OnConnect, self)
+    end
+    if self.btn_favorite then
+        self:AddCallback("btn_favorite", ui_events.BUTTON_CLICKED, self.OnToggleFavorite, self)
+    end
+    if self.btn_remove then
+        self:AddCallback("btn_remove", ui_events.BUTTON_CLICKED, self.OnRemove, self)
+    end
+    if self.btn_refresh then
+        self:AddCallback("btn_refresh", ui_events.BUTTON_CLICKED, self.OnRefresh, self)
+    end
+    if self.btn_back then
+        self:AddCallback("btn_back", ui_events.BUTTON_CLICKED, self.OnBack, self)
+    end
+    if self.tabs then
+        self:AddCallback("tabs", ui_events.TAB_CHANGED, self.OnTabChanged, self)
+    end
+    if self.list_servers and ui_events.LIST_ITEM_CLICKED then
+        self:AddCallback("server_list", ui_events.LIST_ITEM_CLICKED, self.OnListSelect, self)
+        if ui_events.WINDOW_LBUTTON_DB_CLICK then
+            self:AddCallback("server_list", ui_events.WINDOW_LBUTTON_DB_CLICK, self.OnConnect, self)
+        end
+    end
+end
+
+function UIZoneServerList:UpdateLabels()
+    set_widget_text(self.title, tr("ui_zone_title"), AMBER)
+    set_widget_text(self.col_name, tr("ui_zone_col_name"), AMBER)
+    set_widget_text(self.col_map, tr("ui_zone_col_map"), AMBER)
+    set_widget_text(self.col_players, tr("ui_zone_col_players"), AMBER)
+    set_widget_text(self.col_ping, tr("ui_zone_col_ping"), AMBER)
+    set_widget_text(self.col_mode, tr("ui_zone_col_mode"), AMBER)
+    set_widget_text(self.details_title, tr("ui_zone_details"), AMBER)
+    set_widget_text(self.direct_title, tr("ui_zone_tab_direct"), AMBER)
+    set_widget_text(self.host_label, tr("ui_zone_direct_host"), WHITE)
+    set_widget_text(self.port_label, tr("ui_zone_direct_port"), WHITE)
+    set_widget_text(self.nick_label, tr("ui_zone_direct_nick"), WHITE)
+    set_widget_text(self.btn_connect, tr("ui_zone_btn_connect"), nil)
+    set_widget_text(self.btn_favorite, tr("ui_zone_btn_favorite"), nil)
+    set_widget_text(self.btn_remove, tr("ui_zone_btn_remove"), nil)
+    set_widget_text(self.btn_refresh, tr("ui_zone_btn_refresh"), nil)
+    set_widget_text(self.btn_back, tr("ui_zone_btn_back"), nil)
+    if self.tabs and self.tabs.GetButtonById then
+        local function cap(id, text)
+            pcall(function()
+                local b = self.tabs:GetButtonById(id)
+                if b and b.TextControl then b:TextControl():SetText(text) end
+            end)
+        end
+        cap(TAB_INTERNET, tr("ui_zone_tab_internet"))
+        cap(TAB_LAN, tr("ui_zone_tab_lan"))
+        cap(TAB_FAVORITES, tr("ui_zone_tab_favorites"))
+        cap(TAB_DIRECT, tr("ui_zone_tab_direct"))
+    end
+end
+
+function UIZoneServerList:GetActiveTabId()
+    local id = nil
+    pcall(function()
+        if self.tabs and self.tabs.GetActiveId then id = self.tabs:GetActiveId() end
+    end)
+    if type(id) ~= "string" or id == "" then id = TAB_INTERNET end
+    if id ~= TAB_INTERNET and id ~= TAB_LAN and id ~= TAB_FAVORITES and id ~= TAB_DIRECT then
+        id = TAB_INTERNET
+    end
+    return id
+end
+
+function UIZoneServerList:IsDirectTab()
+    return self.tab_id == TAB_DIRECT
 end
 
 function UIZoneServerList:LoadFavorites()
     self.favorites = {}
-    self.history   = {}
-    self.filtered  = {}
-    self.filter_mode = FILTER_ALL
-    self.search_query = ""
-    self.sel_idx = nil
+    self.history = {}
     self.sel_entry = nil
 
     local path = get_identity_path()
@@ -397,18 +564,18 @@ function UIZoneServerList:LoadFavorites()
                             if e and #fav_buffer < MAX_FAVORITES then
                                 e.is_fav = true
                                 e.status = "Favorite"
-                                fav_buffer[#fav_buffer+1] = e
+                                fav_buffer[#fav_buffer + 1] = e
                             end
                         elseif current_section == HISTORY_SEC:lower() then
                             local e = parse_entry(v, false)
                             if e and #hist_buffer < MAX_HISTORY then
                                 e.is_fav = false
                                 e.status = "Recent"
-                                hist_buffer[#hist_buffer+1] = e
+                                hist_buffer[#hist_buffer + 1] = e
                             end
                         elseif current_section == LEGACY_SEC:lower() then
-                            local e = parse_legacy_history(v)
-                            if e then legacy_buffer[#legacy_buffer+1] = e end
+                            local e = parse_entry(v, false)
+                            if e then legacy_buffer[#legacy_buffer + 1] = e end
                         elseif current_section == IDENTITY_SEC:lower() or current_section == "" then
                             if k == "nickname" then
                                 self.nick = sanitize_nickname(v)
@@ -424,371 +591,77 @@ function UIZoneServerList:LoadFavorites()
         end)
         pcall(function() file:close() end)
         if ok_lines then
-            -- Migrate legacy if new sections empty
             if #fav_buffer == 0 and #hist_buffer == 0 and #legacy_buffer > 0 then
                 for _, e in ipairs(legacy_buffer) do
                     if #fav_buffer < MAX_FAVORITES then
                         e.is_fav = true
                         e.status = "Favorite"
-                        fav_buffer[#fav_buffer+1] = e
+                        fav_buffer[#fav_buffer + 1] = e
                     elseif #hist_buffer < MAX_HISTORY then
                         e.is_fav = false
                         e.status = "Recent"
-                        hist_buffer[#hist_buffer+1] = e
+                        hist_buffer[#hist_buffer + 1] = e
                     end
                 end
             end
-
             self.favorites = fav_buffer
-            self.history   = hist_buffer
+            self.history = hist_buffer
         end
     end
 
-    if zone_main and zone_main.get_config then
-        local cfg = zone_main.get_config()
-        if cfg.client_uuid and self.uuid == "anonymous" then self.uuid = cfg.client_uuid end
-        if cfg.hwid_hash and self.hwid == 0 then self.hwid = cfg.hwid_hash end
-        if cfg.nickname and self.nick == "Stalker" then self.nick = sanitize_nickname(cfg.nickname) end
-    end
+    pcall(function()
+        if zone_main and zone_main.get_config then
+            local cfg = zone_main.get_config()
+            if cfg.client_uuid and (self.uuid == nil or self.uuid == "" or self.uuid == "anonymous") then
+                self.uuid = cfg.client_uuid
+            end
+            if cfg.hwid_hash and self.hwid == 0 then self.hwid = cfg.hwid_hash end
+            if cfg.nickname and self.nick == "Stalker" then self.nick = sanitize_nickname(cfg.nickname) end
+        end
+    end)
 
     if #self.favorites == 0 and #self.history == 0 then
+        local ts = now_timestamp()
         self.favorites[1] = {
-            label    = "Local Dev Server",
-            ip       = "127.0.0.1",
-            port     = 27015,
-            is_fav   = true,
-            status   = "Favorite",
-            lastSeen = now_timestamp(),
-            added    = now_timestamp()
+            label = "Local Dev Server",
+            ip = "127.0.0.1",
+            port = DEFAULT_PORT,
+            is_fav = true,
+            status = "Favorite",
+            lastSeen = ts,
+            added = ts,
+            state = nil,
+            query = nil
         }
     end
 
-    -- Sort history newest first
-    table.sort(self.history, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
+    table.sort(self.history, function(a, b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
 
     pcall(function() if self.edit_nick then self.edit_nick:SetText(self.nick) end end)
-    -- Default direct-connect fields: prefer selected favorite, else first hist, else localhost
-    local seed = self.favorites[1] or self.history[1]
+    local seed = self.sel_entry or self.favorites[1] or self.history[1]
     if seed then
         pcall(function() if self.edit_ip then self.edit_ip:SetText(seed.ip) end end)
         pcall(function() if self.edit_port then self.edit_port:SetText(tostring(seed.port)) end end)
     end
-    if self.edit_search then pcall(function() self.edit_search:SetText("") end) end
 
-    self:RefreshList()
+    if self.list_servers then self:RefreshList() end
 end
 
--- ------------------------------------------------------------
--- Filtering + sorting
--- ------------------------------------------------------------
-
-local function entry_matches_search(entry, q)
-    if q == "" then return true end
-    local hay = (entry.label .. " " .. entry.ip .. ":" .. tostring(entry.port)):lower()
-    return hay:find(q, 1, true) ~= nil
-end
-
-function UIZoneServerList:GetFilteredList()
-    local out = {}
-    local q = sanitize_search(self.search_query)
-
-    local function push_if_match(e)
-        if entry_matches_search(e, q) then out[#out+1] = e end
-    end
-
-    if self.filter_mode == FILTER_FAV then
-        for _, e in ipairs(self.favorites) do push_if_match(e) end
-        table.sort(out, function(a,b) return a.label:lower() < b.label:lower() end)
-    elseif self.filter_mode == FILTER_HIST then
-        for _, e in ipairs(self.history) do push_if_match(e) end
-        table.sort(out, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
-    else -- ALL: fav first (alpha), then history (time)
-        local favs = {}
-        local hists = {}
-        for _, e in ipairs(self.favorites) do if entry_matches_search(e,q) then favs[#favs+1]=e end end
-        for _, e in ipairs(self.history) do if entry_matches_search(e,q) then hists[#hists+1]=e end end
-        table.sort(favs, function(a,b) return a.label:lower() < b.label:lower() end)
-        table.sort(hists, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
-        for _, e in ipairs(favs) do out[#out+1]=e end
-        for _, e in ipairs(hists) do out[#out+1]=e end
-    end
-    return out
-end
-
-function UIZoneServerList:RefreshList()
-    if not self.list_servers then return end
-    self.filtered = self:GetFilteredList()
-    self.list_servers:RemoveAll()
-
-    for _, entry in ipairs(self.filtered) do
-        -- Icon prefix: [F] fav, [ ] recent, (..) connecting, (o) connected/failed
-        local icon = entry.is_fav and "[F] " or "[ ] "
-        local status = entry.status or (entry.is_fav and "Favorite" or "Recent")
-        -- Map status to short badge
-        if status == "Connecting" then icon = "(..) "
-        elseif status == "Connected" then icon = "(o) "
-        elseif status == "Failed" then icon = "(o) "
-        elseif status == "Favorite" then icon = "[F] "
-        else icon = entry.is_fav and "[F] " or "[ ] " end
-
-        local badge = status
-        if status == "Favorite" then badge = "Fav"
-        elseif status == "Recent" then badge = "Recent"
-        elseif status == "Saved" then badge = entry.is_fav and "Fav" or "Recent"
-        end
-
-        local label = entry.label or "Server"
-        if #label > 24 then label = label:sub(1, 24) end
-        local display = string.format("%s%-24s  %-15s  %-5d  %s",
-            icon, label, entry.ip, entry.port, badge)
-        self.list_servers:AddTextItem(display)
-    end
-
-    -- Empty hint toggle
-    pcall(function()
-        if not self.empty_hint then return end
-        local show = (#self.filtered == 0)
-        if self.empty_hint.Show then self.empty_hint:Show(show) end
-    end)
-
-    self.sel_idx = nil
-    self.sel_entry = nil
-    pcall(function() self:UpdateDetails(nil) end)
-
-    -- Keep tab visuals in sync (also called from tab handlers)
-    pcall(function() self:UpdateTabVisuals() end)
-end
-
-function UIZoneServerList:UpdateDetails(entry)
-    pcall(function()
-        if not self.details_label then return end
-        local text = "Selected: -"
-        if entry then
-            local favIcon = entry.is_fav and "[F] Favorite" or "[ ] Recent"
-            local seen = ""
-            if entry.lastSeen and entry.lastSeen > 0 then
-                -- human-ish: show raw timestamp shortened; engine has no os.date guarantee
-                seen = string.format(" | last %d", entry.lastSeen % 100000)
-            end
-            text = string.format("Selected: %s  |  %s:%d  |  %s%s",
-                entry.label or "Server", entry.ip, entry.port, favIcon, seen)
-        else
-            if #self.filtered == 0 then
-                text = "No servers - type address below, press [F] Fav to save"
-            else
-                text = string.format("%d server(s) | Tab: %s  |  Filter: %s",
-                    #self.filtered,
-                    self.filter_mode == FILTER_FAV and "Favorites" or self.filter_mode == FILTER_HIST and "Recent" or "All",
-                    self.search_query ~= "" and ("\""..self.search_query.."\"") or "-")
-            end
-        end
-        if self.details_label.TextControl then
-            self.details_label:TextControl():SetText(text)
-        elseif self.details_label.SetText then
-            self.details_label:SetText(text)
-        end
-    end)
-end
-
-function UIZoneServerList:UpdateTabVisuals()
-    local function set_btn_color(btn, active)
-        if not btn then return end
-        pcall(function()
-            local tc = nil
-            if btn.TextControl then tc = btn:TextControl() end
-            if tc and tc.SetTextColor then
-                if active then
-                    local c = GetARGB and GetARGB(255, 255, 215, 5) or 0xFFFFD705
-                    tc:SetTextColor(c)
-                else
-                    local c = GetARGB and GetARGB(255, 200, 200, 200) or 0xFFC8C8C8
-                    tc:SetTextColor(c)
-                end
-            end
-        end)
-    end
-    set_btn_color(self.btn_tab_all,  self.filter_mode == FILTER_ALL)
-    set_btn_color(self.btn_tab_fav,  self.filter_mode == FILTER_FAV)
-    set_btn_color(self.btn_tab_hist, self.filter_mode == FILTER_HIST)
-end
-
--- ------------------------------------------------------------
--- SetStatus - themed footer + optional color by state
--- ------------------------------------------------------------
-function UIZoneServerList:SetStatus(text)
-    self.status_text = text or "Ready"
-    pcall(function()
-        printf(string.format("Zone UI: %s", tostring(self.status_text)))
-    end)
-    pcall(function()
-        if not self.status_label then return end
-        local low = self.status_text:lower()
-        local color = nil
-        if low:find("connected") then
-            color = GetARGB and GetARGB(255, 80, 220, 80) or 0xFF50DC50
-        elseif low:find("failed") or low:find("error") or low:find("banned") or low:find("full") then
-            color = GetARGB and GetARGB(255, 220, 70, 70) or 0xFFDC4646
-        elseif low:find("connecting") or low:find("connect") then
-            color = GetARGB and GetARGB(255, 255, 195, 5) or 0xFFFFC305
-        else
-            color = GetARGB and GetARGB(255, 255, 215, 0) or 0xFFFFD700
-        end
-        local full = "(o) " .. tostring(self.status_text)
-        -- Connected gets green dot, failed red, etc - already colored via TextColor
-        if self.status_label.TextControl then
-            local tc = self.status_label:TextControl()
-            if tc then
-                if tc.SetText then tc:SetText(full) end
-                if color and tc.SetTextColor then tc:SetTextColor(color) end
-            end
-        elseif self.status_label.SetText then
-            self.status_label:SetText(full)
-            if color and self.status_label.SetTextColor then
-                self.status_label:SetTextColor(color)
-            end
-        end
-    end)
-end
-
--- ------------------------------------------------------------
--- Update - per-frame: connection poll + search poll (2 Hz, pcall-safe)
--- ------------------------------------------------------------
-function UIZoneServerList:Update()
-    pcall(function() CUIScriptWnd.Update(self) end)
-
-    -- Search box polling (cheap, ~4 Hz) - catches typing without EDIT_TEXT_COMMIT
-    pcall(function()
-        if not self.edit_search then return end
-        local now_ms = nil
-        if time_global then now_ms = time_global() end
-        if not now_ms and time_continual then now_ms = time_continual() * 1000 end
-        if not now_ms then return end
-        if self.last_search_poll and (now_ms - self.last_search_poll) < 250 then return end
-        self.last_search_poll = now_ms
-        local txt = ""
-        pcall(function() txt = self.edit_search:GetText() or "" end)
-        -- Don't treat rename staging text as search when rename_pending
-        if self.rename_pending then return end
-        local q = sanitize_search(txt)
-        if q ~= sanitize_search(self.search_query) then
-            self.search_query = txt:match("^%s*(.-)%s*$") or ""
-            self:RefreshList()
-        end
-    end)
-
-    pcall(function()
-        if not self.connect_pending then return end
-        local now_ms = nil
-        pcall(function() if time_global then now_ms = time_global() end end)
-        if not now_ms and time_continual then pcall(function() now_ms = time_continual() * 1000 end) end
-        if not now_ms then return end
-        if self.last_status_poll and (now_ms - self.last_status_poll) < 500 then return end
-        self.last_status_poll = now_ms
-
-        local connected = false
-        pcall(function()
-            if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
-        end)
-        if connected then
-            self.connect_pending = false
-            local ip_s = tostring(self.connect_ip or "")
-            local port_s = tostring(self.connect_port or "")
-            pcall(function()
-                local function mark_connected(list)
-                    for _, e in ipairs(list) do
-                        if e.ip == self.connect_ip and e.port == self.connect_port then
-                            e.status = "Connected"
-                            e.lastSeen = now_timestamp()
-                        end
-                    end
-                end
-                mark_connected(self.favorites)
-                mark_connected(self.history)
-            end)
-            pcall(function() self:RefreshList() end)
-            -- Also reselect the connected entry for details
-            pcall(function()
-                for idx, e in ipairs(self.filtered) do
-                    if e.ip == self.connect_ip and e.port == self.connect_port then
-                        self.sel_idx = idx - 1
-                        self.sel_entry = e
-                        self:UpdateDetails(e)
-                        break
-                    end
-                end
-            end)
-            self:SetStatus(string.format("Connected to %s:%s - start or load a game", ip_s, port_s))
-            return
-        end
-        local elapsed = now_ms - (self.connect_start or now_ms)
-        if elapsed > 16000 then
-            self.connect_pending = false
-            pcall(function()
-                local function mark_failed(list)
-                    for _, e in ipairs(list) do
-                        if e.ip == self.connect_ip and e.port == self.connect_port then e.status = "Failed" end
-                    end
-                end
-                mark_failed(self.favorites)
-                mark_failed(self.history)
-            end)
-            pcall(function() self:RefreshList() end)
-            local reason = ""
-            pcall(function()
-                if ZoneNet and ZoneNet.GetLastError then reason = ZoneNet:GetLastError() or "" end
-            end)
-            if reason ~= nil and reason ~= "" then
-                self:SetStatus(string.format("Failed - %s", tostring(reason)))
-            else
-                self:SetStatus("Failed - server unreachable, see xray log")
-            end
-        end
-    end)
-end
-
--- ------------------------------------------------------------
--- Persistence - io-only, handles both new sections + legacy
--- ------------------------------------------------------------
 function UIZoneServerList:SaveFavorites()
     local target_path = get_identity_path()
     local lines = {}
-    local in_fav = false
-    local in_hist = false
-    local in_legacy = false
-    local fav_written = false
-    local hist_written = false
-    local legacy_written = false
 
-    local ok_read, file_or_err = pcall(io.open, target_path, "r")
-    local file = ok_read and file_or_err or nil
-    if file then
+    local ok_read, file = pcall(io.open, target_path, "r")
+    local in_block = false
+    if ok_read and file then
         local ok_lines = pcall(function()
             for line in file:lines() do
                 local sec = line:match("^%s*%[([^%]]+)%]")
                 if sec then
-                    if in_fav and not fav_written then
-                        self:_emit_favorites_block(lines)
-                        fav_written = true
-                    end
-                    if in_hist and not hist_written then
-                        self:_emit_history_block(lines)
-                        hist_written = true
-                    end
-                    if in_legacy and not legacy_written then
-                        lines[#lines + 1] = ""
-                        lines[#lines + 1] = "[" .. LEGACY_SEC .. "]"
-                        legacy_written = true
-                    end
                     local low = sec:lower()
-                    in_fav = (low == FAVORITES_SEC:lower())
-                    in_hist = (low == HISTORY_SEC:lower())
-                    in_legacy = (low == LEGACY_SEC:lower())
-                    if not in_fav and not in_hist and not in_legacy then
-                        lines[#lines + 1] = line
-                    elseif in_fav or in_hist or in_legacy then
-                        -- Skip old block lines; we re-emit below
-                    end
-                elseif not in_fav and not in_hist and not in_legacy then
+                    in_block = (low == FAVORITES_SEC or low == HISTORY_SEC or low == LEGACY_SEC)
+                    if not in_block then lines[#lines + 1] = line end
+                elseif not in_block then
                     local k = line:match("^%s*([%w_]+)%s*=")
                     if k and k:lower() == "nickname" and self.nick then
                         lines[#lines + 1] = "nickname = " .. sanitize_nickname(self.nick)
@@ -800,444 +673,916 @@ function UIZoneServerList:SaveFavorites()
         end)
         pcall(function() file:close() end)
         if not ok_lines then
-            printf("Zone UI Error: Failed reading favorites file")
+            printf("Zone UI Error: failed reading identity file")
             return false
         end
     end
 
-    if not fav_written then self:_emit_favorites_block(lines) end
-    if not hist_written then self:_emit_history_block(lines) end
-    -- Ensure legacy section exists but empty to avoid stale readers
-    if not legacy_written then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "[" .. LEGACY_SEC .. "]"
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "[" .. FAVORITES_SEC .. "]"
+    for i, entry in ipairs(self.favorites) do
+        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|1|%d",
+            i - 1, entry.label or (entry.ip .. ":" .. tostring(entry.port)), entry.ip, entry.port,
+            entry.lastSeen or now_timestamp())
     end
 
-    local ok_open, out_or_err = pcall(io.open, target_path, "w")
-    local out = ok_open and out_or_err or nil
-    if not out then
-        printf("Zone UI Error: Failed to open favorites file for saving")
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "[" .. HISTORY_SEC .. "]"
+    for i, entry in ipairs(self.history) do
+        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|0|%d",
+            i - 1, entry.label or (entry.ip .. ":" .. tostring(entry.port)), entry.ip, entry.port,
+            entry.lastSeen or now_timestamp())
+    end
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "[" .. LEGACY_SEC .. "]"
+
+    local ok_open, out = pcall(io.open, target_path, "w")
+    if not ok_open or not out then
+        printf("Zone UI Error: failed to open identity file for saving")
         return false
     end
     local write_ok = true
-    local ok_write = pcall(function()
+    pcall(function()
         for _, l in ipairs(lines) do
-            local ok = out:write(l .. "\n")
-            if not ok then write_ok = false; break end
+            if out:write(l .. "\n") == nil then write_ok = false break end
         end
     end)
     pcall(function() out:close() end)
-    if not ok_write or not write_ok then
-        printf("Zone UI Error: Failed writing favorites data")
+    if not write_ok then
+        printf("Zone UI Error: failed writing identity file")
         return false
     end
     return true
 end
 
-function UIZoneServerList:_emit_favorites_block(lines)
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "[" .. FAVORITES_SEC .. "]"
-    for i, entry in ipairs(self.favorites) do
-        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|1|%d",
-            i - 1, entry.label or (entry.ip .. ":" .. entry.port), entry.ip, entry.port, entry.lastSeen or now_timestamp())
+function UIZoneServerList:GetView()
+    local out = {}
+    local seen = {}
+    local function push(e)
+        local key = e.ip .. ":" .. tostring(e.port)
+        if seen[key] then return end
+        seen[key] = true
+        out[#out + 1] = e
     end
-end
 
-function UIZoneServerList:_emit_history_block(lines)
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "[" .. HISTORY_SEC .. "]"
-    for i, entry in ipairs(self.history) do
-        lines[#lines + 1] = string.format("entry_%d = %s|%s:%d|0|%d",
-            i - 1, entry.label or (entry.ip .. ":" .. entry.port), entry.ip, entry.port, entry.lastSeen or now_timestamp())
+    if self.tab_id == TAB_FAVORITES then
+        for _, e in ipairs(self.favorites) do push(e) end
+        table.sort(out, function(a, b) return (a.label or ""):lower() < (b.label or ""):lower() end)
+    elseif self.tab_id == TAB_DIRECT then
+        return out
+    else
+        local favs = {}
+        local hists = {}
+        for _, e in ipairs(self.favorites) do favs[#favs + 1] = e end
+        for _, e in ipairs(self.history) do hists[#hists + 1] = e end
+        table.sort(favs, function(a, b) return (a.label or ""):lower() < (b.label or ""):lower() end)
+        table.sort(hists, function(a, b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
+        for _, e in ipairs(favs) do push(e) end
+        for _, e in ipairs(hists) do push(e) end
     end
+    return out
 end
 
--- ============================================================
--- Event Handlers
--- ============================================================
+function UIZoneServerList:AddRow(entry, index)
+    local info = entry.query
+    local online = entry.state == "online"
+    local locked = info and tonumber(info.locked or 0) ~= 0
 
-local function find_entry_by_addr(list, ip, port)
-    for idx, e in ipairs(list) do if e.ip == ip and e.port == port then return e, idx end end
-    return nil, nil
+    local icon_tex = LAMP_OFF
+    local icon_col = argb(255, 130, 130, 124)
+    if entry.state == "offline" then
+        icon_tex, icon_col = LAMP_RED, argb(255, 200, 70, 70)
+    elseif online and locked then
+        icon_tex, icon_col = LAMP_RED, argb(255, 230, 90, 90)
+    elseif online then
+        icon_tex, icon_col = LAMP_GREEN, argb(255, 110, 220, 110)
+    end
+
+    local item = CUIListBoxItem(ROW_H)
+    local font = GetFontLetterica16Russian and GetFontLetterica16Russian() or nil
+
+    local icon = item:AddIconField(24)
+    if icon then
+        icon:InitTexture(icon_tex)
+        icon:SetTextureColor(icon_col)
+    end
+
+    local name = entry.query and entry.query.name
+    if not name or name == "" then name = entry.label end
+    if not name or name == "" then name = entry.ip .. ":" .. tostring(entry.port) end
+    local f_name = item:AddTextField(clip_text(name, 22), 128)
+    if f_name then
+        if font then f_name:SetFont(font) end
+        f_name:SetTextColor(entry.is_fav and argb(255, 255, 210, 90) or WHITE)
+    end
+
+    local map_txt = (info and info.map and info.map ~= "") and info.map or "-"
+    local f_map = item:AddTextField(clip_text(map_txt, 12), 78)
+    if f_map then
+        if font then f_map:SetFont(font) end
+        f_map:SetTextColor(GRAY)
+    end
+
+    local pl_txt = (info and tonumber(info.maxPlayers)) and string.format("%d/%d", info.players or 0, info.maxPlayers) or "-"
+    local f_pl = item:AddTextField(pl_txt, 52)
+    if f_pl then
+        if font then f_pl:SetFont(font) end
+        f_pl:SetTextColor(online and argb(255, 150, 220, 150) or GRAY)
+    end
+
+    local ping_txt = (info and tonumber(info.ping_ms)) and string.format("%d", math.floor(info.ping_ms)) or "-"
+    local f_ping = item:AddTextField(ping_txt, 46)
+    if f_ping then
+        if font then f_ping:SetFont(font) end
+        local c = GRAY
+        if info and tonumber(info.ping_ms) then
+            local p = tonumber(info.ping_ms)
+            if p <= 80 then c = argb(255, 120, 220, 120)
+            elseif p <= 180 then c = argb(255, 235, 200, 80)
+            else c = argb(255, 225, 90, 90) end
+        end
+        f_ping:SetTextColor(c)
+    end
+
+    local mode_txt = info and mode_name(info.mode) or "-"
+    local f_mode = item:AddTextField(clip_text(mode_txt, 10), 70)
+    if f_mode then
+        if font then f_mode:SetFont(font) end
+        f_mode:SetTextColor(GRAY)
+    end
+
+    item:SetTAG(index)
+    self.list_servers:AddExistingItem(item)
 end
 
-function UIZoneServerList:OnConnect()
-    local ok, err = pcall(function()
-        local ip   = self.edit_ip   and self.edit_ip:GetText()   or ""
-        local port = self.edit_port and self.edit_port:GetText() or ""
-        local nick = self.edit_nick and self.edit_nick:GetText() or ""
-        ip   = ip:match("^%s*(.-)%s*$") or ""
-        port = port:match("^%s*(.-)%s*$") or ""
-        nick = nick:match("^%s*(.-)%s*$") or ""
-        if ip == "" then
-            printf("Zone: Cannot connect - empty server IP")
-            pcall(function() self:SetStatus("Enter server IP first") end)
-            return
-        end
-        local port_n = tonumber(port)
-        if not port_n or port_n < 1 or port_n > 65535 then
-            printf("Zone: Cannot connect - invalid port")
-            pcall(function() self:SetStatus("Invalid port (1-65535)") end)
-            return
-        end
-        nick = sanitize_nickname(nick)
-        self.nick = nick
+function UIZoneServerList:RefreshList()
+    if not self.list_servers then return end
+    local keep = self.sel_entry and (self.sel_entry.ip .. ":" .. tostring(self.sel_entry.port)) or nil
 
-        local xrr_busy = false
-        pcall(function()
-            if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_busy = true end
-            if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_busy = true end
-            if _G.XrrNet then
-                local okc, connected = pcall(function() return _G.XrrNet():IsConnected() end)
-                if okc and connected then xrr_busy = true end
-                local okh, listening = pcall(function() return _G.XrrNet():IsListening() end)
-                if okh and listening then xrr_busy = true end
+    self.rows = self:GetView()
+    pcall(function() self.list_servers:RemoveAll() end)
+
+    for i = 1, #self.rows do
+        local entry = self.rows[i]
+        local ok = pcall(function() self:AddRow(entry, i) end)
+        if not ok then break end
+    end
+
+    self.sel_entry = nil
+    if keep then
+        for i = 1, #self.rows do
+            local e = self.rows[i]
+            if (e.ip .. ":" .. tostring(e.port)) == keep then
+                self.sel_entry = e
+                pcall(function() self.list_servers:SetSelectedIndex(i - 1) end)
+                self:EnsureRowVisible(i - 1)
+                break
             end
-        end)
-        if xrr_busy then
-            printf("Zone: Cannot connect - xrRazom co-op session is active.")
-            pcall(function() self:SetStatus("Busy - xrRazom co-op is active") end)
-            return
         end
+    end
 
-        local dll_ok = false
-        pcall(function()
-            if zone_net and zone_net.is_client_loaded and zone_net.is_client_loaded() then dll_ok = true end
-        end)
-        if not dll_ok then
-            printf("Zone: ZoneNet DLL missing, cannot connect.")
-            pcall(function() self:SetStatus("DLL missing - inject ZoneClient first") end)
-            return
+    if not self.sel_entry then
+        local idx = self:SelectedIndexSafe()
+        if idx >= 0 then self.sel_entry = self.rows[idx + 1] end
+    end
+
+    self:UpdateEmptyState()
+    self:UpdateDetails()
+end
+
+function UIZoneServerList:SelectedIndexSafe()
+    local idx = -1
+    pcall(function()
+        if self.list_servers and self.list_servers.GetSelectedIndex then
+            local raw = self.list_servers:GetSelectedIndex()
+            if type(raw) == "number" and raw >= 0 and raw < 100000 then idx = math.floor(raw) end
         end
+    end)
+    if not self.rows or idx < 0 or idx >= #self.rows then return -1 end
+    return idx
+end
 
-        printf(string.format("Zone UI: Connecting to %s:%s as %s UUID %s HWID %s",
-            tostring(ip), tostring(port_n), tostring(nick), tostring(self.uuid), tostring(self.hwid)))
-        pcall(function()
-            if ZoneNet and ZoneNet.Connect then
-                ZoneNet:Connect(ip, port_n, self.uuid, self.hwid, nick)
-            end
-        end)
+function UIZoneServerList:EnsureRowVisible(idx)
+    if not self.list_servers then return end
+    pcall(function()
+        local h = self.list_servers:GetHeight() or 0
+        local pos = self.list_servers:GetCurrentScrollPos() or 0
+        local top = idx * ROW_H
+        local bottom = top + ROW_H
+        if top < pos then
+            pos = top
+        elseif bottom > pos + h then
+            pos = bottom - h
+        end
+        self.list_servers:SetScrollPos(pos)
+    end)
+end
 
-        -- Upsert into history (recents), bump lastSeen, dedup favorites as well
-        local ts = now_timestamp()
-        local found_fav, _ = find_entry_by_addr(self.favorites, ip, port_n)
-        local found_hist, hist_idx = find_entry_by_addr(self.history, ip, port_n)
-        if found_fav then
-            found_fav.lastSeen = ts
-            found_fav.status = "Connecting"
-        elseif found_hist then
-            found_hist.lastSeen = ts
-            found_hist.status = "Connecting"
-            -- Move to front by re-sort (RefreshList sorts)
+function UIZoneServerList:MoveSelection(delta)
+    if not self.list_servers or #self.rows == 0 then return end
+    local idx = self:SelectedIndexSafe()
+    if idx < 0 then
+        idx = delta > 0 and -1 or 0
+    end
+    idx = idx + delta
+    if idx < 0 then idx = 0 end
+    if idx > #self.rows - 1 then idx = #self.rows - 1 end
+    pcall(function() self.list_servers:SetSelectedIndex(idx) end)
+    self.sel_entry = self.rows[idx + 1]
+    pcall(function() if self.edit_ip and self.sel_entry then self.edit_ip:SetText(self.sel_entry.ip) end end)
+    pcall(function() if self.edit_port and self.sel_entry then self.edit_port:SetText(tostring(self.sel_entry.port)) end end)
+    self:UpdateDetails()
+    self:EnsureRowVisible(idx)
+end
+
+function UIZoneServerList:UpdateEmptyState()
+    local direct = self:IsDirectTab()
+    local count = (type(self.rows) == "table") and #self.rows or 0
+    local empty = (not direct) and (count == 0)
+
+    if self.empty_title then pcall(function() self.empty_title:Show(empty) end) end
+    if self.empty_hint then pcall(function() self.empty_hint:Show(empty) end) end
+    if not empty then return end
+
+    local title = (self.state == STATE_SCANNING) and tr("ui_zone_scanning") or tr("ui_zone_empty_title")
+    set_widget_text(self.empty_title, title, AMBER)
+
+    local hint = tr("ui_zone_empty_hint")
+    if self.broadcast_hit and self.broadcast_hit.name and self.broadcast_hit.name ~= "" then
+        hint = self.broadcast_hit.name
+        if self.broadcast_hit.map and self.broadcast_hit.map ~= "" then
+            hint = hint .. " (" .. self.broadcast_hit.map .. ")"
+        end
+    end
+    set_widget_text(self.empty_hint, hint, DIM)
+end
+
+function UIZoneServerList:UpdateDetails()
+    if not self.details_body then return end
+    local e = self.sel_entry
+    if not e then
+        set_widget_text(self.details_body, tr("ui_zone_empty_title"), DIM)
+        return
+    end
+
+    local info = e.query or {}
+    local name = (info.name and info.name ~= "") and info.name or (e.label or "-")
+    local lines = {}
+    lines[#lines + 1] = "%c[0,255,210,90]" .. name
+    lines[#lines + 1] = field_text("ui_zone_direct_host", e.ip .. ":" .. tostring(e.port))
+    lines[#lines + 1] = field_text("ui_zone_col_map", (info.map and info.map ~= "") and info.map or "-")
+    lines[#lines + 1] = field_text("ui_zone_col_players",
+        tonumber(info.maxPlayers) and string.format("%d/%d", info.players or 0, info.maxPlayers) or "-")
+    lines[#lines + 1] = field_text("ui_zone_col_ping",
+        tonumber(info.ping_ms) and (tostring(math.floor(info.ping_ms)) .. " ms") or "-")
+    lines[#lines + 1] = field_text("ui_zone_col_mode", tonumber(info.mode) and mode_name(info.mode) or "-")
+    lines[#lines + 1] = field_text("ui_zone_lock", (info.locked ~= nil) and ((tonumber(info.locked) ~= 0) and "1" or "0") or "-")
+    lines[#lines + 1] = field_text("ui_zone_last_seen", age_text(e.lastSeen))
+    set_widget_text(self.details_body, table.concat(lines, "\\n"), nil)
+end
+
+function UIZoneServerList:UpdateStatus()
+    local state = self.state or STATE_IDLE
+    local text, color, lamp
+    if state == STATE_SCANNING then
+        text, color, lamp = tr("ui_zone_scanning"), AMBER, LAMP_OFF
+    elseif state == STATE_CONNECTING then
+        text, color, lamp = tr("ui_zone_connecting"), AMBER, LAMP_OFF
+    elseif state == STATE_CONNECTED then
+        text, color, lamp = tr("ui_zone_connected"), GREEN, LAMP_GREEN
+    elseif state == STATE_FAILED then
+        text, color, lamp = tr("ui_zone_failed"), RED, LAMP_RED
+    else
+        if self:NetAvailable() then
+            text, color, lamp = tr("ui_zone_status_ready"), AMBER, LAMP_OFF
         else
-            -- Insert into history (LRU, newest first - sort handles order)
-            if #self.history >= MAX_HISTORY then
-                pcall(function()
-                    table.sort(self.history, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
-                    table.remove(self.history, #self.history)
-                end)
-            end
-            self.history[#self.history + 1] = {
-                label = string.format("%s:%s", tostring(ip), tostring(port_n)),
-                ip = ip, port = port_n, is_fav = false, status = "Connecting", lastSeen = ts, added = ts
-            }
+            text, color, lamp = tr("ui_zone_status_offline"), RED, LAMP_RED
         end
+    end
+    if self.state_detail and self.state_detail ~= "" and state ~= STATE_IDLE then
+        text = text .. ": " .. self.state_detail
+    end
+    set_widget_text(self.status_label, text, color)
+    set_widget_text(self.status_header, text, color)
+    if self.header_lamp then
+        pcall(function() self.header_lamp:InitTexture(lamp) end)
+    end
+end
 
-        pcall(function() self:SaveFavorites() end)
+function UIZoneServerList:SetState(state, detail)
+    self.state = state or STATE_IDLE
+    self.state_detail = detail or ""
+    self:UpdateStatus()
+    self:UpdateEmptyState()
+end
+
+function UIZoneServerList:UpdateDirectVisibility()
+    local direct = self:IsDirectTab()
+    local function show(w, v)
+        if w and w.Show then pcall(function() w:Show(v) end) end
+    end
+    show(self.list_servers, not direct)
+    show(self.list_frame, not direct)
+    show(self.col_name, not direct)
+    show(self.col_map, not direct)
+    show(self.col_players, not direct)
+    show(self.col_ping, not direct)
+    show(self.col_mode, not direct)
+    show(self.details_bg, not direct)
+    show(self.details_title, not direct)
+    show(self.details_body, not direct)
+    show(self.direct_bg, direct)
+    show(self.direct_title, direct)
+    show(self.host_label, direct)
+    show(self.host_bg, direct)
+    show(self.edit_ip, direct)
+    show(self.port_label, direct)
+    show(self.port_bg, direct)
+    show(self.edit_port, direct)
+    show(self.nick_label, direct)
+    show(self.nick_bg, direct)
+    show(self.edit_nick, direct)
+    if direct then
+        self.edit_focus = 1
+        self:ApplyEditFocus()
+    else
+        self:ReleaseEditFocus()
+    end
+    self:UpdateEmptyState()
+end
+
+function UIZoneServerList:ApplyEditFocus()
+    local focus = self.edit_focus or 0
+    local edits = { self.edit_ip, self.edit_port, self.edit_nick }
+    for i = 1, #edits do
+        local e = edits[i]
+        if e and e.CaptureFocus then
+            pcall(function() e:CaptureFocus(i == focus) end)
+        end
+    end
+end
+
+function UIZoneServerList:ReleaseEditFocus()
+    self.edit_focus = 0
+    local edits = { self.edit_ip, self.edit_port, self.edit_nick }
+    for i = 1, #edits do
+        local e = edits[i]
+        if e and e.CaptureFocus then
+            pcall(function() e:CaptureFocus(false) end)
+        end
+    end
+end
+
+function UIZoneServerList:GetEditText(edit)
+    local raw = ""
+    if edit then pcall(function() raw = edit:GetText() or "" end) end
+    return (raw:match("^%s*(.-)%s*$")) or ""
+end
+
+function UIZoneServerList:CurrentPort()
+    local port = tonumber(self:GetEditText(self.edit_port))
+    if port and port >= 1 and port <= 65535 then return math.floor(port) end
+    if self.rows and self.rows[1] and tonumber(self.rows[1].port) then
+        return tonumber(self.rows[1].port)
+    end
+    return DEFAULT_PORT
+end
+
+function UIZoneServerList:FindEntry(ip, port)
+    local e = find_entry_by_addr(self.favorites, ip, port)
+    if e then return e end
+    e = find_entry_by_addr(self.history, ip, port)
+    return e
+end
+
+function UIZoneServerList:UpsertHistory(ip, port)
+    local ts = now_timestamp()
+    local fav = find_entry_by_addr(self.favorites, ip, port)
+    if fav then
+        fav.lastSeen = ts
+        return fav
+    end
+    local hist = find_entry_by_addr(self.history, ip, port)
+    if hist then
+        hist.lastSeen = ts
+        return hist
+    end
+    if #self.history >= MAX_HISTORY then
+        table.sort(self.history, function(a, b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
+        table.remove(self.history, #self.history)
+    end
+    local entry = {
+        label = string.format("%s:%d", ip, port),
+        ip = ip,
+        port = port,
+        is_fav = false,
+        status = "Recent",
+        lastSeen = ts,
+        added = ts,
+        state = nil,
+        query = nil
+    }
+    self.history[#self.history + 1] = entry
+    return entry
+end
+
+function UIZoneServerList:StartScan()
+    if self.scan_active or self.state == STATE_CONNECTING then return end
+    if self:IsDirectTab() then return end
+    if not self:NetAvailable() then
+        self:SetState(STATE_IDLE)
+        return
+    end
+    if not self:ClientLoaded() then
+        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        return
+    end
+
+    local queue = {}
+    local view = self:GetView()
+    for _, e in ipairs(view) do
+        queue[#queue + 1] = { ip = e.ip, port = e.port }
+    end
+    if self.tab_id == TAB_LAN then
+        local port = self:CurrentPort()
+        for _ = 1, LAN_PROBE_COUNT do
+            queue[#queue + 1] = { ip = BROADCAST_ADDR, port = port, broadcast = true }
+        end
+    end
+
+    self.broadcast_hit = nil
+    self.scan_queue = queue
+    self.scan_index = 1
+    self.scan_active = (#queue > 0)
+    self.scan_prev_connected = (self.state == STATE_CONNECTED)
+    self.last_scan_step = 0
+    if self.scan_active and not self.scan_prev_connected then
+        self:SetState(STATE_SCANNING)
+    end
+end
+
+function UIZoneServerList:AbortScan()
+    self.scan_active = false
+    self.scan_queue = nil
+    self.scan_index = nil
+    self.scan_prev_connected = false
+end
+
+function UIZoneServerList:ApplyQuery(probe, info)
+    if probe.broadcast then
+        self.broadcast_hit = info
+        self.state_detail = info.name or ""
+        self:UpdateStatus()
+        self:UpdateEmptyState()
+        return false
+    end
+
+    local entry = self:FindEntry(probe.ip, probe.port)
+    if not entry then
+        entry = self:UpsertHistory(probe.ip, probe.port)
+        self.scan_discoveries = true
+    end
+    if not entry then return false end
+
+    entry.query = info
+    entry.state = (tonumber(info.locked or 0) ~= 0) and "locked" or "online"
+    if info.name and info.name ~= "" then
+        entry.label = sanitize_label(info.name, entry.ip, entry.port)
+    end
+    return true
+end
+
+function UIZoneServerList:ApplyOffline(probe)
+    if probe.broadcast then return false end
+    local entry = self:FindEntry(probe.ip, probe.port)
+    if not entry then return false end
+    if entry.state == "offline" then return false end
+    entry.state = "offline"
+    entry.query = nil
+    return true
+end
+
+function UIZoneServerList:ScanStep()
+    if not self.scan_active then return end
+    local now = self:Now()
+    if self.last_scan_step and (now - self.last_scan_step) < SCAN_STEP_MS then return end
+    self.last_scan_step = now
+
+    local probe = self.scan_queue and self.scan_queue[self.scan_index]
+    if not probe then
+        self.scan_active = false
+        if self.scan_discoveries then
+            self.scan_discoveries = false
+            pcall(function() self:SaveFavorites() end)
+        end
+        if self.scan_prev_connected then
+            self.scan_prev_connected = false
+            self:SetState(STATE_CONNECTED, self.state_detail)
+        elseif self.state ~= STATE_CONNECTING and self.state ~= STATE_CONNECTED then
+            self:SetState(STATE_IDLE)
+        end
         pcall(function() self:RefreshList() end)
-
-        pcall(function()
-            self.connect_pending = true
-            self.connect_ip = ip
-            self.connect_port = port_n
-            self.connect_start = 0
-            if time_global then self.connect_start = time_global()
-            elseif time_continual then self.connect_start = time_continual() * 1000 end
-            self.last_status_poll = 0
-        end)
-        pcall(function() self:SetStatus(string.format("Connecting to %s:%s...", tostring(ip), tostring(port_n))) end)
-    end)
-    if not ok then
-        printf("Zone UI Error: Connect failed safely (no crash)")
-        pcall(function() self:SetStatus("Error - see xray log") end)
+        return
     end
-end
+    self.scan_index = self.scan_index + 1
 
-function UIZoneServerList:OnToggleFavorite()
-    -- Toggle starred state for current edit_ip:port or selected entry
-    local ip, port_n = nil, nil
-    local sel = self.sel_entry
-    if sel then
-        ip = sel.ip
-        port_n = sel.port
+    local info = nil
+    pcall(function()
+        local r = ZoneNet:QueryServer(probe.ip, probe.port, SCAN_TIMEOUT_MS)
+        if type(r) == "table" then info = r end
+    end)
+
+    local changed = false
+    if info then
+        changed = self:ApplyQuery(probe, info)
     else
-        ip = self.edit_ip and self.edit_ip:GetText() or ""
-        local port = self.edit_port and self.edit_port:GetText() or ""
-        ip = ip:match("^%s*(.-)%s*$") or ""
-        port = port:match("^%s*(.-)%s*$") or ""
-        if ip == "" or port == "" then
-            pcall(function() self:SetStatus("Select server or enter IP/port to fav") end)
-            return
-        end
-        port_n = tonumber(port)
-        if not port_n or port_n < 1 or port_n > 65535 then
-            pcall(function() self:SetStatus("Invalid port (1-65535)") end)
-            return
-        end
+        changed = self:ApplyOffline(probe)
     end
-
-    local fav_entry, fav_idx = find_entry_by_addr(self.favorites, ip, port_n)
-    local hist_entry, hist_idx = find_entry_by_addr(self.history, ip, port_n)
-
-    if fav_entry then
-        -- Unstar: move from favorites to history
-        table.remove(self.favorites, fav_idx)
-        if not hist_entry then
-            if #self.history >= MAX_HISTORY then
-                pcall(function()
-                    table.sort(self.history, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
-                    table.remove(self.history, #self.history)
-                end)
-            end
-            self.history[#self.history + 1] = {
-                label = fav_entry.label, ip = ip, port = port_n,
-                is_fav = false, status = "Recent", lastSeen = now_timestamp(), added = fav_entry.added or now_timestamp()
-            }
-        end
-        pcall(function() self:SetStatus(string.format("Removed [F] %s", fav_entry.label)) end)
-    else
-        -- Star: move from history or create new favorite
-        local src = hist_entry or { label = string.format("%s:%d", ip, port_n), ip = ip, port = port_n, lastSeen = now_timestamp() }
-        if #self.favorites >= MAX_FAVORITES then
-            pcall(function() self:SetStatus(string.format("Favorites full (%d max) - remove one first", MAX_FAVORITES)) end)
-            return
-        end
-        if hist_entry then table.remove(self.history, hist_idx) end
-        self.favorites[#self.favorites + 1] = {
-            label = src.label or string.format("%s:%d", ip, port_n),
-            ip = ip, port = port_n, is_fav = true, status = "Favorite",
-            lastSeen = now_timestamp(), added = src.added or now_timestamp()
-        }
-        pcall(function() self:SetStatus(string.format("Added [F] %s", src.label)) end)
+    if changed then
+        pcall(function() self:RefreshList() end)
     end
+end
 
-    pcall(function() self:SaveFavorites() end)
-    pcall(function() self:RefreshList() end)
-    self.sel_idx = nil
-    self.sel_entry = nil
-    -- Restore selection to toggled entry if still visible
+function UIZoneServerList:PollConnect()
+    if self.state ~= STATE_CONNECTING then return end
+    local now = self:Now()
+    if self.last_connect_poll and (now - self.last_connect_poll) < CONNECT_POLL_MS then return end
+    self.last_connect_poll = now
+
+    local connected = false
     pcall(function()
-        for idx, e in ipairs(self.filtered) do
-            if e.ip == ip and e.port == port_n and self.filtered[idx] and idx - 1 < #self.filtered then
-                self.sel_idx = idx - 1
-                self.sel_entry = e
-                self:UpdateDetails(e)
-                if self.edit_ip then self.edit_ip:SetText(e.ip) end
-                if self.edit_port then self.edit_port:SetText(tostring(e.port)) end
-                break
+        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+
+    if connected then
+        for _, list in ipairs({ self.favorites, self.history }) do
+            for _, e in ipairs(list) do
+                if e.ip == self.connect_ip and e.port == self.connect_port then
+                    e.state = "online"
+                    e.lastSeen = now_timestamp()
+                end
             end
         end
-    end)
-end
-
--- Legacy alias: old XML binds btn_add_fav to OnAddFavorite - keep compat
-function UIZoneServerList:OnAddFavorite()
-    return self:OnToggleFavorite()
-end
-
-function UIZoneServerList:OnDelFavorite()
-    local entry = self.sel_entry
-    if not entry then
-        pcall(function() self:SetStatus("Select server first") end)
-        return
-    end
-    local ip, port = entry.ip, entry.port
-    local removed = false
-    local fav_e, fav_i = find_entry_by_addr(self.favorites, ip, port)
-    if fav_e then table.remove(self.favorites, fav_i); removed = true end
-    local hist_e, hist_i = find_entry_by_addr(self.history, ip, port)
-    if hist_e then table.remove(self.history, hist_i); removed = true end
-    if not removed then return end
-
-    self.sel_idx = nil
-    self.sel_entry = nil
-    pcall(function() self:SaveFavorites() end)
-    pcall(function() self:RefreshList() end)
-    pcall(function() self:SetStatus(string.format("Removed %s", entry.label)) end)
-    pcall(function() self:UpdateDetails(nil) end)
-end
-
-function UIZoneServerList:OnRename()
-    local entry = self.sel_entry
-    if not entry then
-        pcall(function() self:SetStatus("Select server to rename") end)
-        return
-    end
-
-    if not self.rename_pending or self.rename_entry ~= entry then
-        if not self.edit_search then
-            pcall(function() self:SetStatus("Rename unavailable") end)
-            return
-        end
-        -- Stage 1: populate search box with current label for editing
-        self.rename_pending = true
-        self.rename_entry = entry
-        pcall(function()
-            if self.edit_search then
-                self.edit_search:SetText(entry.label)
-            end
-        end)
-        pcall(function() self:SetStatus(string.format("Edit name in filter box, press Rename again - %s", entry.label)) end)
-        return
-    end
-
-    -- Stage 2: commit - take search box text as new label
-    local newLabel = ""
-    pcall(function()
-        if self.edit_search then newLabel = self.edit_search:GetText() or "" end
-    end)
-    newLabel = sanitize_label(newLabel, entry.ip, entry.port)
-    if newLabel == entry.label then
-        self.rename_pending = false
-        self.rename_entry = nil
-        pcall(function() self:SetStatus("Name unchanged") end)
-        return
-    end
-    entry.label = newLabel
-    -- Also update counterpart in other list if exists (ip:port unique)
-    pcall(function()
-        local fav_e = find_entry_by_addr(self.favorites, entry.ip, entry.port)
-        local hist_e = find_entry_by_addr(self.history, entry.ip, entry.port)
-        if fav_e and fav_e ~= entry then fav_e.label = newLabel end
-        if hist_e and hist_e ~= entry then hist_e.label = newLabel end
-    end)
-    self.rename_pending = false
-    self.rename_entry = nil
-    pcall(function() if self.edit_search then self.edit_search:SetText("") end end)
-    self.search_query = ""
-    pcall(function() self:SaveFavorites() end)
-    pcall(function() self:RefreshList() end)
-    self.sel_idx = nil
-    self.sel_entry = nil
-    pcall(function()
-        for idx, e in ipairs(self.filtered) do
-            if e.ip == entry.ip and e.port == entry.port and self.filtered[idx] and idx - 1 < #self.filtered then
-                self.sel_idx = idx - 1
-                self.sel_entry = e
-                self:UpdateDetails(e)
-                break
-            end
-        end
-    end)
-    pcall(function() self:SetStatus(string.format("Renamed to %s", newLabel)) end)
-end
-
-function UIZoneServerList:OnRefresh()
-    self.search_query = ""
-    pcall(function() if self.edit_search then self.edit_search:SetText("") end end)
-    self.rename_pending = false
-    self.rename_entry = nil
-    -- Re-sort history newest first, keep fav alpha
-    pcall(function() table.sort(self.history, function(a,b) return (a.lastSeen or 0) > (b.lastSeen or 0) end) end)
-    pcall(function() self:RefreshList() end)
-    -- Ping preview if connected
-    local ping = 0
-    pcall(function()
-        if ZoneNet and ZoneNet.GetSessionInfo then
-            local _, p = ZoneNet:GetSessionInfo()
-            ping = p or 0
-        end
-    end)
-    if ping and ping > 0 then
-        pcall(function() self:SetStatus(string.format("Refreshed - ping %d ms", ping)) end)
-    else
-        pcall(function() self:SetStatus(string.format("Refreshed - %d fav, %d recent", #self.favorites, #self.history)) end)
-    end
-end
-
-function UIZoneServerList:OnSearchCommit()
-    pcall(function()
-        if not self.edit_search then return end
-        if self.rename_pending then return end
-        local txt = self.edit_search:GetText() or ""
-        self.search_query = txt:match("^%s*(.-)%s*$") or ""
+        self:SetState(STATE_CONNECTED, string.format("%s:%d", tostring(self.connect_ip), tonumber(self.connect_port) or 0))
         self:RefreshList()
+        return
+    end
+
+    if now - (self.connect_start or now) >= CONNECT_TIMEOUT_MS then
+        local reason = ""
+        pcall(function()
+            if ZoneNet and ZoneNet.GetLastError then reason = ZoneNet:GetLastError() or "" end
+        end)
+        for _, list in ipairs({ self.favorites, self.history }) do
+            for _, e in ipairs(list) do
+                if e.ip == self.connect_ip and e.port == self.connect_port then e.state = "offline" end
+            end
+        end
+        self.connect_start = 0
+        self:SetState(STATE_FAILED, reason)
+        self:RefreshList()
+    end
+end
+
+function UIZoneServerList:Update()
+    pcall(function() CUIScriptWnd.Update(self) end)
+    pcall(function() self:ScanStep() end)
+    pcall(function() self:PollConnect() end)
+    pcall(function() self:AnimateSpinner() end)
+    -- Menu-safe pump: the join flow packets (SHOW_START/LOAD_LEVEL) arrive
+    -- before actor_on_update exists; drain them while the browser is open.
+    pcall(function()
+        if zone_net and type(zone_net.pump_menu) == "function" then
+            zone_net.pump_menu()
+        end
     end)
 end
 
-function UIZoneServerList:OnTabAll()
-    self.filter_mode = FILTER_ALL
-    self.rename_pending = false
-    self:RefreshList()
-    pcall(function() self:SetStatus("Filter: All servers") end)
-end
-function UIZoneServerList:OnTabFav()
-    self.filter_mode = FILTER_FAV
-    self.rename_pending = false
-    self:RefreshList()
-    pcall(function() self:SetStatus(string.format("Filter: Favorites (%d)", #self.favorites)) end)
-end
-function UIZoneServerList:OnTabHist()
-    self.filter_mode = FILTER_HIST
-    self.rename_pending = false
-    self:RefreshList()
-    pcall(function() self:SetStatus(string.format("Filter: Recent (%d)", #self.history)) end)
+function UIZoneServerList:AnimateSpinner()
+    if not self.spinner then return end
+    local active = (self.state == STATE_SCANNING or self.state == STATE_CONNECTING)
+    if self.spinner_shown ~= active then
+        self.spinner_shown = active
+        pcall(function() self.spinner:Show(active) end)
+    end
+    if not active then return end
+    local now = self:Now()
+    if self.last_spin and (now - self.last_spin) < 350 then return end
+    self.last_spin = now
+    self.spin_on = not self.spin_on
+    local c = self.spin_on and argb(255, 255, 195, 5) or argb(255, 110, 80, 10)
+    pcall(function() self.spinner:SetTextureColor(c) end)
 end
 
 function UIZoneServerList:OnListSelect()
-    if not self.list_servers then return end
-    local idx = self.list_servers:GetSelectedIndex()
-    if idx == nil or idx < 0 or idx >= #self.filtered then return end
-    local entry = self.filtered[idx + 1]
-    if not entry then return end
-    self.sel_idx = idx
-    self.sel_entry = entry
-    pcall(function() if self.edit_ip then self.edit_ip:SetText(entry.ip) end end)
-    pcall(function() if self.edit_port then self.edit_port:SetText(tostring(entry.port)) end end)
-    pcall(function() self:UpdateDetails(entry) end)
+    local idx = self:SelectedIndexSafe()
+    if idx < 0 then return end
+    local e = self.rows and self.rows[idx + 1]
+    if not e then return end
+    self.sel_entry = e
+    self:UpdateDetails()
+end
+
+function UIZoneServerList:OnTabChanged()
+    self:AbortScan()
+    self.tab_id = self:GetActiveTabId()
+    self.broadcast_hit = nil
+    self:UpdateDirectVisibility()
+    self:RefreshList()
+    if self.tab_id == TAB_DIRECT then
+        self:AbortScan()
+        if self.state ~= STATE_CONNECTING and self.state ~= STATE_CONNECTED and self.state ~= STATE_FAILED then
+            self:SetState(STATE_IDLE)
+        end
+    else
+        self:StartScan()
+    end
+end
+
+function UIZoneServerList:OnRefresh()
+    self.broadcast_hit = nil
+    self:RefreshList()
+    self:StartScan()
+end
+
+function UIZoneServerList:OnConnect()
+    if self.state == STATE_CONNECTING then return end
+    self:AbortScan()
+
+    local ip, port = nil, nil
+    if not self:IsDirectTab() then
+        local e = self.sel_entry
+        if e then ip, port = e.ip, e.port end
+        if not ip then
+            pcall(function() if self.tabs then self.tabs:SetActiveTab(TAB_DIRECT) end end)
+            self.tab_id = TAB_DIRECT
+            self:UpdateDirectVisibility()
+            self:RefreshList()
+            self:ApplyEditFocus()
+            return
+        end
+    else
+        ip = self:GetEditText(self.edit_ip)
+        port = tonumber(self:GetEditText(self.edit_port))
+    end
+
+    if not valid_host(ip) then
+        self:SetState(STATE_FAILED, tr("ui_zone_bad_address"))
+        return
+    end
+    port = tonumber(port)
+    if not port or port < 1 or port > 65535 then
+        self:SetState(STATE_FAILED, tr("ui_zone_bad_port"))
+        return
+    end
+    port = math.floor(port)
+
+    self.nick = sanitize_nickname(self:GetEditText(self.edit_nick))
+    pcall(function() if self.edit_nick then self.edit_nick:SetText(self.nick) end end)
+
+    -- Identity must exist before any handshake: never connect as the shared
+    -- "anonymous" account, and persist uuid/hwid to zone_identity.ltx.
+    local cfg = client_identity()
+    if not cfg then
+        self:SetState(STATE_FAILED, tr_or("ui_zone_identity_missing", "Client identity unavailable - cannot connect"))
+        return
+    end
+    self.uuid = cfg.client_uuid
+    self.hwid = tonumber(cfg.hwid_hash) or 0
+
+    local live_connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then
+            live_connected = ZoneNet:IsConnected() and true or false
+        end
+    end)
+    if live_connected then
+        local same_target = (self.connect_ip == ip) and (tonumber(self.connect_port) == port)
+        if same_target then
+            self:SetState(STATE_CONNECTED, string.format("%s:%d", tostring(ip), port))
+            return
+        end
+        -- Explicit reconnect: tear the live session down before dialing the
+        -- new target so Connect never resets a session behind the user's back.
+        pcall(function() ZoneNet:Disconnect() end)
+    end
+
+    local busy = false
+    pcall(function()
+        if _G.XrrIsConnected and _G.XrrIsConnected() then busy = true end
+        if _G.XrrIsHosted and _G.XrrIsHosted() then busy = true end
+        if _G.XrrNet then
+            local okc, connected = pcall(function() return _G.XrrNet():IsConnected() end)
+            if okc and connected then busy = true end
+        end
+    end)
+    if busy then
+        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        return
+    end
+
+    if not self:NetAvailable() or not self:ClientLoaded() then
+        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        return
+    end
+
+    local connect_called = false
+    pcall(function()
+        ZoneNet:Connect(ip, port, self.uuid, self.hwid, self.nick)
+        connect_called = true
+    end)
+    if not connect_called then
+        self:SetState(STATE_FAILED, tr("ui_zone_status_offline"))
+        return
+    end
+
+    self.connect_ip = ip
+    self.connect_port = port
+    self.connect_start = self:Now()
+    self.last_connect_poll = self.connect_start
+    self:UpsertHistory(ip, port)
+    self:SaveFavorites()
+    self:SetState(STATE_CONNECTING, string.format("%s:%d", ip, port))
+    self:RefreshList()
+end
+
+function UIZoneServerList:OnToggleFavorite()
+    local ip, port = nil, nil
+    if not self:IsDirectTab() and self.sel_entry then
+        ip, port = self.sel_entry.ip, self.sel_entry.port
+    else
+        ip = self:GetEditText(self.edit_ip)
+        port = tonumber(self:GetEditText(self.edit_port))
+    end
+    if not valid_host(ip) or not port or port < 1 or port > 65535 then
+        self:SetState(STATE_FAILED, tr("ui_zone_bad_address"))
+        return
+    end
+    port = math.floor(port)
+
+    local fav, fav_idx = find_entry_by_addr(self.favorites, ip, port)
+    local hist, hist_idx = find_entry_by_addr(self.history, ip, port)
+
+    if fav then
+        table.remove(self.favorites, fav_idx)
+        if not hist then
+            if #self.history >= MAX_HISTORY then
+                table.sort(self.history, function(a, b) return (a.lastSeen or 0) > (b.lastSeen or 0) end)
+                table.remove(self.history, #self.history)
+            end
+            local ts = now_timestamp()
+            self.history[#self.history + 1] = {
+                label = fav.label,
+                ip = ip,
+                port = port,
+                is_fav = false,
+                status = "Recent",
+                lastSeen = ts,
+                added = ts,
+                state = fav.state,
+                query = fav.query
+            }
+        end
+    else
+        if #self.favorites >= MAX_FAVORITES then
+            self:SetState(STATE_FAILED, string.format("%s %d", tr("ui_zone_btn_favorite"), MAX_FAVORITES))
+            return
+        end
+        if hist then table.remove(self.history, hist_idx) end
+        local ts = now_timestamp()
+        self.favorites[#self.favorites + 1] = {
+            label = hist and hist.label or (ip .. ":" .. tostring(port)),
+            ip = ip,
+            port = port,
+            is_fav = true,
+            status = "Favorite",
+            lastSeen = ts,
+            added = hist and hist.added or ts,
+            state = hist and hist.state or nil,
+            query = hist and hist.query or nil
+        }
+    end
+
+    self:SaveFavorites()
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:OnRemove()
+    local removed = false
+    local e = self.sel_entry
+    if not e and self:IsDirectTab() then
+        local ip = self:GetEditText(self.edit_ip)
+        local port = tonumber(self:GetEditText(self.edit_port))
+        if valid_host(ip) and port and port >= 1 and port <= 65535 then
+            e = self:FindEntry(ip, math.floor(port))
+        end
+    end
+    if not e then
+        self:UpdateStatus()
+        return
+    end
+
+    local fav, fav_idx = find_entry_by_addr(self.favorites, e.ip, e.port)
+    if fav then table.remove(self.favorites, fav_idx) removed = true end
+    local hist, hist_idx = find_entry_by_addr(self.history, e.ip, e.port)
+    if hist then table.remove(self.history, hist_idx) removed = true end
+    if not removed then
+        self:UpdateStatus()
+        return
+    end
+
+    self.sel_entry = nil
+    self:SaveFavorites()
+    self:RefreshList()
+    self:UpdateStatus()
+end
+
+function UIZoneServerList:OnShow()
+    self.tab_id = self:GetActiveTabId()
+    self:UpdateLabels()
+    self:UpdateDirectVisibility()
+
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then connected = ZoneNet:IsConnected() and true or false end
+    end)
+    if connected then
+        local detail = ""
+        if self.connect_ip then
+            detail = string.format("%s:%d", tostring(self.connect_ip), tonumber(self.connect_port) or 0)
+        end
+        self:SetState(STATE_CONNECTED, detail)
+    elseif self.state ~= STATE_CONNECTING then
+        self:SetState(STATE_IDLE)
+    end
+
+    self:RefreshList()
+    self:StartScan()
 end
 
 function UIZoneServerList:OnBack()
+    self:AbortScan()
+    self:ReleaseEditFocus()
     self:HideDialog()
-    self:Show(false)
+    CUIScriptWnd.Show(self, false)
     if self.owner then
-        self.owner:ShowDialog(true)
-        self.owner:Show(true)
+        pcall(function() self.owner:ShowDialog(true) end)
+        pcall(function() self.owner:Show(true) end)
     end
 end
 
 function UIZoneServerList:OnKeyboard(dik, keyboard_action)
-    pcall(function() CUIScriptWnd.OnKeyboard(self, dik, keyboard_action) end)
-    if keyboard_action == ui_events.WINDOW_KEY_PRESSED and DIK_keys and dik == DIK_keys.DIK_ESCAPE then
-        if self.rename_pending then
-            self.rename_pending = false
-            self.rename_entry = nil
-            pcall(function() if self.edit_search then self.edit_search:SetText("") end end)
-            self.search_query = ""
-            pcall(function() self:RefreshList() end)
-            pcall(function() self:SetStatus("Rename cancelled") end)
-            return true
-        end
+    local res = false
+    pcall(function() res = CUIScriptWnd.OnKeyboard(self, dik, keyboard_action) end)
+    if res then return res end
+    if keyboard_action ~= ui_events.WINDOW_KEY_PRESSED then return false end
+    if not DIK_keys then return false end
+
+    if dik == DIK_keys.DIK_ESCAPE then
         self:OnBack()
+        return true
+    elseif dik == DIK_keys.DIK_RETURN then
+        self:OnConnect()
+        return true
+    elseif dik == DIK_keys.DIK_F5 then
+        self:OnRefresh()
+        return true
+    elseif dik == DIK_keys.DIK_UP then
+        self:MoveSelection(-1)
+        return true
+    elseif dik == DIK_keys.DIK_DOWN then
+        self:MoveSelection(1)
+        return true
+    elseif dik == DIK_keys.DIK_TAB then
+        if self:IsDirectTab() then
+            self.edit_focus = (self.edit_focus or 0) + 1
+            if self.edit_focus > 3 then self.edit_focus = 1 end
+            self:ApplyEditFocus()
+        end
         return true
     end
     return false
 end
 
--- ============================================================
--- Public factory / API
--- ============================================================
 function open_server_browser(owner)
     if not _server_browser_dlg then
-        _server_browser_dlg = UIZoneServerList(owner)
-        _server_browser_dlg:InitControls()
-        _server_browser_dlg:InitCallBacks()
+        local dlg = UIZoneServerList(owner)
+        local ok = dlg:InitControls()
+        if ok == false or not dlg.list_servers then
+            printf("Zone UI init failed")
+            return nil
+        end
+        dlg:InitCallBacks()
+        _server_browser_dlg = dlg
     else
         if owner then _server_browser_dlg.owner = owner end
         _server_browser_dlg:LoadFavorites()
     end
     _server_browser_dlg:ShowDialog(true)
     _server_browser_dlg:Show(true)
+    _server_browser_dlg:OnShow()
     return _server_browser_dlg
 end
 

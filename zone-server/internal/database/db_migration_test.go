@@ -18,7 +18,7 @@ func TestMigrateProfileRevKeepsAutoProvisionPlaceholders(t *testing.T) {
 	if err := db.AutoProvision("uuid-real", "hwid-real", "RealStalker"); err != nil {
 		t.Fatalf("AutoProvision failed: %v", err)
 	}
-	if err := db.CreateCharacter("uuid-real", "stalker", ""); err != nil {
+	if err := db.CreateCharacter("uuid-real", "stalker", "", 0); err != nil {
 		t.Fatalf("CreateCharacter failed: %v", err)
 	}
 	// Legacy genuinely-created character: profile_rev=0 but persisted after

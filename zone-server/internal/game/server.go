@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -42,6 +43,23 @@ const (
 // DefaultActorVisual is the actor section used for player entities that have
 // not sent an OpPlayerVisual yet.
 const DefaultActorVisual = `actors\stalker_neutral\stalker_neutral_1`
+
+const (
+	// maxStarterMoney caps the client-picked starter amount.
+	maxStarterMoney = 10_000_000
+
+	protocolErrorInvalidFaction = 1
+	protocolErrorInvalidLoadout = 2
+	protocolErrorCreateFailed   = 3
+)
+
+// errorCodeForValidation maps ValidateNewCharacter failures onto wire codes.
+func errorCodeForValidation(err error) uint8 {
+	if errors.Is(err, database.ErrInvalidFaction) {
+		return protocolErrorInvalidFaction
+	}
+	return protocolErrorInvalidLoadout
+}
 
 func boolToUint8(b bool) uint8 {
 	if b {
@@ -478,12 +496,17 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			}
 
 			s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
-			// Unconditional safe-zone snapshot immediately after handshake.
-			s.sendSafezoneState(sess)
 			if isNew {
 				show := protocol.ShowStart{Level: 0, PosX: -211.3, PosY: -20.2, PosZ: -145.8, Flags: 0, EcoTier: 1}
 				s.SendToSession(sess, protocol.OpShowStart, protocol.FlagReliable, show)
 			} else {
+				// Returning player: straight into the spawn, no menu detour.
+				s.sendLoadLevel(sess)
+				s.syncInventoryForLevel(sess)
+			}
+			// Spawn flow is on the wire first; enforcement + AOI follow it.
+			s.sendSafezoneState(sess)
+			if !isNew {
 				s.sendExistingPeersToNewcomer(sess)
 			}
 		}
@@ -655,6 +678,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				sess.Unlock()
 
 				s.grid.Update(sessID, ct.PosX, ct.PosZ)
+				s.maybeBroadcastEntityEnter(sess)
 
 				szObj := CheckSafeZone(ct.PosX, ct.PosY, ct.PosZ, level)
 				isSafe := (szObj != nil)
@@ -985,24 +1009,34 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 		sess.Lock()
 		pending := sess.PendingCreate
+		uuid := sess.AccountID
 		sess.Unlock()
 		if !pending {
+			// Late/duplicate select after a successful create; ignore.
 			return
 		}
 		faction := nullTermString(sel.Faction[:])
 		loadout := nullTermString(sel.Items[:])
-		sess.Lock()
-		uuid := sess.AccountID
-		sess.Unlock()
-		if s.db != nil {
-			if err := database.ValidateNewCharacter(faction, loadout); err != nil {
-				return
-			}
-			if err := s.db.CreateCharacter(uuid, faction, loadout); err != nil {
-				return
-			}
-		} else if _, ok := database.AllowedFactions[faction]; !ok {
+		money := sel.Money
+		if money > maxStarterMoney {
+			money = maxStarterMoney
+		}
+		if err := database.ValidateNewCharacter(faction, loadout); err != nil {
+			s.logger.Warn("Rejected character select",
+				zap.String("uuid", uuid),
+				zap.String("faction", faction),
+				zap.Error(err))
+			s.sendError(sess, errorCodeForValidation(err),
+				"Character creation rejected: invalid faction or loadout.")
+			// Keep PendingCreate so the player can correct the selection.
 			return
+		}
+		if s.db != nil {
+			if err := s.db.CreateCharacter(uuid, faction, loadout, money); err != nil {
+				s.logger.Error("CreateCharacter failed", zap.String("uuid", uuid), zap.Error(err))
+				s.sendError(sess, protocolErrorCreateFailed, "Character creation failed. Try again.")
+				return
+			}
 		}
 		sess.Lock()
 		sess.PendingCreate = false
@@ -1013,13 +1047,14 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		sessID := sess.SessionID
 		sess.Unlock()
 		s.grid.Insert(sessID, -211.3, -145.8)
-		load := protocol.ShowStart{Level: 0, PosX: -211.3, PosY: -20.2, PosZ: -145.8, Flags: 0, EcoTier: 1}
-		s.SendToSession(sess, protocol.OpLoadLevel, protocol.FlagReliable, load)
+		s.sendLoadLevel(sess)
+		s.syncInventoryForLevel(sess)
 		res := protocol.HandshakeRes{Status: 0, SpawnX: -211.3, SpawnY: -20.2, SpawnZ: -145.8, WorldTime: uint64(time.Now().Unix()), EcoTier: 1, HasCharacter: 1}
 		copy(res.Faction[:], faction)
 		binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
 		s.SendToSession(sess, protocol.OpHandshakeRes, protocol.FlagReliable, res)
 		s.sendSafezoneState(sess)
+		s.maybeBroadcastEntityEnter(sess)
 		s.sendExistingPeersToNewcomer(sess)
 	case protocol.OpLevelChange:
 		var lvl protocol.LevelChangePayload
@@ -1030,9 +1065,25 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		if sess == nil {
 			return
 		}
+		sess.Lock()
+		pendingCreate := sess.PendingCreate
+		sess.Unlock()
+		if pendingCreate {
+			s.logger.Warn("Ignored level change during character creation",
+				zap.String("addr", addr.String()),
+			)
+			return
+		}
 		levelName := nullTermString(lvl.Level[:])
 		if levelName == "" || len(levelName) > 31 || !isPrintableLevelName(levelName) {
 			s.logger.Warn("Rejected invalid level change",
+				zap.String("addr", addr.String()),
+				zap.String("level", levelName),
+			)
+			return
+		}
+		if _, ok := supportedLevels[levelName]; !ok {
+			s.logger.Warn("Ignored unsupported level change",
 				zap.String("addr", addr.String()),
 				zap.String("level", levelName),
 			)
@@ -1048,9 +1099,16 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.aoi.RemoveSession(sess.SessionID)
 		if oldLevel != levelName {
 			s.broadcastEntityLeaveToPeers(sess.SessionID, oldLevel)
-			s.broadcastEntityEnter(sess)
+			sess.Lock()
+			sess.Gvid = 0
+			sess.EnterBroadcastLevel = ""
+			sess.Unlock()
 			s.sendExistingPeersToNewcomer(sess)
 		}
+		// The client reports its level after a level load. Deliver the kit only
+		// when the level actually changed; syncInventoryForLevel advances the
+		// per-level marker after a successful send.
+		s.syncInventoryForLevel(sess)
 		s.sendSafezoneState(sess)
 	case protocol.OpPlayerVisual:
 		var pv protocol.PlayerVisualPayload
@@ -1069,7 +1127,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		copy(sess.Visual[:], visual)
 		sess.HasVisual = true
 		sess.Unlock()
-		s.broadcastEntityEnter(sess)
+		s.maybeBroadcastEntityEnter(sess)
 	case OpAck:
 		if s.ackQueue != nil {
 			var ackSeq uint32
@@ -1176,6 +1234,171 @@ func (s *Server) sendSafezoneState(sess *network.PlayerSession) {
 	s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, payload)
 }
 
+// supportedLevels maps every level name the server recognises onto the wire
+// u8 level id used by OpLoadLevel. Only l01_escape is hosted today, so every
+// entry currently resolves to id 0; the remaining names come from the
+// safe-zone table and exist so a client level report is validated instead of
+// desyncing server-side AOI/chat filtering.
+var supportedLevels = map[string]uint8{
+	"l01_escape":     0,
+	"l02_garbage":    0,
+	"l03_agroprom":   0,
+	"l04_darkvalley": 0,
+	"l05_bar_rostok": 0,
+	"l07_military":   0,
+	"l08_yantar":     0,
+	"l09_deadcity":   0,
+	"k00_marsh":      0,
+	"zaton":          0,
+	"jupiter":        0,
+}
+
+// levelIDForName maps an internal level name onto the wire u8 level id.
+func levelIDForName(name string) uint8 {
+	if id, ok := supportedLevels[name]; ok {
+		return id
+	}
+	return 0
+}
+
+// sendLoadLevel tells the client to begin gameplay at the session's current
+// level and position. From the main menu the client turns this into a console
+// "start" of a fresh singleplayer game; when a level is already loaded the
+// client only applies position/faction (reconnect, no reload).
+func (s *Server) sendLoadLevel(sess *network.PlayerSession) {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	pos := sess.Position
+	level := sess.CurrentLevel
+	var faction [16]byte
+	copy(faction[:], sess.Faction)
+	sess.Unlock()
+	if level == "" {
+		level = "l01_escape"
+	}
+
+	payload := protocol.LevelLoad{
+		Level:   levelIDForName(level),
+		PosX:    pos[0],
+		PosY:    pos[1],
+		PosZ:    pos[2],
+		Faction: faction,
+		EcoTier: 1,
+	}
+	s.SendToSession(sess, protocol.OpLoadLevel, protocol.FlagReliable, payload)
+}
+
+// sendInventorySync streams character_inventory to the client in MTU-sized
+// chunks. An empty inventory still produces one packet so the client can mark
+// the initial sync complete. It returns false when the inventory could not be
+// loaded, so callers do not advance the synced-level marker on failure.
+func (s *Server) sendInventorySync(sess *network.PlayerSession) bool {
+	if sess == nil {
+		return false
+	}
+	sess.Lock()
+	uuid := sess.AccountID
+	sess.Unlock()
+	if s.db == nil || uuid == "" {
+		return false
+	}
+	items, err := s.db.GetCharacterInventory(uuid)
+	if err != nil {
+		s.logger.Warn("Inventory sync: load failed", zap.String("uuid", uuid), zap.Error(err))
+		return false
+	}
+	if len(items) == 0 {
+		s.SendToSession(sess, protocol.OpInventorySync, protocol.FlagReliable, protocol.InventorySyncPayload{})
+		return true
+	}
+	for start := 0; start < len(items); start += protocol.MaxInventorySyncItems {
+		end := start + protocol.MaxInventorySyncItems
+		if end > len(items) {
+			end = len(items)
+		}
+		var payload protocol.InventorySyncPayload
+		n := 0
+		for _, it := range items[start:end] {
+			if n >= len(payload.Items) {
+				break
+			}
+			var entry protocol.InventoryItemPayload
+			copy(entry.Section[:], it.ItemSection)
+			entry.Count = 1
+			cond := float64(it.Condition) * 100.0
+			if cond < 0 {
+				cond = 0
+			}
+			if cond > 100 {
+				cond = 100
+			}
+			entry.Condition = uint8(math.Round(cond))
+			ammo := it.AmmoCurrent
+			if ammo < 0 {
+				ammo = 0
+			}
+			if ammo > 65535 {
+				ammo = 65535
+			}
+			entry.Ammo = uint16(ammo)
+			slot := it.Slot
+			if slot < -128 {
+				slot = -128
+			}
+			if slot > 127 {
+				slot = 127
+			}
+			entry.Slot = int8(slot)
+			payload.Items[n] = entry
+			n++
+		}
+		if n == 0 {
+			break
+		}
+		payload.ItemCount = uint8(n)
+		s.SendToSession(sess, protocol.OpInventorySync, protocol.FlagReliable, payload)
+	}
+	return true
+}
+
+// syncInventoryForLevel delivers character_inventory exactly once per
+// (session, level): the send is skipped when the current level was already
+// synced, and InventorySyncedLevel advances only after a successful send so a
+// transient load failure can be retried on the next level report.
+func (s *Server) syncInventoryForLevel(sess *network.PlayerSession) {
+	if sess == nil {
+		return
+	}
+	sess.Lock()
+	level := sess.CurrentLevel
+	if level == "" {
+		level = "l01_escape"
+	}
+	alreadySynced := sess.InventorySyncedLevel == level
+	sess.Unlock()
+	if alreadySynced {
+		return
+	}
+	if s.sendInventorySync(sess) {
+		sess.Lock()
+		sess.InventorySyncedLevel = level
+		sess.Unlock()
+	}
+}
+
+// sendError delivers an explicit, displayable failure to the client.
+func (s *Server) sendError(sess *network.PlayerSession, code uint8, message string) {
+	var payload protocol.ErrorPayload
+	payload.Code = code
+	if len(message) > len(payload.Message)-1 {
+		message = message[:len(payload.Message)-1]
+	}
+	copy(payload.Message[:], message)
+	s.SendToSession(sess, protocol.OpError, protocol.FlagReliable, payload)
+}
+
 // buildEntityEnter builds the ENTITY_ENTER_AOI payload for a player session,
 // falling back to DefaultActorVisual when no OpPlayerVisual was received yet.
 func (s *Server) buildEntityEnter(sess *network.PlayerSession) protocol.EntityEnterAoI {
@@ -1197,6 +1420,25 @@ func (s *Server) buildEntityEnter(sess *network.PlayerSession) protocol.EntityEn
 	pkt.Gvid = sess.Gvid
 	sess.Unlock()
 	return pkt
+}
+
+func (s *Server) maybeBroadcastEntityEnter(sess *network.PlayerSession) bool {
+	if sess == nil {
+		return false
+	}
+	sess.Lock()
+	gvid := sess.Gvid
+	hasVisual := sess.HasVisual
+	level := sess.CurrentLevel
+	already := level != "" && sess.EnterBroadcastLevel == level
+	if gvid == 0 || !hasVisual || already {
+		sess.Unlock()
+		return false
+	}
+	sess.EnterBroadcastLevel = level
+	sess.Unlock()
+	s.broadcastEntityEnter(sess)
+	return true
 }
 
 // broadcastEntityEnter sends ENTITY_ENTER_AOI for sess to every same-level peer.

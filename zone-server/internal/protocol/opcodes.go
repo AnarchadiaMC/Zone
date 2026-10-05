@@ -34,6 +34,8 @@ const (
 	OpLoadLevel       = 0x0073
 	OpLevelChange     = 0x0074
 	OpPlayerVisual    = 0x0075
+	OpInventorySync   = 0x0076
+	OpError           = 0x0077
 )
 
 type PacketHeader struct {

@@ -1,0 +1,164 @@
+<w>
+	<!--
+		Zone Online peer faction/loadout select layout.
+		Forked from vanilla configs\ui\ui_mm_faction_select.xml, trimmed to the
+		widgets UIZonePeerFaction (zone_ui_peer_faction.script) initializes:
+		faction flag, character description/relations, nickname, inventory and
+		loadout cell containers, an error line, and the faction popup.
+		Coordinates match the vanilla new-game screen.
+	-->
+
+	<background width="1024" height="768">
+		<auto_static x="0" y="0" width="1024" height="768" stretch="1">
+			<texture x="0" y="1024" width="1280" height="768">ui\ui_actor_main_menu_one</texture>
+		</auto_static>
+	</background>
+
+	<main_dialog>
+		<frame_back x="62" y="72" width="899" height="623"> <!-- base -->
+			<auto_static x="0" y="0" width="899" height="623" stretch="1">
+				<texture>ui_new_game_back</texture>
+			</auto_static>
+		</frame_back>
+
+		<frame_front x="0" y="0" width="999" height="723">
+			<auto_static x="0" y="0" width="999" height="723" stretch="1">
+				<texture>ui_new_game_main</texture>
+			</auto_static>
+		</frame_front>
+
+		<!-- Static Text -->
+		<cap_character x="10" y="5" width="132" height="22">
+			<text r="250" g="250" b="250" font="letterica18"  align="c">st_mm_new_game_character</text>
+		</cap_character>
+		<cap_inventory x="465" y="5" width="132" height="22">
+			<text r="250" g="250" b="250" font="letterica18"  align="c">st_mm_new_game_inventory</text>
+		</cap_inventory>
+		<cap_loadout x="685" y="5" width="132" height="22">
+			<text r="250" g="250" b="250" font="letterica18"  align="c">st_mm_new_game_loadout</text>
+		</cap_loadout>
+
+		<cap_name x="194" y="284" width="61" height="17">
+			<text r="200" g="200" b="200" font="letterica18"  align="l">st_mm_new_game_name</text>
+		</cap_name>
+		<cap_points_left x="517" y="348" width="86" height="18">
+			<text r="150" g="150" b="150" font="letterica16">st_mm_new_game_points_left</text>
+		</cap_points_left>
+		<cap_points_used x="737" y="348" width="86" height="18">
+			<text r="150" g="150" b="150" font="letterica16">st_mm_new_game_points_used</text>
+		</cap_points_used>
+
+		<!-- Interactive Text -->
+		<input_name x="259" y="285" width="164" height="17">
+			<text complex_mode="1" r="150" g="150" b="150" align="l"  vert_align="c" font="letterica18" />
+		</input_name>
+		<cap_name_hint x="194" y="318" width="260" height="14">
+			<text r="120" g="120" b="120" font="letterica16" align="l">ui_zone_name_hint</text>
+		</cap_name_hint>
+		<text_points_left x="608" y="348" width="55" height="18">
+			<text complex_mode="1" r="150" g="150" b="150" align="l"  vert_align="c" font="letterica16" />
+		</text_points_left>
+		<text_points_used x="828" y="348" width="55" height="18">
+			<text complex_mode="1" r="150" g="150" b="150" align="l"  vert_align="c" font="letterica16" />
+		</text_points_used>
+
+		<text_relations x="33" y="76" width="122" height="150">
+			<text complex_mode="1" r="150" g="150" b="150" align="l"  vert_align="c" font="letterica16" />
+		</text_relations>
+		<text_descr x="164" y="42" width="254" height="220">
+			<text complex_mode="1" r="150" g="150" b="150" align="l"  vert_align="c" font="letterica16" />
+		</text_descr>
+
+		<text_error x="194" y="368" width="420" height="18">
+			<text complex_mode="1" r="220" g="70" b="70" align="l"  vert_align="c" font="letterica16" />
+		</text_error>
+
+		<!-- Item Lists -->
+		<check_reset x="639" y="345" width="35" height="23" stretch="1">
+			<texture>ui_new_game_btn_checkbox</texture>
+		</check_reset>
+
+		<cont_inv x="468" y="38" width="197" height="300" stretch="1"/>
+		<cont_loadout x="690" y="38" width="197" height="300" stretch="1"/>
+
+		<!-- Main buttons -->
+		<btn_faction x="4" y="346" width="86" height="21" stretch="1">
+			<text r="150" g="150" b="150" font="letterica16" align="c">st_mm_btn_new_game_faction</text>
+			<texture>ui_inGame2_button</texture>
+		</btn_faction>
+
+		<btn_back x="237" y="591" width="136" height="27" stretch="1">
+			<text r="150" g="150" b="150" font="letterica18" align="c">st_mm_btn_new_game_back</text>
+			<texture>ui_inGame2_button</texture>
+		</btn_back>
+
+		<btn_start x="525" y="591" width="136" height="27" stretch="1">
+			<text r="150" g="150" b="150" font="letterica18" align="c">st_mm_btn_new_game_submit</text>
+			<texture>ui_inGame2_button</texture>
+		</btn_start>
+
+		<!-- Frames -->
+		<box_faction x="4" y="274" width="86" height="63"/>
+		<box_item x="464" y="279" width="125" height="87"/>
+
+		<!-- Scrolls -->
+		<scroll_desc x="164" y="42" width="264" height="220" right_ident="0" left_ident="0" top_indent="0" bottom_indent="0" vert_interval="0" always_show_scroll="0"/>
+
+		<popup_faction>
+			<frame x="264" y="115" width="376" height="395"> <!-- base -->
+				<auto_static x="0" y="0" width="376" height="395" stretch="1">
+					<texture>ui_new_game_popup_faction</texture>
+				</auto_static>
+			</frame>
+			<frame_black x="-270" y="-77" width="1280" height="778">
+				<auto_static x="0" y="0" width="1280" height="778" stretch="1">
+					<texture>ui_new_game_black_back</texture>
+				</auto_static>
+			</frame_black>
+
+			<cap_faction x="9" y="5" width="132" height="22">
+				<text r="250" g="250" b="250" font="letterica18"  align="c">st_mm_new_game_faction</text>
+			</cap_faction>
+
+			<scroll_faction x="14" y="42" width="348" height="338" right_ident="0" left_ident="0" top_indent="0" bottom_indent="0" vert_interval="0" always_show_scroll="0"/>
+			<templ_faction x="0" y="0" width="348" height="338"/>
+
+			<btn_stalker x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_stalker</texture>
+			</btn_stalker>
+			<btn_bandit x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_bandit</texture>
+			</btn_bandit>
+			<btn_csky x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_csky</texture>
+			</btn_csky>
+			<btn_dolg x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_dolg</texture>
+			</btn_dolg>
+			<btn_freedom x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_freedom</texture>
+			</btn_freedom>
+			<btn_killer x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_killer</texture>
+			</btn_killer>
+			<btn_army x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_army</texture>
+			</btn_army>
+			<btn_ecolog x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_ecolog</texture>
+			</btn_ecolog>
+			<btn_monolith x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_monolith</texture>
+			</btn_monolith>
+			<btn_renegade x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_renegade</texture>
+			</btn_renegade>
+			<btn_greh x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_greh</texture>
+			</btn_greh>
+			<btn_isg x="0" y="0" width="88" height="88" stretch="1">
+				<texture>ui_new_game_btn_isg</texture>
+			</btn_isg>
+		</popup_faction>
+	</main_dialog>
+</w>

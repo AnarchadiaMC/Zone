@@ -3,35 +3,64 @@
 
 local mm_class = nil
 local _prev_global_on_main_menu_init = rawget(_G, "on_main_menu_init")
+
+local function open_zone_browser(menu)
+    if not (zone_ui_server_list and type(zone_ui_server_list.open_server_browser) == "function") then
+        return nil
+    end
+    local ok, dlg = pcall(zone_ui_server_list.open_server_browser, menu)
+    if ok and dlg then return dlg end
+    return nil
+end
+
 local function install_methods()
     if mm_class then return end
     local cls = ui_main_menu.main_menu
     mm_class = cls
     local orig_show_faction_ui = cls.ShowFactionUI
     if type(orig_show_faction_ui) ~= "function" then orig_show_faction_ui = function() end end
-    cls.OnButton_zone_online_clicked = function(self)
-        if self.zone_server_browser_dlg == nil then
-            if zone_ui_server_list and zone_ui_server_list.UIZoneServerList then
-                local dlg = zone_ui_server_list.UIZoneServerList(self)
-                local ok = dlg:InitControls()
-                dlg:InitCallBacks()
-                self.zone_server_browser_dlg = dlg
-                if not (ok ~= false and dlg.list_servers) then
-                    printf("Zone UI init failed")
-                    self.zone_server_browser_dlg = nil
-                    return
-                end
-            end
+
+    -- Main-menu per-frame pump. The join flow needs SHOW_START/LOAD_LEVEL
+    -- dispatched while the main menu is up (actor_on_update does not exist
+    -- yet); wrapping the window Update keeps pumping after the browser and
+    -- faction dialogs are hidden.
+    local orig_update = cls.Update
+    if type(orig_update) ~= "function" then orig_update = nil end
+    cls.Update = function(self, ...)
+        local res = nil
+        if orig_update then
+            res = orig_update(self, ...)
         else
-            self.zone_server_browser_dlg:LoadFavorites()
+            pcall(function() CUIScriptWnd.Update(self) end)
         end
+        pcall(function()
+            if zone_net and type(zone_net.pump_menu) == "function" then
+                zone_net.pump_menu()
+            end
+        end)
+        return res
+    end
+
+    cls.OnButton_zone_online_clicked = function(self)
         local dlg = self.zone_server_browser_dlg
-        if dlg and dlg.list_servers then
-            pcall(function() self:HideDialog() end)
-            pcall(function() self:Show(false) end)
-            pcall(function() dlg:ShowDialog(true) end)
-            pcall(function() dlg:Show(true) end)
+        if not (dlg and dlg.list_servers) then
+            dlg = open_zone_browser(self)
+            if not dlg then
+                printf("Zone UI init failed")
+                return
+            end
+            self.zone_server_browser_dlg = dlg
+        elseif zone_ui_server_list and zone_ui_server_list.open_server_browser then
+            local ok, res = pcall(zone_ui_server_list.open_server_browser, self)
+            if ok and res then
+                dlg = res
+                self.zone_server_browser_dlg = res
+            end
         end
+        pcall(function() self:HideDialog() end)
+        pcall(function() self:Show(false) end)
+        pcall(function() dlg:ShowDialog(true) end)
+        pcall(function() dlg:Show(true) end)
     end
     cls.ShowFactionUI = function(self, ...)
         local ok_zone, zone_connected = pcall(function() return ZoneNet and ZoneNet:IsConnected() end)
@@ -80,5 +109,4 @@ function on_main_menu_init(menu)
 end
 
 function on_game_start()
-    -- Optional global callbacks
 end

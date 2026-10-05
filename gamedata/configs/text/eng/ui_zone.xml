@@ -3,4 +3,121 @@
     <string id="ui_mm_zone_online">
         <text>Zone</text>
     </string>
+    <string id="ui_zone_title">
+        <text>ZONE NETWORK</text>
+    </string>
+    <string id="ui_zone_tab_internet">
+        <text>Internet</text>
+    </string>
+    <string id="ui_zone_tab_lan">
+        <text>LAN</text>
+    </string>
+    <string id="ui_zone_tab_favorites">
+        <text>Favorites</text>
+    </string>
+    <string id="ui_zone_tab_direct">
+        <text>Direct Connect</text>
+    </string>
+    <string id="ui_zone_col_name">
+        <text>Name</text>
+    </string>
+    <string id="ui_zone_col_map">
+        <text>Map</text>
+    </string>
+    <string id="ui_zone_col_players">
+        <text>Players</text>
+    </string>
+    <string id="ui_zone_col_ping">
+        <text>Ping</text>
+    </string>
+    <string id="ui_zone_col_mode">
+        <text>Mode</text>
+    </string>
+    <string id="ui_zone_scan">
+        <text>Scan</text>
+    </string>
+    <string id="ui_zone_scanning">
+        <text>Scanning...</text>
+    </string>
+    <string id="ui_zone_empty_title">
+        <text>No servers found</text>
+    </string>
+    <string id="ui_zone_empty_hint">
+        <text>Press Refresh to scan again, or enter an address on the Direct Connect tab.</text>
+    </string>
+    <string id="ui_zone_connecting">
+        <text>Connecting...</text>
+    </string>
+    <string id="ui_zone_connected">
+        <text>Connected</text>
+    </string>
+    <string id="ui_zone_failed">
+        <text>Connection failed</text>
+    </string>
+    <string id="ui_zone_direct_host">
+        <text>Server address</text>
+    </string>
+    <string id="ui_zone_direct_port">
+        <text>Port</text>
+    </string>
+    <string id="ui_zone_direct_nick">
+        <text>Callsign</text>
+    </string>
+    <string id="ui_zone_btn_connect">
+        <text>Connect</text>
+    </string>
+    <string id="ui_zone_btn_back">
+        <text>Back</text>
+    </string>
+    <string id="ui_zone_btn_favorite">
+        <text>Add Favorite</text>
+    </string>
+    <string id="ui_zone_btn_remove">
+        <text>Remove</text>
+    </string>
+    <string id="ui_zone_btn_refresh">
+        <text>Refresh</text>
+    </string>
+    <string id="ui_zone_status_ready">
+        <text>Ready</text>
+    </string>
+    <string id="ui_zone_status_offline">
+        <text>Network module unavailable</text>
+    </string>
+    <string id="ui_zone_details">
+        <text>Details</text>
+    </string>
+    <string id="ui_zone_lock">
+        <text>Lock</text>
+    </string>
+    <string id="ui_zone_last_seen">
+        <text>Last seen</text>
+    </string>
+    <string id="ui_zone_bad_address">
+        <text>Enter a valid address</text>
+    </string>
+    <string id="ui_zone_bad_port">
+        <text>Port must be between 1 and 65535</text>
+    </string>
+    <string id="ui_zone_name_hint">
+        <text>Callsign is set in Zone options (MCM).</text>
+    </string>
+    <string id="ui_zone_error_generic">
+        <text>The server rejected character creation.</text>
+    </string>
+    <string id="ui_zone_error_faction">
+        <text>The server rejected this faction.</text>
+    </string>
+    <string id="ui_zone_error_loadout">
+        <text>The server rejected this loadout.</text>
+    </string>
+    <string id="ui_zone_error_create">
+        <text>The server could not create the character. Try again.</text>
+    </string>
+    <string id="ui_zone_error_send">
+        <text>Failed to send the selection to the server.</text>
+    </string>
+    <string id="ui_zone_error_not_connected">
+        <text>Not connected to the server.</text>
+    </string>
 </string_table>

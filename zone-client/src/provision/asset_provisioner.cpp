@@ -228,8 +228,11 @@ namespace AssetProvisioner
                             (rel.find(L"configs\\ui\\") != std::wstring::npos);
             bool isZoneText = (rel.find(L"configs\\text\\") != std::wstring::npos) &&
                               (rel.size() >= 11 && rel.compare(rel.size() - 11, 11, L"ui_zone.xml") == 0);
+            // Mod-owned DLTX config must match the DLL (stale copies can carry
+            // broken spawn definitions); overwrite it on every attach.
+            bool isZoneConfig = (rel.find(L"mod_system_zone_online.ltx") != std::wstring::npos);
 
-            if (isScript || isUiXml || isZoneText)
+            if (isScript || isUiXml || isZoneText || isZoneConfig)
                 OverwriteFile(fullPath, content);
             else
                 WriteFileIfMissing(fullPath, content);

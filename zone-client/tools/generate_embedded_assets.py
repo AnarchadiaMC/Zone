@@ -14,6 +14,7 @@ import sys
 MOD_FILES = [
     "configs/mod_system_zone_online.ltx",
     "configs/ui/zone_ui_server_list.xml",
+    "configs/ui/ui_mm_zone_peer_faction.xml",
     "configs/text/eng/ui_zone.xml",
     "configs/text/rus/ui_zone.xml",
     "scripts/modxml_zone_main_menu.script",

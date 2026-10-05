@@ -27,7 +27,7 @@ pfn_luaL_checknumber p_luaL_checknumber = nullptr;
 extern "C" {
     void ZN_Connect(const char* ip, double port, const char* uuid, double hwid, const char* nick);
     void ZN_Disconnect();
-    void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint8_t animflags, uint16_t gvid);
+    void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, uint8_t animflags, uint16_t gvid);
     bool ZN_PollEvent(char* buf, size_t* len);
     bool ZN_IsInSafeZone();
     bool ZN_IsConnected();
@@ -88,12 +88,9 @@ namespace
         float z = (float)luaL_checknumber(L, 3);
         int16_t yaw = (int16_t)luaL_checknumber(L, 4);
         int16_t pitch = (int16_t)luaL_checknumber(L, 5);
-        int16_t vx = (int16_t)luaL_checknumber(L, 6);
-        int16_t vy = (int16_t)luaL_checknumber(L, 7);
-        int16_t vz = (int16_t)luaL_checknumber(L, 8);
-        uint8_t animflags = (uint8_t)luaL_checknumber(L, 9);
-        uint16_t gvid = (uint16_t)lua_tonumber(L, 10); // optional 10th arg
-        ZN_SendTransform(x, y, z, yaw, pitch, vx, vy, vz, animflags, gvid);
+        uint8_t animflags = (uint8_t)luaL_checknumber(L, 6);
+        uint16_t gvid = (uint16_t)lua_tonumber(L, 7); // optional 7th arg
+        ZN_SendTransform(x, y, z, yaw, pitch, animflags, gvid);
         return 0;
     }
 

@@ -35,6 +35,14 @@ type PlayerSession struct {
 	ChatTimestamps    []time.Time
 	PendingCreate     bool
 	Faction           string
+	// EnterBroadcastLevel is the level for which ENTITY_ENTER_AOI has been
+	// broadcast to same-level peers. Empty until a broadcast happens with a
+	// valid gvid and visual; reset on level change.
+	EnterBroadcastLevel string
+	// InventorySyncedLevel is the level name for which character_inventory has
+	// already been streamed to this client. Empty until the first post-spawn
+	// OpLevelChange arrives, so a Lua VM restart cannot lose the starter kit.
+	InventorySyncedLevel string
 }
 
 // AllowChat enforces per-session chat rate limiting (max 5 msgs / 5s).

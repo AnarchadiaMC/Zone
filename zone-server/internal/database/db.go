@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	_ "modernc.org/sqlite"
@@ -131,12 +132,19 @@ var AllowedFactions = map[string]struct{}{
 	"zombied": {},
 }
 
+// Sentinel errors returned by ValidateNewCharacter. Callers use errors.Is to
+// map a failure onto a protocol error code.
+var (
+	ErrInvalidFaction = errors.New("invalid faction")
+	ErrInvalidLoadout = errors.New("invalid loadout")
+)
+
 var ValidateNewCharacter = func(faction, loadout string) error {
 	if _, ok := AllowedFactions[faction]; !ok {
-		return fmt.Errorf("invalid faction %q", faction)
+		return fmt.Errorf("%w %q", ErrInvalidFaction, faction)
 	}
 	if len(loadout) > 4096 {
-		return fmt.Errorf("loadout too long")
+		return fmt.Errorf("%w: too long", ErrInvalidLoadout)
 	}
 	if loadout == "" {
 		return nil
@@ -149,20 +157,20 @@ var ValidateNewCharacter = func(faction, loadout string) error {
 		}
 		count++
 		if count > 256 {
-			return fmt.Errorf("too many loadout entries")
+			return fmt.Errorf("%w: too many entries", ErrInvalidLoadout)
 		}
 		sec := e
 		if i := strings.Index(e, ":"); i >= 0 {
 			sec = e[:i]
 		}
 		if len(sec) == 0 || len(sec) > 64 {
-			return fmt.Errorf("invalid loadout section %q", sec)
+			return fmt.Errorf("%w: invalid section %q", ErrInvalidLoadout, sec)
 		}
 		for _, r := range sec {
 			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
 				continue
 			}
-			return fmt.Errorf("invalid loadout section %q", sec)
+			return fmt.Errorf("%w: invalid section %q", ErrInvalidLoadout, sec)
 		}
 	}
 	return nil
@@ -224,7 +232,7 @@ func (d *DB) HasCharacter(uuid string) (bool, error) {
 	return true, nil
 }
 
-func (d *DB) CreateCharacter(uuid, faction, loadout string) error {
+func (d *DB) CreateCharacter(uuid, faction, loadout string, money uint32) error {
 	if err := ValidateNewCharacter(faction, loadout); err != nil {
 		return err
 	}
@@ -249,6 +257,13 @@ func (d *DB) CreateCharacter(uuid, faction, loadout string) error {
 		}
 	} else {
 		return err
+	}
+	// Starter money: only overwrite the schema default when the client picked a
+	// positive amount (a zero/omitted value keeps the 5000 ruble default).
+	if money > 0 {
+		if _, err := tx.Exec(`UPDATE characters SET rubles=?, updated_at=? WHERE client_uuid=?`, int64(money), now, uuid); err != nil {
+			return err
+		}
 	}
 	if loadout != "" {
 		for _, e := range strings.Split(loadout, ",") {

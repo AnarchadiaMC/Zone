@@ -1,6 +1,123 @@
 <?xml version="1.0" encoding="windows-1251"?>
 <string_table>
     <string id="ui_mm_zone_online">
-        <text>Р—РѕРЅР°</text>
+        <text>Зона</text>
+    </string>
+    <string id="ui_zone_title">
+        <text>СЕТЬ ЗОНЫ</text>
+    </string>
+    <string id="ui_zone_tab_internet">
+        <text>Интернет</text>
+    </string>
+    <string id="ui_zone_tab_lan">
+        <text>Локальная</text>
+    </string>
+    <string id="ui_zone_tab_favorites">
+        <text>Избранное</text>
+    </string>
+    <string id="ui_zone_tab_direct">
+        <text>Прямое подключение</text>
+    </string>
+    <string id="ui_zone_col_name">
+        <text>Название</text>
+    </string>
+    <string id="ui_zone_col_map">
+        <text>Карта</text>
+    </string>
+    <string id="ui_zone_col_players">
+        <text>Игроки</text>
+    </string>
+    <string id="ui_zone_col_ping">
+        <text>Пинг</text>
+    </string>
+    <string id="ui_zone_col_mode">
+        <text>Режим</text>
+    </string>
+    <string id="ui_zone_scan">
+        <text>Сканировать</text>
+    </string>
+    <string id="ui_zone_scanning">
+        <text>Сканирование...</text>
+    </string>
+    <string id="ui_zone_empty_title">
+        <text>Серверы не найдены</text>
+    </string>
+    <string id="ui_zone_empty_hint">
+        <text>Нажмите «Обновить» для повторного сканирования или введите адрес на вкладке «Прямое подключение».</text>
+    </string>
+    <string id="ui_zone_connecting">
+        <text>Подключение...</text>
+    </string>
+    <string id="ui_zone_connected">
+        <text>Подключено</text>
+    </string>
+    <string id="ui_zone_failed">
+        <text>Не удалось подключиться</text>
+    </string>
+    <string id="ui_zone_direct_host">
+        <text>Адрес сервера</text>
+    </string>
+    <string id="ui_zone_direct_port">
+        <text>Порт</text>
+    </string>
+    <string id="ui_zone_direct_nick">
+        <text>Позывной</text>
+    </string>
+    <string id="ui_zone_btn_connect">
+        <text>Подключиться</text>
+    </string>
+    <string id="ui_zone_btn_back">
+        <text>Назад</text>
+    </string>
+    <string id="ui_zone_btn_favorite">
+        <text>В избранное</text>
+    </string>
+    <string id="ui_zone_btn_remove">
+        <text>Удалить</text>
+    </string>
+    <string id="ui_zone_btn_refresh">
+        <text>Обновить</text>
+    </string>
+    <string id="ui_zone_status_ready">
+        <text>Готово</text>
+    </string>
+    <string id="ui_zone_status_offline">
+        <text>Сетевой модуль недоступен</text>
+    </string>
+    <string id="ui_zone_details">
+        <text>Сведения</text>
+    </string>
+    <string id="ui_zone_lock">
+        <text>Замок</text>
+    </string>
+    <string id="ui_zone_last_seen">
+        <text>Последний раз</text>
+    </string>
+    <string id="ui_zone_bad_address">
+        <text>Введите корректный адрес</text>
+    </string>
+    <string id="ui_zone_bad_port">
+        <text>Порт должен быть от 1 до 65535</text>
+    </string>
+    <string id="ui_zone_name_hint">
+        <text>Никнейм задаётся в настройках Zone (MCM).</text>
+    </string>
+    <string id="ui_zone_error_generic">
+        <text>Сервер отклонил создание персонажа.</text>
+    </string>
+    <string id="ui_zone_error_faction">
+        <text>Сервер отклонил эту фракцию.</text>
+    </string>
+    <string id="ui_zone_error_loadout">
+        <text>Сервер отклонил это снаряжение.</text>
+    </string>
+    <string id="ui_zone_error_create">
+        <text>Сервер не смог создать персонажа. Попробуйте ещё раз.</text>
+    </string>
+    <string id="ui_zone_error_send">
+        <text>Не удалось отправить выбор на сервер.</text>
+    </string>
+    <string id="ui_zone_error_not_connected">
+        <text>Нет соединения с сервером.</text>
     </string>
 </string_table>

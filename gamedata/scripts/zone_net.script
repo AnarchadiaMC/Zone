@@ -15,6 +15,23 @@ local VISUAL_CHECK_MS = 1000
 local DEFAULT_VISUAL = "actors\\stalker_neutral\\stalker_neutral_1"
 local zone_callbacks_registered = false
 
+-- Join/spawn flow state ------------------------------------------------------
+-- Set by OpLoadLevel (0x0073); applied immediately in-game or on first actor
+-- update after the menu-initiated level start. The marker file carries the
+-- target across the Lua VM restart that a level load triggers.
+local pending_spawn = nil
+local pending_inventory = {}
+local last_applied_inventory_fingerprint = nil
+local apply_inventory_pending = false
+local level_start_issued = false
+local JOIN_MARKER = "zone_pending_join.ltx"
+
+-- Forward declarations: dispatch_packet references these but they are defined
+-- after it (they need the parse helpers declared further down). clear_pending_join
+-- is forward-declared so reset_state can disarm the on-disk join marker.
+local on_load_level, on_inventory_sync, on_server_error, handle_show_start
+local clear_pending_join
+
 function read_uint8(pkt, pos)
     return string.byte(pkt, pos), pos + 1
 end
@@ -103,6 +120,15 @@ function reset_state()
     last_level_sent = nil
     last_visual_sent = nil
     last_visual_check = 0
+    -- Disarm any menu-initiated join marker: without this a later
+    -- actor_on_first_update in a fresh session could apply a stale
+    -- spawn/faction from a previous join attempt.
+    pending_spawn = nil
+    pending_inventory = {}
+    last_applied_inventory_fingerprint = nil
+    apply_inventory_pending = false
+    level_start_issued = false
+    if clear_pending_join then pcall(clear_pending_join) end
 end
 
 -- Polyfill ZoneNet global object for compatibility
@@ -231,6 +257,15 @@ function ZoneNet:GetFaction()
     end
     return ""
 end
+-- Economy tier delivered by the handshake (ZN_GetSpawn out-param).
+function ZoneNet:GetEcoTier()
+    local _, _, _, _, eco = self:GetSpawn()
+    return tonumber(eco) or 0
+end
+-- Back-compat alias used by zone_ui_peer_faction.zone_eco_tier().
+function ZoneNet:HostEcoTier()
+    return self:GetEcoTier()
+end
 function ZoneNet:SendCharacterSelect(faction, money, items_str)
     if not zone_client then return false end
     local ok, res = pcall(function() return zone_client.ZN_SendCharacterSelect(faction or "", money or 0, items_str or "") end)
@@ -266,13 +301,8 @@ local function open_faction_ui_once(owner)
         end
     end)
 end
-function on_show_start(pkt, offset)
-    local pending = false
-    pcall(function()
-        if ZoneNet and ZoneNet.IsPendingCreate then pending = ZoneNet:IsPendingCreate() and true or false end
-    end)
-    if pending then open_faction_ui_once() end
-end
+-- OpShowStart handling lives in zone_main.on_show_start (single owner);
+-- dispatch reaches it through handle_show_start (defined below).
 
 function read_float_le(pkt, pos)
     local b1, b2, b3, b4 = string.byte(pkt, pos, pos + 3)
@@ -388,9 +418,23 @@ function dispatch_packet(pkt)
             pcall(zone_ai_proxy.on_ai_action, pkt, offset)
         end
     elseif opcode == 0x0071 then
-        pcall(on_show_start, pkt, offset)
+        pcall(function()
+            if type(handle_show_start) == "function" then handle_show_start(pkt, offset) end
+        end)
     elseif opcode == 0x0072 then
         close_faction_ui()
+    elseif opcode == 0x0073 then
+        pcall(function()
+            if type(on_load_level) == "function" then on_load_level(pkt, offset) end
+        end)
+    elseif opcode == 0x0076 then
+        pcall(function()
+            if type(on_inventory_sync) == "function" then on_inventory_sync(pkt, offset) end
+        end)
+    elseif opcode == 0x0077 then
+        pcall(function()
+            if type(on_server_error) == "function" then on_server_error(pkt, offset) end
+        end)
     end
 end
 
@@ -446,9 +490,474 @@ local function send_player_visual(force)
     ZoneNet:SendPlayerVisual(visual)
 end
 
+-- ---------------------------------------------------------------------------
+-- Join / spawn flow (OpLoadLevel 0x0073, OpInventorySync 0x0076, OpError 0x0077)
+-- ---------------------------------------------------------------------------
+
+local function in_game()
+    local present = false
+    pcall(function() present = (level ~= nil and level.present() == true) end)
+    return present
+end
+
+-- Main-menu-safe packet pump. actor_on_update only fires in-game, but the
+-- pre-game join packets (handshake status, SHOW_START 0x0071, LOAD_LEVEL
+-- 0x0073, ERROR 0x0077, SAFEZONE_STATE 0x0020) arrive while the player is
+-- still in the main menu. Drains only that subset. Once LOAD_LEVEL has
+-- requested the level start it stops consuming, so packets that belong to the
+-- in-game pump (e.g. INVENTORY_SYNC 0x0076) stay in the native event ring
+-- across the Lua VM restart. Re-entrancy safe and pcall-wrapped.
+local MENU_PUMP_OPCODES = {
+    [0x0002] = true,
+    [0x0071] = true,
+    [0x0073] = true,
+    [0x0077] = true,
+    [0x0020] = true,
+}
+local menu_pumping = false
+
+function pump_menu()
+    if menu_pumping or level_start_issued then return end
+    menu_pumping = true
+    pcall(function()
+        if in_game() then return end
+        while true do
+            local pkt = nil
+            local ok_poll = pcall(function() pkt = ZoneNet:PollEvent() end)
+            if not ok_poll or not pkt then break end
+            local opcode = nil
+            if string.len(pkt) >= 12 then
+                opcode = read_uint16_le(pkt, 9)
+            end
+            if opcode and MENU_PUMP_OPCODES[opcode] then
+                pcall(dispatch_packet, pkt)
+            end
+            if level_start_issued then break end
+        end
+    end)
+    menu_pumping = false
+end
+
+local function apply_faction(faction)
+    if not (db and db.actor) then return false end
+    faction = tostring(faction or "")
+    if faction == "" then return false end
+    local comm = faction
+    if string.sub(comm, 1, 6) ~= "actor_" then comm = "actor_" .. comm end
+    local ok = pcall(function() db.actor:set_character_community(comm, 0, 0) end)
+    if not ok then
+        printf("Zone: failed to apply faction %s", tostring(faction))
+    end
+    return ok
+end
+
+local function apply_spawn_position(x, y, z)
+    if not (db and db.actor) then return false end
+    local ok = pcall(function() db.actor:set_actor_position(vector():set(x, y, z)) end)
+    if not ok then
+        ok = pcall(function() db.actor:set_npc_position(vector():set(x, y, z)) end)
+    end
+    if not ok then
+        printf("Zone: failed to apply spawn position")
+    end
+    return ok
+end
+
+local function console_exec(cmd)
+    local ok = false
+    pcall(function()
+        if get_console then
+            get_console():execute(cmd)
+            ok = true
+        end
+    end)
+    if not ok then
+        pcall(function()
+            if type(_G.exec_console_cmd) == "function" then
+                _G.exec_console_cmd(cmd)
+                ok = true
+            end
+        end)
+    end
+    return ok
+end
+
+-- A new game can only be created from the main menu: the engine's KERNEL:start
+-- handler asserts no level is loaded. Console "start" runs Anomaly's own
+-- new-game flow from all.spawn; the spawn registry picks the start level
+-- (l01_escape), so this is the stock path with no xrRazom dependency.
+local function start_singleplayer_game()
+    return console_exec("start server(all/single/alife/new) client(localhost)")
+end
+
+local function level_name_from_id(level_id)
+    -- Server level ids: 0 = l01_escape (only hosted world).
+    if tonumber(level_id) == 0 then return "l01_escape" end
+    return "l01_escape"
+end
+
+-- Pending-join marker: survives the Lua VM restart caused by a level load.
+local function join_marker_path()
+    local path = nil
+    pcall(function()
+        local fs = getFS and getFS()
+        if fs and fs.update_path then
+            path = fs:update_path("$app_data_root$", JOIN_MARKER)
+        end
+    end)
+    return path
+end
+
+local function save_pending_join(sp)
+    local path = join_marker_path()
+    if not path then return false end
+    local ok = pcall(function()
+        local f = io.open(path, "w")
+        if not f then return end
+        f:write(string.format("level = %s\n", tostring(sp.level or "")))
+        f:write(string.format("x = %.4f\n", tonumber(sp.x) or 0))
+        f:write(string.format("y = %.4f\n", tonumber(sp.y) or 0))
+        f:write(string.format("z = %.4f\n", tonumber(sp.z) or 0))
+        f:write(string.format("faction = %s\n", tostring(sp.faction or "")))
+        f:close()
+    end)
+    return ok
+end
+
+clear_pending_join = function()
+    local path = join_marker_path()
+    if not path then return end
+    pcall(function()
+        local f = io.open(path, "w")
+        if f then
+            f:write("")
+            f:close()
+        end
+    end)
+end
+
+local function load_pending_join()
+    local path = join_marker_path()
+    if not path then return nil end
+    local sp = nil
+    pcall(function()
+        local f = io.open(path, "r")
+        if not f then return end
+        local t = { level = "", faction = "", x = 0, y = 0, z = 0 }
+        for line in f:lines() do
+            local k, v = string.match(line, "^%s*(%w+)%s*=%s*(.-)%s*$")
+            if k and v then t[k] = v end
+        end
+        f:close()
+        if t.level ~= "" or t.faction ~= "" then sp = t end
+    end)
+    if not sp then return nil end
+    sp.x = tonumber(sp.x) or 0
+    sp.y = tonumber(sp.y) or 0
+    sp.z = tonumber(sp.z) or 0
+    return sp
+end
+
+local function create_inventory_entry(entry)
+    local actor = db and db.actor
+    if not actor then return false end
+    local section = entry.section
+    if type(section) ~= "string" or section == "" then return false end
+    if ini_sys and ini_sys.section_exist and not ini_sys:section_exist(section) then
+        printf("Zone: inventory sync: unknown section %s", tostring(section))
+        return false
+    end
+
+    local copies = math.floor(tonumber(entry.count) or 1)
+    if copies < 1 then copies = 1 end
+    if copies > 100 then copies = 100 end
+
+    local pos  = actor:position()
+    local lvid = actor:level_vertex_id()
+    local gvid = actor:game_vertex_id()
+    local actor_id = actor:id()
+    local created = 0
+
+    for _ = 1, copies do
+        local se = nil
+        pcall(function() se = alife():create(section, pos, lvid, gvid, actor_id) end)
+        if not se then
+            -- Some classes (e.g. ammo) can fail with an online parent; create
+            -- unparented, then move the spawned object into the actor.
+            pcall(function() se = alife():create(section, pos, lvid, gvid) end)
+            if se then
+                local sid = nil
+                pcall(function() sid = (type(se.id) == "function") and se:id() or se.id end)
+                if sid then
+                    local obj = nil
+                    pcall(function() obj = level.object_by_id(sid) end)
+                    if obj then pcall(function() actor:transfer_item(obj, actor) end) end
+                end
+            end
+        end
+        if se then
+            created = created + 1
+            local sid = nil
+            pcall(function() sid = (type(se.id) == "function") and se:id() or se.id end)
+            local obj = nil
+            if sid then pcall(function() obj = level.object_by_id(sid) end) end
+            if obj then
+                local cond = tonumber(entry.condition)
+                if cond and cond >= 0 and cond <= 100 then
+                    pcall(function() obj:set_condition(cond / 100) end)
+                end
+                local ammo = tonumber(entry.ammo)
+                if ammo and ammo > 0 then
+                    pcall(function() obj:set_ammo_elapsed(math.floor(ammo)) end)
+                end
+                local slot = tonumber(entry.slot)
+                if slot then
+                    slot = math.floor(slot)
+                    if slot >= 0 and slot <= 15 then
+                        pcall(function() actor:move_to_slot(obj, slot, true) end)
+                    end
+                end
+            end
+        end
+    end
+
+    if created == 0 then
+        printf("Zone: inventory sync: failed to create %s", tostring(section))
+        return false
+    end
+    return true
+end
+
+local function inventory_fingerprint(entries)
+    local parts = {}
+    for _, it in ipairs(entries) do
+        parts[#parts + 1] = string.format("%s:%d:%d:%d",
+            tostring(it.section), tonumber(it.count) or 1,
+            tonumber(it.condition) or 0, tonumber(it.ammo) or 0)
+    end
+    return table.concat(parts, "|")
+end
+
+local function drain_inventory_queue()
+    if not in_game() then return end
+    if #pending_inventory == 0 then return end
+
+    local queue = pending_inventory
+    pending_inventory = {}
+    local fingerprint = inventory_fingerprint(queue)
+
+    -- Same kit already delivered to this Lua session (reconnect without a
+    -- level reload): the actor still owns it, do not spawn a second copy.
+    if fingerprint == last_applied_inventory_fingerprint then
+        printf("Zone: inventory sync already applied, skipping (%d entries)", #queue)
+        return
+    end
+
+    local applied = 0
+    for _, entry in ipairs(queue) do
+        if create_inventory_entry(entry) then applied = applied + 1 end
+    end
+    if applied > 0 then
+        last_applied_inventory_fingerprint = fingerprint
+    end
+    printf("Zone: inventory sync applied (%d/%d entries)", applied, #queue)
+end
+
+local function apply_pending_spawn()
+    if not pending_spawn then return end
+    if not in_game() then return end
+    local sp = pending_spawn
+    pending_spawn = nil
+    apply_faction(sp.faction)
+    apply_spawn_position(sp.x, sp.y, sp.z)
+    apply_inventory_pending = true
+end
+
+-- Applied on the first actor update after a menu-initiated level start.
+-- The marker is cleared only when the join was actually applied; otherwise it
+-- survives for a retry or is disarmed by reset_state on disconnect.
+local function apply_join_after_load()
+    local sp = load_pending_join()
+    if sp then
+        local faction_ok = apply_faction(sp.faction)
+        local position_ok = apply_spawn_position(sp.x, sp.y, sp.z)
+        if faction_ok or position_ok then
+            clear_pending_join()
+        else
+            printf("Zone: pending join not applied; marker kept until disconnect")
+        end
+    end
+    if in_game() then
+        apply_inventory_pending = true
+    end
+end
+
+on_load_level = function(pkt, offset)
+    -- LevelLoad payload (30 bytes): level u8, x/y/z f32, faction[16], eco u8.
+    local len = string.len(pkt)
+    if len < offset + 30 - 1 then return end
+
+    local level_id, pos = read_uint8(pkt, offset)
+    local x, pos = read_float_le(pkt, pos)
+    local y, pos = read_float_le(pkt, pos)
+    local z, pos = read_float_le(pkt, pos)
+    local faction, pos = read_string(pkt, pos, 16)
+    faction = clean_cstring(faction)
+    local eco, _ = read_uint8(pkt, pos)
+
+    local target_level = level_name_from_id(level_id)
+    local sp = { level = target_level, x = x, y = y, z = z, faction = faction, eco = eco }
+
+    if in_game() then
+        local cur = current_level_name()
+        if not cur or cur == target_level then
+            pending_spawn = sp
+            apply_pending_spawn()
+            apply_inventory_pending = true
+        else
+            -- No engine API loads an arbitrary level by name while a level is
+            -- loaded (KERNEL:start asserts no level; ChangeLevel needs graph
+            -- vertex ids). Surface it instead of silently doing nothing.
+            printf("Zone: server wants level %s but %s is loaded; reconnect from the main menu",
+                tostring(target_level), tostring(cur))
+            if db and db.actor then
+                pcall(function()
+                    db.actor:give_game_news("Zone",
+                        "Server level change is not supported in-game. Reconnect from the main menu.",
+                        "ui_inGame2_PDA_icon", 0, 5000, 0)
+                end)
+            end
+        end
+        return
+    end
+
+    -- Main menu: persist the target (the reload wipes this Lua VM), then start.
+    pending_spawn = sp
+    save_pending_join(sp)
+    if not level_start_issued then
+        level_start_issued = true
+        if start_singleplayer_game() then
+            printf("Zone: starting game for level %s", tostring(target_level))
+        else
+            printf("Zone: failed to start game (console start unavailable)")
+            level_start_issued = false
+            -- No VM restart is coming, so the marker would only be a stale
+            -- time bomb for a manual new game: disarm it.
+            pending_spawn = nil
+            clear_pending_join()
+        end
+    end
+end
+
+on_inventory_sync = function(pkt, offset)
+    local len = string.len(pkt)
+    if len < offset then return end
+    local item_count, pos = read_uint8(pkt, offset)
+    if not item_count or item_count == 0 then return end
+
+    local entries = {}
+    for _ = 1, item_count do
+        if pos + 69 > len then
+            printf("Zone: inventory sync packet truncated")
+            return
+        end
+        local section, p2 = read_string(pkt, pos, 64); pos = p2
+        section = clean_cstring(section)
+        local count, p3 = read_uint16_le(pkt, pos); pos = p3
+        local condition, p4 = read_uint8(pkt, pos); pos = p4
+        local ammo, p5 = read_uint16_le(pkt, pos); pos = p5
+        local slot_raw, p6 = read_uint8(pkt, pos); pos = p6
+        local slot = slot_raw
+        if slot_raw > 127 then slot = slot_raw - 256 end
+        entries[#entries + 1] = {
+            section = section, count = count,
+            condition = condition, ammo = ammo, slot = slot,
+        }
+    end
+    if #entries == 0 then return end
+
+    -- Server retry defense: never queue a kit whose fingerprint was already
+    -- applied. Without this, a double send would spawn the items twice when
+    -- both batches land in pending_inventory before the next drain.
+    if inventory_fingerprint(entries) == last_applied_inventory_fingerprint then
+        printf("Zone: inventory sync already applied, dropping duplicate batch (%d entries)", #entries)
+        return
+    end
+
+    for _, entry in ipairs(entries) do
+        pending_inventory[#pending_inventory + 1] = entry
+    end
+    if in_game() then
+        apply_inventory_pending = true
+    end
+end
+
+on_server_error = function(pkt, offset)
+    local len = string.len(pkt)
+    if len < offset then return end
+    local code, pos = read_uint8(pkt, offset)
+    local msg = ""
+    if len >= pos + 96 - 1 then
+        msg, pos = read_string(pkt, pos, 96)
+        msg = clean_cstring(msg)
+    end
+    if msg == "" then
+        msg = string.format("Server rejected the character (code %d).", tonumber(code) or 0)
+    end
+
+    -- Prefer the localized string for known codes.
+    local key = "ui_zone_error_generic"
+    if code == 1 then key = "ui_zone_error_faction"
+    elseif code == 2 then key = "ui_zone_error_loadout"
+    elseif code == 3 then key = "ui_zone_error_create" end
+    pcall(function()
+        local translated = game.translate_string(key)
+        if type(translated) == "string" and translated ~= "" and translated ~= key then
+            msg = translated
+        end
+    end)
+
+    printf("Zone: server error: %s", tostring(msg))
+    if db and db.actor then
+        pcall(function()
+            db.actor:give_game_news("Zone", msg, "ui_inGame2_PDA_icon", 0, 5000, 0)
+        end)
+    end
+
+    local dlg = nil
+    pcall(function()
+        if type(_G.get_peer_faction_dialog) == "function" then
+            dlg = _G.get_peer_faction_dialog()
+        end
+        if not dlg and zone_ui_peer_faction and zone_ui_peer_faction.get_peer_faction_dialog then
+            dlg = zone_ui_peer_faction.get_peer_faction_dialog()
+        end
+    end)
+    if dlg and dlg.OnServerError then
+        pcall(function() dlg:OnServerError(msg) end)
+    end
+end
+
+handle_show_start = function(pkt, offset)
+    -- Single owner of OpShowStart handling lives in zone_main.
+    local owned = false
+    pcall(function()
+        if zone_main and type(zone_main.on_show_start) == "function" then
+            owned = true
+            zone_main.on_show_start(pkt, offset)
+        end
+    end)
+    if not owned then
+        pcall(function()
+            if _G.open_peer_faction then _G.open_peer_faction(nil) end
+        end)
+    end
+end
+
 local function on_actor_first_update()
     pcall(send_level_change, true)
     pcall(send_player_visual, true)
+    pcall(apply_join_after_load)
 end
 
 local function on_level_changing()
@@ -466,7 +975,7 @@ local function on_actor_net_destroy()
     last_visual_check = 0
 end
 
-function on_game_start()
+function register_level_callbacks()
     if zone_callbacks_registered then return end
     zone_callbacks_registered = true
     pcall(function()
@@ -478,6 +987,10 @@ function on_game_start()
     end)
     pcall(send_level_change, true)
     pcall(send_player_visual, true)
+end
+
+function on_game_start()
+    register_level_callbacks()
 end
 
 -- xrRazom guard: when co-op is live, Zone stays dormant so the two proxy
@@ -561,6 +1074,14 @@ function on_tick()
             open_faction_ui_once()
         end
     end)
+
+    -- Deliver queued starter/restored inventory once the actor exists; deferred
+    -- to the tick after the spawn so physics and the inventory owner are ready.
+    if apply_inventory_pending and in_game() and db and db.actor then
+        apply_inventory_pending = false
+        pcall(drain_inventory_queue)
+    end
+
     if db.actor then
         pcall(function()
             local pos = db.actor:position()

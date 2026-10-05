@@ -290,6 +290,162 @@ func TestProtocolV2_SleeperDamageUsesSameValidation(t *testing.T) {
 	}
 }
 
+func entityEnterPacketsFor(t *testing.T, sink *fakeSink, entityID uint32) []protocol.EntityEnterAoI {
+	t.Helper()
+	var out []protocol.EntityEnterAoI
+	for _, raw := range packetsByOpcode(sink, protocol.OpEntityEnterAoI) {
+		r := bytes.NewReader(raw)
+		if _, err := protocol.ReadHeader(r); err != nil {
+			continue
+		}
+		var enter protocol.EntityEnterAoI
+		if err := binary.Read(r, binary.LittleEndian, &enter); err != nil {
+			continue
+		}
+		if enter.EntityID == entityID {
+			out = append(out, enter)
+		}
+	}
+	return out
+}
+
+func TestProtocolV2_EntityEnterWaitsForGvidAndVisual(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+
+	peerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45010}
+	moverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45011}
+	peer := &network.PlayerSession{
+		SessionID:    7501,
+		AccountID:    "uuid-enter-peer",
+		UDPAddr:      peerAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{1, 0, 1},
+		Health:       100,
+		HasVisual:    true,
+		Gvid:         100,
+		LastSeen:     time.Now(),
+	}
+	mover := &network.PlayerSession{
+		SessionID:         7502,
+		AccountID:         "uuid-enter-mover",
+		UDPAddr:           moverAddr,
+		CurrentLevel:      "l01_escape",
+		Position:          [3]float32{0, 0, 0},
+		Health:            100,
+		LastTransformTime: time.Now(),
+		LastSeen:          time.Now(),
+	}
+	s.sessions.AddSession(peer)
+	s.sessions.AddSession(mover)
+	sink.Reset()
+
+	ctZero := protocol.ClientTransform{PosX: 0, PosY: 0, PosZ: 0}
+	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 100, protocol.FlagUnreliable, ctZero), moverAddr)
+	if got := len(entityEnterPacketsFor(t, sink, mover.SessionID)); got != 0 {
+		t.Fatalf("ENTITY_ENTER broadcast for gvid 0: got %d, want 0", got)
+	}
+
+	ctGvid := protocol.ClientTransform{PosX: 0, PosY: 0, PosZ: 0, Gvid: 0x0123}
+	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 101, protocol.FlagUnreliable, ctGvid), moverAddr)
+	if got := len(entityEnterPacketsFor(t, sink, mover.SessionID)); got != 0 {
+		t.Fatalf("ENTITY_ENTER broadcast before visual known: got %d, want 0", got)
+	}
+
+	var pv protocol.PlayerVisualPayload
+	copy(pv.Visual[:], `actors\stalker_neutral\stalker_neutral_1`)
+	s.HandlePacket(buildTestPacket(t, protocol.OpPlayerVisual, 200, protocol.FlagReliable, pv), moverAddr)
+
+	enters := entityEnterPacketsFor(t, sink, mover.SessionID)
+	if len(enters) != 1 {
+		t.Fatalf("expected exactly 1 ENTITY_ENTER once gvid and visual known, got %d", len(enters))
+	}
+	if enters[0].Gvid != 0x0123 {
+		t.Errorf("ENTITY_ENTER gvid = 0x%04X, want 0x0123", enters[0].Gvid)
+	}
+	if got := string(bytes.TrimRight(enters[0].Section[:], "\x00")); got != `actors\stalker_neutral\stalker_neutral_1` {
+		t.Errorf("ENTITY_ENTER section = %q", got)
+	}
+
+	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 300, protocol.FlagUnreliable, ctGvid), moverAddr)
+	if got := len(entityEnterPacketsFor(t, sink, mover.SessionID)); got != 1 {
+		t.Fatalf("ENTITY_ENTER re-broadcast for same level: got %d, want 1", got)
+	}
+}
+
+func TestProtocolV2_LevelChangeResetsAndRebroadcastsEntityEnter(t *testing.T) {
+	s, sink, _ := setupTestServerWithDB(t)
+
+	peerOldAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45012}
+	peerNewAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45013}
+	moverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45014}
+	peerOld := &network.PlayerSession{
+		SessionID:    7601,
+		AccountID:    "uuid-lvl-peer-old",
+		UDPAddr:      peerOldAddr,
+		CurrentLevel: "l01_escape",
+		Position:     [3]float32{1, 0, 1},
+		Health:       100,
+		HasVisual:    true,
+		Gvid:         10,
+		LastSeen:     time.Now(),
+	}
+	peerNew := &network.PlayerSession{
+		SessionID:    7602,
+		AccountID:    "uuid-lvl-peer-new",
+		UDPAddr:      peerNewAddr,
+		CurrentLevel: "l02_garbage",
+		Position:     [3]float32{2, 0, 2},
+		Health:       100,
+		HasVisual:    true,
+		Gvid:         20,
+		LastSeen:     time.Now(),
+	}
+	mover := &network.PlayerSession{
+		SessionID:         7603,
+		AccountID:         "uuid-lvl-mover",
+		UDPAddr:           moverAddr,
+		CurrentLevel:      "l01_escape",
+		Position:          [3]float32{0, 0, 0},
+		Health:            100,
+		HasVisual:         true,
+		Gvid:              0x1111,
+		LastTransformTime: time.Now(),
+		LastSeen:          time.Now(),
+	}
+	s.sessions.AddSession(peerOld)
+	s.sessions.AddSession(peerNew)
+	s.sessions.AddSession(mover)
+	sink.Reset()
+
+	ctOld := protocol.ClientTransform{PosX: 0, PosY: 0, PosZ: 0, Gvid: 0x1111}
+	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 100, protocol.FlagUnreliable, ctOld), moverAddr)
+	if got := len(entityEnterPacketsFor(t, sink, mover.SessionID)); got != 1 {
+		t.Fatalf("expected 1 initial ENTITY_ENTER, got %d", got)
+	}
+	sink.Reset()
+
+	var lvl protocol.LevelChangePayload
+	copy(lvl.Level[:], "l02_garbage")
+	s.HandlePacket(buildTestPacket(t, protocol.OpLevelChange, 200, protocol.FlagReliable, lvl), moverAddr)
+
+	if got := len(entityEnterPacketsFor(t, sink, mover.SessionID)); got != 0 {
+		t.Fatalf("ENTITY_ENTER broadcast immediately after level change: got %d, want 0", got)
+	}
+	if got := len(packetsByOpcode(sink, protocol.OpEntityLeaveAoI)); got != 1 {
+		t.Fatalf("expected 1 ENTITY_LEAVE for the old level, got %d", got)
+	}
+
+	ctNew := protocol.ClientTransform{PosX: 0, PosY: 0, PosZ: 0, Gvid: 0x2222}
+	s.HandlePacket(buildTestPacket(t, protocol.OpClientTransform, 300, protocol.FlagUnreliable, ctNew), moverAddr)
+	enters := entityEnterPacketsFor(t, sink, mover.SessionID)
+	if len(enters) != 1 {
+		t.Fatalf("expected exactly 1 ENTITY_ENTER after level change + gvid, got %d", len(enters))
+	}
+	if enters[0].Gvid != 0x2222 {
+		t.Errorf("re-broadcast gvid = 0x%04X, want 0x2222", enters[0].Gvid)
+	}
+}
+
 func TestProtocolV2_PlayerVisualBroadcastsEntityEnter(t *testing.T) {
 	s, sink, _ := setupTestServerWithDB(t)
 	sink.Reset()

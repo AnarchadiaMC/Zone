@@ -98,21 +98,26 @@ end
 -- side (they load first), silently losing btn_multiplayer. Nothing references
 -- modxml_zone_main_menu.inject_button externally (dxml dispatches on_xml_read).
 local _zone_modxml_chaining = false
+local _zone_callbacks_registered = false
 
 function zone_modxml_on_xml_read()
-    RegisterScriptCallback("on_xml_read", zone_inject_button)
+    if not _zone_callbacks_registered then
+        _zone_callbacks_registered = true
+        RegisterScriptCallback("on_xml_read", zone_inject_button)
 
-    -- Defer main_menu_on_init registration: zone_menu_patch loads after gathering.
-    -- Use a wrapper that resolves the function at call time, not registration time.
-    RegisterScriptCallback("main_menu_on_init", function(menu)
-        if zone_menu_patch and zone_menu_patch.on_main_menu_init then
-            zone_menu_patch.on_main_menu_init(menu)
-        end
-        if type(_prev_global_on_main_menu_init) == "function" then
-            pcall(_prev_global_on_main_menu_init, menu)
-        end
-    end)
-    log("[Zone] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
+        -- Defer main_menu_on_init registration: zone_menu_patch loads after gathering.
+        -- Use a wrapper that resolves the function at call time, not registration time.
+        -- zone_menu_patch.on_main_menu_init chains the previously-defined global
+        -- itself; chaining it here as well would run the previous handler twice.
+        RegisterScriptCallback("main_menu_on_init", function(menu)
+            if zone_menu_patch and type(zone_menu_patch.on_main_menu_init) == "function" then
+                zone_menu_patch.on_main_menu_init(menu)
+            elseif type(_prev_global_on_main_menu_init) == "function" then
+                pcall(_prev_global_on_main_menu_init, menu)
+            end
+        end)
+        log("[Zone] modxml_zone_main_menu registered on_xml_read and main_menu_on_init")
+    end
 
     -- Re-entrancy guard (protects against mutual A-calls-B-calls-A chains).
     if _zone_modxml_chaining then return end

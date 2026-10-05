@@ -1,145 +1,156 @@
 <w>
-    <!-- Zone Server Browser - Overhauled Tactical Theme (Amber/Dark) -->
-    <background x="163" y="64" width="698" height="640" stretch="1">
-        <texture>ui_inGame2_multiplayer_game_menu</texture>
+    <background x="0" y="0" width="1024" height="768" stretch="1">
+        <texture>ui_inGame2_mp_background</texture>
     </background>
 
-    <!-- Header: Zone amber primary, subtitle muted -->
-    <header_label x="200" y="80" width="624" height="26">
-        <text align="c" font="letterica18" r="255" g="195" b="5">ZONE - SERVER BROWSER</text>
-    </header_label>
-    <subtitle_label x="200" y="106" width="624" height="14">
-        <text align="c" font="letterica16" r="140" g="140" b="135">SURVIVAL NETWORK  |  DIRECT LINK  |  SECURE UPLINK</text>
-    </subtitle_label>
+    <window_frame x="163" y="60" width="698" height="648" stretch="1">
+        <texture>ui_inGame2_main_window</texture>
+    </window_frame>
 
-    <!-- Accent underline (1px gold rule) -->
-    <accent_line x="175" y="124" width="674" height="1" stretch="1">
-        <texture>ui_inGame2_white_rect</texture>
+    <title x="180" y="72" width="530" height="28">
+        <text font="graffiti22" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_title</text>
+    </title>
+    <accent_line x="180" y="104" width="664" height="2" stretch="1">
+        <texture a="255" r="255" g="195" b="5">ui_inGame2_white_rect</texture>
     </accent_line>
+    <header_lamp x="815" y="70" width="37" height="25">
+        <texture>ui_inGame2_lamp_OFF</texture>
+    </header_lamp>
+    <status_header x="520" y="76" width="285" height="18">
+        <text font="letterica16" align="r" vert_align="c" r="255" g="215" b="0">ui_zone_status_ready</text>
+    </status_header>
 
-    <!-- Filter tabs (left) + search (right) -->
-    <btn_tab_all x="175" y="132" width="72" height="22">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c" r="255" g="215" b="0">All</text>
-    </btn_tab_all>
-    <btn_tab_fav x="252" y="132" width="96" height="22">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">* Favorites</text>
-    </btn_tab_fav>
-    <btn_tab_hist x="353" y="132" width="82" height="22">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">Recent</text>
-    </btn_tab_hist>
+    <tabs x="180" y="112" width="440" height="34">
+        <button id="tab_internet" x="0" y="0" width="118" height="34">
+            <texture>ui_button_tablist</texture>
+            <text font="letterica16" align="c" vert_align="c" r="235" g="230" b="215">ui_zone_tab_internet</text>
+        </button>
+        <button id="tab_lan" x="118" y="0" width="72" height="34">
+            <texture>ui_button_tablist</texture>
+            <text font="letterica16" align="c" vert_align="c" r="235" g="230" b="215">ui_zone_tab_lan</text>
+        </button>
+        <button id="tab_favorites" x="190" y="0" width="112" height="34">
+            <texture>ui_button_tablist</texture>
+            <text font="letterica16" align="c" vert_align="c" r="235" g="230" b="215">ui_zone_tab_favorites</text>
+        </button>
+        <button id="tab_direct" x="302" y="0" width="92" height="34">
+            <texture>ui_button_tablist</texture>
+            <text font="letterica16" align="c" vert_align="c" r="235" g="230" b="215">ui_zone_tab_direct</text>
+        </button>
+    </tabs>
 
-    <search_label x="500" y="136" width="42" height="16">
-        <text align="r" font="letterica16" r="160" g="160" b="160">Filter:</text>
-    </search_label>
-    <edit_search x="548" y="132" width="150" height="22" max_symb_count="32">
-        <texture>ui_inGame2_edit_box_1</texture>
-        <text font="letterica16" r="220" g="220" b="210"/>
-    </edit_search>
-
-    <!-- Column headers (amber underline via color, monospaced alignment via padding) -->
-    <col_name x="185" y="160" width="260" height="18">
-        <text font="letterica16" r="255" g="195" b="5">*  Server Name</text>
+    <col_name x="214" y="150" width="128" height="16">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_name</text>
     </col_name>
-    <col_host x="455" y="160" width="150" height="18">
-        <text font="letterica16" r="255" g="195" b="5">Host</text>
-    </col_host>
-    <col_port x="615" y="160" width="60" height="18">
-        <text font="letterica16" r="255" g="195" b="5">Port</text>
-    </col_port>
-    <col_status x="680" y="160" width="90" height="18">
-        <text font="letterica16" r="255" g="195" b="5">State</text>
-    </col_status>
+    <col_map x="342" y="150" width="78" height="16">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_map</text>
+    </col_map>
+    <col_players x="420" y="150" width="52" height="16">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_players</text>
+    </col_players>
+    <col_ping x="472" y="150" width="46" height="16">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_ping</text>
+    </col_ping>
+    <col_mode x="518" y="150" width="70" height="16">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_col_mode</text>
+    </col_mode>
 
-    <!-- Server list: reduced height to make room for details panel -->
-    <list x="175" y="180" width="674" height="186" item_height="20">
-        <font font="letterica16" r="210" g="210" b="205"/>
-        <list_font font="letterica16" r="210" g="210" b="205"/>
+    <list_frame x="180" y="166" width="430" height="436">
+        <texture>ui_inGame2_servers_list_frame</texture>
+    </list_frame>
+    <list x="180" y="166" width="430" height="436" item_height="26" always_show_scroll="1" can_select="1">
+        <font font="letterica16" r="225" g="225" b="215"/>
+        <list_font font="letterica16" r="225" g="225" b="215"/>
     </list>
 
-    <!-- Empty-state hint (shown via script when list empty, hidden otherwise) -->
-    <empty_hint x="175" y="250" width="674" height="22">
-        <text align="c" font="letterica16" r="120" g="120" b="115">No servers - enter address below or add favorite  |  Double-click to connect</text>
+    <empty_title x="180" y="340" width="430" height="24">
+        <text font="letterica18" align="c" vert_align="c" r="255" g="195" b="5">ui_zone_empty_title</text>
+    </empty_title>
+    <empty_hint x="180" y="368" width="430" height="36">
+        <text font="letterica16" align="c" vert_align="t" r="150" g="150" b="142" complex_mode="1">ui_zone_empty_hint</text>
     </empty_hint>
 
-    <!-- Selection details panel (dark strip) -->
-    <details_bg x="175" y="370" width="674" height="24" stretch="1">
-        <texture>ui_inGame2_edit_box_1</texture>
+    <details_bg x="620" y="166" width="224" height="436">
+        <texture>ui_inGame2_listbox</texture>
     </details_bg>
-    <details_label x="182" y="374" width="660" height="16">
-        <text font="letterica16" r="170" g="170" b="165">Selected: -</text>
-    </details_label>
-    <details_hint x="182" y="386" width="660" height="12">
-        <text font="letterica16" r="110" g="110" b="105">Double-click entry to connect  |  * toggles favorite  |  Recent auto-saved on connect</text>
-    </details_hint>
+    <details_title x="632" y="176" width="200" height="20">
+        <text font="letterica18" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_details</text>
+    </details_title>
+    <details_body x="632" y="202" width="200" height="388" complex_mode="1">
+        <text font="letterica16" align="l" vert_align="t" r="210" g="210" b="200"/>
+    </details_body>
 
-    <!-- Direct connect form -->
-    <direct_label x="175" y="404" width="300" height="18">
-        <text font="letterica16" r="255" g="195" b="5">DIRECT LINK</text>
-    </direct_label>
-    <direct_underline x="175" y="420" width="300" height="1" stretch="1">
-        <texture>ui_inGame2_white_rect</texture>
-    </direct_underline>
-
-    <ip_label x="175" y="430" width="78" height="20">
-        <text font="letterica16" r="200" g="200" b="200">IP Address:</text>
-    </ip_label>
-    <edit_ip x="260" y="428" width="260" height="24" max_symb_count="64">
+    <direct_bg x="180" y="166" width="664" height="436">
+        <texture>ui_inGame2_listbox</texture>
+    </direct_bg>
+    <direct_title x="192" y="178" width="300" height="22">
+        <text font="letterica18" align="l" vert_align="c" r="255" g="195" b="5">ui_zone_tab_direct</text>
+    </direct_title>
+    <host_label x="200" y="246" width="140" height="20">
+        <text font="letterica16" align="l" vert_align="c" r="200" g="200" b="192">ui_zone_direct_host</text>
+    </host_label>
+    <host_bg x="352" y="242" width="470" height="26">
         <texture>ui_inGame2_edit_box_1</texture>
-        <text font="letterica16" r="235" g="235" b="230"/>
+    </host_bg>
+    <edit_ip x="360" y="244" width="454" height="22" max_symb_count="64">
+        <text_color>
+            <e r="235" g="235" b="230"/>
+            <d r="120" g="120" b="120"/>
+        </text_color>
     </edit_ip>
-
-    <port_label x="530" y="430" width="38" height="20">
-        <text font="letterica16" r="200" g="200" b="200">Port:</text>
+    <port_label x="200" y="288" width="140" height="20">
+        <text font="letterica16" align="l" vert_align="c" r="200" g="200" b="192">ui_zone_direct_port</text>
     </port_label>
-    <edit_port x="570" y="428" width="90" height="24" max_symb_count="5">
+    <port_bg x="352" y="284" width="150" height="26">
         <texture>ui_inGame2_edit_box_1</texture>
-        <text font="letterica16" r="235" g="235" b="230"/>
+    </port_bg>
+    <edit_port x="360" y="286" width="134" height="22" max_symb_count="5">
+        <text_color>
+            <e r="235" g="235" b="230"/>
+            <d r="120" g="120" b="120"/>
+        </text_color>
     </edit_port>
-
-    <nick_label x="175" y="458" width="78" height="20">
-        <text font="letterica16" r="200" g="200" b="200">Callsign:</text>
+    <nick_label x="200" y="330" width="140" height="20">
+        <text font="letterica16" align="l" vert_align="c" r="200" g="200" b="192">ui_zone_direct_nick</text>
     </nick_label>
-    <edit_nick x="260" y="456" width="200" height="24" max_symb_count="24">
+    <nick_bg x="352" y="326" width="300" height="26">
         <texture>ui_inGame2_edit_box_1</texture>
-        <text font="letterica16" r="235" g="235" b="230"/>
+    </nick_bg>
+    <edit_nick x="360" y="328" width="284" height="22" max_symb_count="24">
+        <text_color>
+            <e r="235" g="235" b="230"/>
+            <d r="120" g="120" b="120"/>
+        </text_color>
     </edit_nick>
 
-    <!-- Primary action row -->
-    <btn_connect x="175" y="492" width="150" height="32">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c" r="255" g="215" b="0">Connect</text>
-    </btn_connect>
-    <btn_add_fav x="332" y="492" width="110" height="32">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">* Fav</text>
-    </btn_add_fav>
-    <btn_rename x="449" y="492" width="104" height="32">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">Rename</text>
-    </btn_rename>
-    <btn_refresh x="560" y="492" width="90" height="32">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">Refresh</text>
-    </btn_refresh>
-
-    <!-- Secondary row -->
-    <btn_del_fav x="175" y="532" width="150" height="30">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">Remove</text>
-    </btn_del_fav>
-    <btn_back x="332" y="532" width="110" height="30">
-        <texture>ui_button_ordinary</texture>
-        <text font="letterica16" align="c" vert_align="c">Back</text>
-    </btn_back>
-
-    <!-- Status footer: dark strip + amber/green/red text via script SetTextColor -->
-    <status_bg x="175" y="574" width="674" height="22" stretch="1">
-        <texture>ui_inGame2_edit_box_1</texture>
+    <status_bg x="180" y="610" width="664" height="29">
+        <texture>ui_inGame2_edit_box</texture>
     </status_bg>
-    <status_label x="182" y="578" width="660" height="16">
-        <text font="letterica16" r="255" g="215" b="0">o Ready - select server or enter address</text>
+    <status_label x="188" y="616" width="600" height="18">
+        <text font="letterica16" align="l" vert_align="c" r="255" g="215" b="0">ui_zone_status_ready</text>
     </status_label>
+    <spinner x="800" y="614" width="24" height="20" frames="1" duration="1000" columns="1" frame_width="24" frame_height="20" cyclic="0" autoplay="0">
+        <texture a="255" r="255" g="195" b="5">ui_inGame2_lamp_OFF</texture>
+    </spinner>
+
+    <btn_connect x="180" y="648" width="150" height="32">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica16" align="c" vert_align="c" r="255" g="215" b="0">ui_zone_btn_connect</text>
+    </btn_connect>
+    <btn_favorite x="338" y="648" width="140" height="32">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica16" align="c" vert_align="c" r="225" g="225" b="215">ui_zone_btn_favorite</text>
+    </btn_favorite>
+    <btn_remove x="486" y="648" width="140" height="32">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica16" align="c" vert_align="c" r="225" g="225" b="215">ui_zone_btn_remove</text>
+    </btn_remove>
+    <btn_refresh x="634" y="648" width="100" height="32">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica16" align="c" vert_align="c" r="225" g="225" b="215">ui_zone_btn_refresh</text>
+    </btn_refresh>
+    <btn_back x="742" y="648" width="102" height="32">
+        <texture>ui_button_ordinary</texture>
+        <text font="letterica16" align="c" vert_align="c" r="225" g="225" b="215">ui_zone_btn_back</text>
+    </btn_back>
 </w>

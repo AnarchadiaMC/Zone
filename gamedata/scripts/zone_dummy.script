@@ -3,8 +3,18 @@
 
 local spawned_proxies = {}
 local peer_factions = {}
+-- ENTITY_ENTER_AOI may arrive before the level/graph exists. Wire data is kept
+-- here (keyed by entity id) until a snapshot tick can spawn with valid data.
+local pending_peers = {}
 local MAX_HISTORY = 8
 local JITTER_BUFFER_MS = 100
+local DEFAULT_PROXY_VISUAL = "actors\\stalker_neutral\\stalker_neutral_1"
+local PROXY_SECTION = "zone_proxy_stalker"
+local FALLBACK_PROXY_SECTION = "sim_default_stalker_0"
+local INVALID_LEVEL_VERTEX = 0xFFFFFFFE
+local PENDING_PEER_CAP = 32
+local PENDING_PEER_TTL_MS = 120000
+local pending_prune_logged = false
 
 -- Ring buffer helper functions (L-30: avoid table.remove(tbl, 1) in hot path)
 local function add_history_sample(proxy, sample)
@@ -56,24 +66,108 @@ local function resolve_entity(id)
     return nil
 end
 
--- Helper to select valid profile section for faction (L-25)
-local function get_proxy_section(faction)
-    if faction and faction ~= "" then
-        local s = "sim_default_" .. faction
-        if ini_sys and ini_sys:section_exist(s) then return s end
-        local s0 = s .. "_0"
-        if ini_sys and ini_sys:section_exist(s0) then return s0 end
+-- Spawn section: [zone_proxy_stalker] is DLTX-merged into system.ltx from
+-- mod_system_zone_online.ltx and inherits sim_default_stalker_0.
+local function resolve_spawn_section()
+    if ini_sys and ini_sys.section_exist then
+        if ini_sys:section_exist(PROXY_SECTION) then return PROXY_SECTION end
+        if ini_sys:section_exist(FALLBACK_PROXY_SECTION) then return FALLBACK_PROXY_SECTION end
     end
-    if ini_sys and ini_sys:section_exist("sim_default_stalker") then
-        return "sim_default_stalker"
-    elseif ini_sys and ini_sys:section_exist("sim_default_stalker_0") then
-        return "sim_default_stalker_0"
-    end
-    return "stalker"
+    return nil
 end
 
-function spawn_proxy(session_id, pos, faction)
-    if spawned_proxies[session_id] then return end
+-- Server ENTITY_ENTER never carries a visual for AI puppets; player peers do.
+-- Applied only once the object is online (create is queued, not instant).
+local function try_apply_visual(proxy, obj)
+    if proxy.visual_applied then return end
+    local visual = proxy.visual
+    if not visual or visual == "" then
+        visual = DEFAULT_PROXY_VISUAL
+    end
+    local current = nil
+    pcall(function() current = obj:visual() end)
+    if current and current ~= "" and current == visual then
+        proxy.visual_applied = true
+        return
+    end
+    local ok = pcall(function() obj:set_visual_name(visual, true) end)
+    if ok then
+        proxy.visual_applied = true
+    end
+end
+
+-- Hold ENTITY_ENTER wire data until the level graph is available.
+local function store_pending_peer(eid, x, y, z, faction, visual, health, gvid)
+    if pending_peers[eid] then
+        local entry = pending_peers[eid]
+        entry.x, entry.y, entry.z = x, y, z
+        entry.faction, entry.visual = faction, visual
+        entry.health, entry.gvid = health, gvid
+    else
+        local n = 0
+        for _ in pairs(pending_peers) do n = n + 1 end
+        if n >= PENDING_PEER_CAP then
+            local oldest_eid, oldest_t = nil, nil
+            for id, entry in pairs(pending_peers) do
+                if oldest_t == nil or entry.t < oldest_t then
+                    oldest_eid, oldest_t = id, entry.t
+                end
+            end
+            if oldest_eid then
+                pending_peers[oldest_eid] = nil
+            end
+        end
+        pending_peers[eid] = {
+            x = x, y = y, z = z,
+            faction = faction, visual = visual,
+            health = health, gvid = gvid,
+            t = time_global()
+        }
+    end
+    if faction and faction ~= "" then
+        peer_factions[eid] = faction
+    end
+end
+
+local function prune_pending_peers(tg)
+    local removed = 0
+    for eid, entry in pairs(pending_peers) do
+        if entry.t and (tg - entry.t) > PENDING_PEER_TTL_MS then
+            pending_peers[eid] = nil
+            removed = removed + 1
+        end
+    end
+    if removed > 0 and not pending_prune_logged then
+        pending_prune_logged = true
+        printf("[zone_dummy] pruned %d expired pending peer(s)", removed)
+    end
+end
+
+local function try_spawn_pending(eid)
+    local pending = pending_peers[eid]
+    if not pending then return false end
+    if spawned_proxies[eid] then
+        pending_peers[eid] = nil
+        return true
+    end
+    -- Never spawn before the level graph exists (vertex_id needs it).
+    if not (level and level.vertex_id) then return false end
+    local pos = nil
+    pcall(function() pos = vector():set(pending.x, pending.y, pending.z) end)
+    if not pos then return false end
+    if spawn_proxy(eid, pos, pending.faction, pending.visual, pending.gvid) then
+        pending_peers[eid] = nil
+        return true
+    end
+    return false
+end
+
+-- Spawn from validated ENTITY_ENTER_AOI v2 data only: real visual + packet
+-- gvid. No actor lvid/gvid fallback (that spawned peers at the wrong graph
+-- vertex). Returns true when the alife object was queued for spawn.
+function spawn_proxy(session_id, pos, faction, visual, gvid)
+    if spawned_proxies[session_id] then return false end
+    if not pos then return false end
 
     -- Never spawn while xrRazom owns the world (dual proxy systems conflict).
     local xrr_active = false
@@ -81,64 +175,54 @@ function spawn_proxy(session_id, pos, faction)
         if _G.XrrIsConnected and _G.XrrIsConnected() then xrr_active = true end
         if _G.XrrIsHosted and _G.XrrIsHosted() then xrr_active = true end
     end)
-    if xrr_active then return end
+    if xrr_active then return false end
+
+    -- Game vertex is packet-authoritative; 0 means the server had none.
+    if not gvid or gvid == 0 then return false end
+
+    -- Level vertex queried at the ENTITY position, never at the local actor.
+    -- level.vertex_id returns u32(-1) off-graph; never feed that to create.
+    local lvid = nil
+    pcall(function()
+        if level and level.vertex_id then
+            lvid = level.vertex_id(pos)
+        end
+    end)
+    if lvid == nil or lvid >= INVALID_LEVEL_VERTEX then return false end
+
+    local section = resolve_spawn_section()
+    if not section then return false end
+
+    local sim = nil
+    pcall(function() sim = alife() end)
+    if not sim then return false end
+
+    local se_obj = nil
+    pcall(function() se_obj = sim:create(section, pos, lvid, gvid) end)
+    if not se_obj then return false end
 
     local resolved_faction = (faction and faction ~= "") and faction or (peer_factions[session_id] or "stalker")
     peer_factions[session_id] = resolved_faction
 
-    local section = get_proxy_section(resolved_faction)
-
-    -- PRODUCTION FIX: resolve vertices at the PROXY position, never at the
-    -- local actor. Using actor lvid/gvid spawned cross-map peers at the wrong
-    -- graph point (and crashed some level setups). level.vertex_id(pos) is the
-    -- engine query (see level_script.cpp); game vertex via cross-table when
-    -- available, else actor fallback, else 0 (create guarded by pcall).
-    local lvid = 0
-    local gvid = 0
-    pcall(function()
-        if level and level.vertex_id then
-            lvid = level.vertex_id(pos) or 0
-        elseif db.actor then
-            lvid = db.actor:level_vertex_id()
-        end
-        -- level.vertex_id returns u32(-1) off-graph; never feed that to create.
-        if lvid == nil or lvid >= 0xFFFFFFFE then
-            lvid = (db.actor and db.actor:level_vertex_id()) or 0
-        end
-    end)
-    pcall(function()
-        if level and level.vertex_position then
-            -- cross-table lookup would go here; keep actor fallback for now
-        end
-        if db.actor then
-            gvid = db.actor:game_vertex_id() or 0
-        end
-    end)
-
-    local sim = nil
-    pcall(function() sim = alife() end)
-    if not sim then return end
-
-    local se_obj = nil
-    pcall(function() se_obj = sim:create(section, pos, lvid, gvid) end)
-    if se_obj then
-        -- Tag for death manager bypass (needs integration in death_manager.script)
-        se_obj.is_zone_proxy = true
-        
-        spawned_proxies[session_id] = {
-            se_id = se_obj.id,
-            game_id = nil,
-            pos_history = {},
-            hist_head = 1,
-            hist_count = 0,
-            faction = resolved_faction,
-            last_attacker_id = nil,
-            last_update = time_global()
-        }
-    end
+    spawned_proxies[session_id] = {
+        se_id = se_obj.id,
+        game_id = nil,
+        pos_history = {},
+        hist_head = 1,
+        hist_count = 0,
+        faction = resolved_faction,
+        visual = (visual and visual ~= "") and visual or DEFAULT_PROXY_VISUAL,
+        visual_applied = false,
+        last_attacker_id = nil,
+        last_update = time_global()
+    }
+    -- Tag for death manager bypass (needs integration in death_manager.script)
+    pcall(function() se_obj.is_zone_proxy = true end)
+    return true
 end
 
 function despawn_proxy(session_id)
+    pending_peers[session_id] = nil
     local proxy = spawned_proxies[session_id]
     if proxy then
         -- Guarded: alife() is nil in menu / during level change.
@@ -170,15 +254,19 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     
     proxy.last_update = time_global()
     
-    -- Resolve game_id once online
+    -- Resolve game_id once online and apply the peer's real visual.
     if not proxy.game_id and level and level.object_by_id then
         local obj = level.object_by_id(proxy.se_id)
-        if obj then proxy.game_id = proxy.se_id end
+        if obj then
+            proxy.game_id = proxy.se_id
+            try_apply_visual(proxy, obj)
+        end
     end
     
     -- Apply anim flags / health if game object exists
     local obj = (proxy.game_id and level and level.object_by_id) and level.object_by_id(proxy.game_id) or nil
     if obj then
+        try_apply_visual(proxy, obj)
         if health <= 0 and obj:alive() then
             -- L-18: Attribute killer to actual attacker entity instead of self
             local killer_obj = resolve_entity(proxy.last_attacker_id) or obj
@@ -187,8 +275,8 @@ function update_proxy(session_id, x, y, z, yaw, pitch, animflags, health)
     end
 end
 
--- Reap ghosts whose LEAVE was lost (unreliable UDP) to prevent leaks.
-local STALE_PROXY_MS = 10000
+-- Hard TTL leak guard; explicit ENTITY_LEAVE is the normal despawn path.
+local STALE_PROXY_MS = 300000
 local function reap_stale_proxies(tg)
     for sid, proxy in pairs(spawned_proxies) do
         if proxy.last_update and (tg - proxy.last_update) > STALE_PROXY_MS then
@@ -208,7 +296,10 @@ function interpolate_proxies()
         -- Resolve game_id once online if not yet resolved
         if not proxy.game_id and level and level.object_by_id then
             local obj = level.object_by_id(proxy.se_id)
-            if obj then proxy.game_id = proxy.se_id end
+            if obj then
+                proxy.game_id = proxy.se_id
+                try_apply_visual(proxy, obj)
+            end
         end
 
         local count = proxy.hist_count
@@ -311,6 +402,7 @@ end
 
 function on_snapshot(pkt, offset)
     local pkt_len = string.len(pkt)
+    prune_pending_peers(time_global())
     -- count(1) + 22 bytes per SnapshotEntry; validate before walking (forged count safe)
     local count, pos = zone_net.read_uint8(pkt, offset)
     if not count then return end
@@ -331,19 +423,31 @@ function on_snapshot(pkt, offset)
         if yaw > 32767 then yaw = yaw - 65536 end
         if pitch > 32767 then pitch = pitch - 65536 end
         
-        -- If not spawned (maybe missed ENTER), use stored faction if available (L-25)
-        if not spawned_proxies[sid] then
-            local faction = peer_factions[sid] or "stalker"
-            spawn_proxy(sid, vector():set(x, y, z), faction)
+        -- Snapshot never spawns from scratch. It only flushes a pending
+        -- ENTITY_ENTER (peer seen before level load) with the latest position,
+        -- then updates proxies that already have valid spawn data.
+        local pending = pending_peers[sid]
+        if pending and not spawned_proxies[sid] then
+            pending.x, pending.y, pending.z = x, y, z
+            pending.health = health
+            try_spawn_pending(sid)
         end
-        update_proxy(sid, x, y, z, yaw / 100.0, pitch / 100.0, animflags, health)
+        if spawned_proxies[sid] then
+            update_proxy(sid, x, y, z, yaw / 100.0, pitch / 100.0, animflags, health)
+        end
     end
 end
 
+-- ENTITY_ENTER_AOI v2: entityID u32, type u8, section[64] (visual path),
+-- x/y/z f32, faction[16], health u8, gvid u16.
 function on_entity_enter(pkt, offset)
+    if not pkt or not offset then return end
+    -- Full v2 payload before parsing (forged/truncated packet safe).
+    if string.len(pkt) < offset + 100 - 1 then return end
+
     local eid, pos = zone_net.read_uint32_le(pkt, offset)
     local typ, pos = zone_net.read_uint8(pkt, pos)
-    local section, pos = zone_net.read_string(pkt, pos, 32)
+    local section, pos = zone_net.read_string(pkt, pos, 64)
     -- clean null bytes from section
     section = section:gsub("%z+", "")
     
@@ -354,6 +458,7 @@ function on_entity_enter(pkt, offset)
     local faction, pos = zone_net.read_string(pkt, pos, 16)
     faction = faction:gsub("%z+", "")
     local health, pos = zone_net.read_uint8(pkt, pos)
+    local gvid, pos = zone_net.read_uint16_le(pkt, pos)
     
     -- Store peer faction (L-25)
     if faction and faction ~= "" then
@@ -364,14 +469,23 @@ function on_entity_enter(pkt, offset)
         local proxy = spawned_proxies[eid]
         if proxy then
             proxy.faction = faction
+            if section and section ~= "" then
+                proxy.visual = section
+                proxy.visual_applied = false
+            end
             if proxy.game_id and level and level.object_by_id then
                 local obj = level.object_by_id(proxy.game_id)
-                if obj and obj.set_character_community then
-                    pcall(function() obj:set_character_community(faction, 0, 0) end)
+                if obj then
+                    pcall(try_apply_visual, proxy, obj)
+                    if obj.set_character_community then
+                        pcall(function() obj:set_character_community(faction, 0, 0) end)
+                    end
                 end
             end
         else
-            spawn_proxy(eid, vector():set(x, y, z), faction)
+            -- Store first; spawn only with valid level vertex + packet gvid.
+            store_pending_peer(eid, x, y, z, faction, section, health, gvid)
+            try_spawn_pending(eid)
         end
     end
 end
@@ -407,7 +521,10 @@ function on_damage_notify(target_id, attacker_id, damage, bone_id)
 end
 
 function on_entity_leave(pkt, offset)
-    local eid, pos = zone_net.read_uint32_le(pkt, offset)
+    if not pkt or not offset then return end
+    local eid = nil
+    pcall(function() eid = zone_net.read_uint32_le(pkt, offset) end)
+    if not eid then return end
     despawn_proxy(eid)
 end
 
@@ -430,6 +547,7 @@ function on_level_changing()
     end)
     spawned_proxies = {}
     peer_factions = {}
+    pending_peers = {}
 end
 
 function on_game_start()

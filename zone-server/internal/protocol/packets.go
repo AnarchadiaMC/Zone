@@ -51,6 +51,48 @@ type CharacterSelect struct {
 	Items   [256]byte
 }
 
+// LevelLoad is the OpLoadLevel (0x0073) payload: server-authoritative spawn
+// target sent after handshake (returning player) or after CharacterSelect.
+type LevelLoad struct {
+	Level   uint8
+	PosX    float32
+	PosY    float32
+	PosZ    float32
+	Faction [16]byte
+	EcoTier uint8
+}
+
+// InventoryItemPayload is one entry of OpInventorySync (0x0076). Count is the
+// number of identical copies to create; condition is 0-100 (percent); ammo is
+// loaded rounds for weapons or box content for ammo items; slot is -1 when
+// unslotted.
+type InventoryItemPayload struct {
+	Section   [64]byte
+	Count     uint16
+	Condition uint8
+	Ammo      uint16
+	Slot      int8
+}
+
+// InventorySyncPayload is one chunk of a starter/restored inventory. A single
+// packet carries at most MaxInventorySyncItems entries to stay under the 1200
+// byte MTU; a full inventory arrives as several packets in order.
+type InventorySyncPayload struct {
+	ItemCount uint8
+	Items     [MaxInventorySyncItems]InventoryItemPayload
+}
+
+// MaxInventorySyncItems is the per-packet entry cap: 1 + 16*70 = 1121 bytes,
+// 1133 with the header, under MaxSafeUDPPacketSize.
+const MaxInventorySyncItems = 16
+
+// ErrorPayload is the OpError (0x0077) payload. Code values:
+// 1 = invalid faction, 2 = invalid loadout, 3 = character creation failed.
+type ErrorPayload struct {
+	Code    uint8
+	Message [96]byte
+}
+
 type ClientTransform struct {
 	SessionID [4]byte
 	PosX      float32
@@ -250,6 +292,14 @@ func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload in
 					return err
 				}
 			}
+		case *InventorySyncPayload:
+			if err := writeInventorySync(&buf, p.ItemCount, p.Items[:]); err != nil {
+				return err
+			}
+		case InventorySyncPayload:
+			if err := writeInventorySync(&buf, p.ItemCount, p.Items[:]); err != nil {
+				return err
+			}
 		default:
 			if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
 				return err
@@ -280,6 +330,20 @@ func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload in
 
 	_, err := w.Write(buf.Bytes())
 	return err
+}
+
+func writeInventorySync(w io.Writer, itemCount uint8, items []InventoryItemPayload) error {
+	if err := binary.Write(w, binary.LittleEndian, itemCount); err != nil {
+		return err
+	}
+	count := int(itemCount)
+	if count > len(items) {
+		count = len(items)
+	}
+	if count == 0 {
+		return nil
+	}
+	return binary.Write(w, binary.LittleEndian, items[:count])
 }
 
 func WriteServerSnapshot(w io.Writer, seq uint32, flags uint8, snap *ServerSnapshot) error {

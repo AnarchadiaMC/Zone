@@ -46,7 +46,7 @@ extern "C" {
         NetClient::Disconnect();
     }
 
-    __declspec(dllexport) void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, int16_t vx, int16_t vy, int16_t vz, uint8_t animflags, uint16_t gvid)
+    __declspec(dllexport) void ZN_SendTransform(float x, float y, float z, int16_t yaw, int16_t pitch, uint8_t animflags, uint16_t gvid)
     {
         NetClient::Transform transform;
         transform.x = x;
@@ -54,9 +54,9 @@ extern "C" {
         transform.z = z;
         transform.yaw = yaw;
         transform.pitch = pitch;
-        transform.vx = vx;
-        transform.vy = vy;
-        transform.vz = vz;
+        transform.vx = 0;
+        transform.vy = 0;
+        transform.vz = 0;
         transform.animflags = animflags;
         NetClient::SendTransform(transform, gvid);
     }
