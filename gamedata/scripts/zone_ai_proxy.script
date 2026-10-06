@@ -459,8 +459,14 @@ local function process_state(eid, x, y, z, yaw_raw, anim, tg)
     apply_anim_state(obj, anim)
 
     if stale then
-        yaw_direction(entity.target_yaw)
-        pcall(go_set_desired_direction, obj)
+        -- Resync packet after a freeze: body state only, but an attack must
+        -- still face the nearest player so the swing reads as directed.
+        if anim == 3 then
+            face_actor(obj)
+        else
+            yaw_direction(entity.target_yaw)
+            pcall(go_set_desired_direction, obj)
+        end
         return
     end
 

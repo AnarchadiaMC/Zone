@@ -15,6 +15,21 @@ damage_budget_per_s: 400
 item_rate_per_s: 5
 ai_enabled: true
 ai_online_radius_m: 220
+# AI combat FSM (wave B). ai_combat_enabled: false keeps patrol replication but
+# disables aggro, chasing and attacks. Radii/damage/timings fall back to the
+# documented defaults (40 / 2.0 / 1500 / 10 / 5 / 10) when omitted or <= 0.
+ai_combat_enabled: true
+ai_aggro_radius_m: 40
+ai_attack_range_m: 2.0
+ai_attack_cooldown_ms: 1500
+ai_melee_damage: 10
+ai_corpse_seconds: 5
+ai_patrol_resume_s: 10
+# Server-side line-of-sight gating. los_data_dir holds <level>.occl files built
+# by tools/levelgeom; missing/corrupt files fail open (damage allowed) and are
+# logged once per level.
+los_enabled: true
+los_data_dir: "zone_los"
 # World item lifecycle. world_item_ttl_min: omitted = 60, 0 disables expiry.
 # world_item_max_per_level caps rows per level; drops beyond the cap reject.
 world_item_ttl_min: 60

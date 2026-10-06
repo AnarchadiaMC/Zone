@@ -261,7 +261,7 @@ type GroupResponse struct {
 // MaxGroupMembers is the wire capacity of OpGroupState (0x007A).
 const MaxGroupMembers = 8
 
-// GroupStateMember is one member entry of OpGroupState: 49 bytes.
+// GroupStateMember is one member entry of OpGroupState: 53 bytes.
 type GroupStateMember struct {
 	SessionID uint32
 	Name      [32]byte
@@ -271,7 +271,7 @@ type GroupStateMember struct {
 
 // GroupState is the OpGroupState (0x007A) server->client payload. The wire
 // form carries MemberCount followed by exactly MemberCount member entries
-// (1 + 49 each); an empty state is a single 0x00 byte.
+// (1 + 53 each); an empty state is a single 0x00 byte.
 type GroupState struct {
 	MemberCount uint8
 	Members     [MaxGroupMembers]GroupStateMember
@@ -298,6 +298,21 @@ const (
 const (
 	ContainerActionDeposit  uint8 = 1
 	ContainerActionWithdraw uint8 = 2
+)
+
+// Stash action identifiers for OpStashAction: 1 stores inventory into the
+// position-keyed world stash, 2 takes from it.
+const (
+	StashActionStore uint8 = 1
+	StashActionTake  uint8 = 2
+)
+
+// Trade action identifiers for OpTradeAction: 1 buys from the vendor (debits
+// rubles, credits an item), 2 sells to the vendor (removes an item, credits
+// rubles).
+const (
+	TradeActionBuy  uint8 = 1
+	TradeActionSell uint8 = 2
 )
 
 // AIStateEntry is one 19-byte AI puppet entry of OpAIState (0x007C):
@@ -408,6 +423,71 @@ type ItemUpdatePacket struct {
 	Y         float32
 	Z         float32
 	Condition uint8
+}
+
+// StashActionPacket is the OpStashAction (0x0081) client->server payload:
+// 84 bytes. ActionID is client-monotonic and shares the OpItemAction replay
+// floor; Action is StashActionStore or StashActionTake; X/Y/Z is the raw world
+// position the client sends for the stash (the server rounds it onto the 0.5 m
+// key grid); Count is the requested stack size; Condition is 0-100.
+type StashActionPacket struct {
+	ActionID  uint32
+	Action    uint8
+	X         float32
+	Y         float32
+	Z         float32
+	Section   [64]byte
+	Count     uint16
+	Condition uint8
+}
+
+// StashResultPacket is the OpStashResult (0x0082) server->client payload:
+// 73 bytes. Result is ItemResultOK/Rejected/Corrected; Count is the signed
+// delta applied to the client's inventory view (negative = stored, positive =
+// taken); Section/Condition are echoed from server state.
+type StashResultPacket struct {
+	ActionID  uint32
+	Result    uint8
+	Action    uint8
+	Count     int16
+	Section   [64]byte
+	Condition uint8
+}
+
+// TradeActionPacket is the OpTradeAction (0x0083) client->server payload:
+// 76 bytes. ActionID is client-monotonic; Action is TradeActionBuy or
+// TradeActionSell; MoneyDelta is the client-asserted price (server-capped);
+// Count is the requested stack size; Condition is 0-100 (used for buys, the
+// consumed stack is derived for sells).
+type TradeActionPacket struct {
+	ActionID   uint32
+	Action     uint8
+	MoneyDelta uint32
+	Section    [64]byte
+	Count      uint16
+	Condition  uint8
+}
+
+// TradeResultPacket is the OpTradeResult (0x0084) server->client payload:
+// 75 bytes. Result is ItemResultOK/Rejected/Corrected; MoneyDelta is the
+// signed amount actually credited (positive) or debited (negative) by the
+// server, 0 on rejection; Condition is the server-derived bucket for sells
+// and the credited bucket for buys.
+type TradeResultPacket struct {
+	ActionID   uint32
+	Result     uint8
+	Action     uint8
+	MoneyDelta int32
+	Section    [64]byte
+	Condition  uint8
+}
+
+// WalletUpdatePacket is the OpWalletUpdate (0x0085) server->client payload:
+// 4 bytes. Money is the character's absolute authoritative ruble balance; the
+// client reconciles db.actor money to it. Sent after every money change and on
+// join/character-select.
+type WalletUpdatePacket struct {
+	Money uint32
 }
 
 func WritePacket(w io.Writer, opcode uint16, seq uint32, flags uint8, payload interface{}) error {
@@ -600,7 +680,7 @@ func writeInventorySync(w io.Writer, itemCount uint8, items []InventoryItemPaylo
 }
 
 // writeGroupState serialises only the populated member entries instead of the
-// fixed [8] backing array, so the payload is 1 + 49*MemberCount bytes.
+// fixed [8] backing array, so the payload is 1 + 53*MemberCount bytes.
 func writeGroupState(w io.Writer, state *GroupState) error {
 	if state == nil {
 		return nil

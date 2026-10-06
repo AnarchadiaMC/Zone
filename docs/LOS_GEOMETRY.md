@@ -1,12 +1,13 @@
 # Server-Side Line-of-Sight Geometry
 
-Status: pipeline implemented and tested, **not wired into gameplay**. The
-`los_enabled` flag does not exist yet; v0.5.0 behaviour is unchanged.
-
-This document records how level collision geometry is extracted from the live
-Anomaly install, how it is converted into a compact occluder file, the binary
-format, the Go API in `internal/los`, benchmark results, and how `damage.go`
-would use it behind a future feature flag.
+Status: pipeline implemented and tested, **wired into gameplay and enabled by
+default** since the LOS-gating wave (`los_enabled: true`, multi-sample
+head/chest/pelvis, fail-open without an artifact). This document records how
+level collision geometry is extracted from the live Anomaly install, how it is
+converted into a compact occluder file, the binary format, the Go API in
+`internal/los` and benchmark results. The gating rules, configuration and
+fail-open policy live in `zone-server/docs/LOS_GATING.md`; only `l01_escape` has
+a generated artifact so far.
 
 ## 1. Where the geometry lives
 

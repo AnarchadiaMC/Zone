@@ -67,7 +67,7 @@ On first start the server creates the embedded SQLite database (`zone_world.db`)
 
 ### Configuration reference (`zone_server.yaml`)
 
-All 22 keys understood by `internal/config`. The shipped `zone_server.yaml` sets 19 of them; the rest fall back to the defaults below when omitted.
+All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets 28 of them; the rest fall back to the defaults below when omitted.
 
 | Key | Default | In shipped YAML | Purpose |
 |---|---|:---:|---|
@@ -79,20 +79,44 @@ All 22 keys understood by `internal/config`. The shipped `zone_server.yaml` sets
 | `emission_interval_min` | `120` if omitted (shipped file: `45`) | yes | Minutes between emission cycles. |
 | `admin_pipe` | `\\.\pipe\zone_admin` (`/tmp/zone_admin.sock` on Unix) | yes | Admin channel path. Commands: `status`, `kick`, `ban`, `broadcast`. |
 | `server_name` | `"Zone Online"` | yes | Name advertised in the server browser. |
-| `map_name` | `"l01_escape"` | yes | Hosted level (only `l01_escape` is supported). |
+| `map_name` | `"l01_escape"` | yes | Initial/menu spawn level. In-game travel can switch to any installed level (see below). |
 | `mode` | `0` | yes | Free-form mode byte advertised in `SERVER_QUERY_RES`. |
 | `locked` | `false` | yes | `true` rejects new connections (handshake Status 1). |
 | `group_max_players` | `4` | yes | Max group size, clamped to 1–8 (the 0x007A wire capacity). |
 | `invite_ttl_sec` | `60` | yes | Group invite lifetime; swept every tick. |
 | `damage_budget_per_s` | `400` | yes | Rolling 1 s sustained damage clamp per attacker (hit registration). |
-| `item_rate_per_s` | `5` | yes | Item action rate limit per session (shared by 0x007D and 0x007F). |
+| `item_rate_per_s` | `5` | yes | Item action rate limit per session (shared by 0x007D, 0x007F, 0x0081 and 0x0083). |
 | `ai_enabled` | `true` | yes | Master switch for AI seeding, simulation, replication and AI packets. |
 | `ai_online_radius_m` | `220` | yes | Legacy alias. When set to a non-220 value it pins both hysteresis radii (no hysteresis); otherwise the enter/leave defaults apply. |
 | `ai_enter_radius_m` | `180` | no | A puppet enters a client's replication stream inside this 2D radius. |
 | `ai_leave_radius_m` | `220` | no | A visible puppet leaves only past this radius (hysteresis). Clamped ≥ enter radius. |
 | `ai_max_entities` | `64` | no | Maximum registered puppet squads; registrations beyond the cap are logged and skipped, and per-session in-range sets are capped nearest-first. |
+| `ai_combat_enabled` | `true` | yes | Master switch for the puppet combat FSM; `false` keeps patrol replication but disables aggro, chase and attacks. |
+| `ai_aggro_radius_m` | `40` | yes | 3D radius in which a puppet acquires a hostile player. |
+| `ai_attack_range_m` | `2.0` | yes | Melee reach; inside this distance the FSM starts swinging. |
+| `ai_attack_cooldown_ms` | `1500` | yes | Milliseconds between melee swings. |
+| `ai_melee_damage` | `10` | yes | Damage per melee swing. |
+| `ai_corpse_seconds` | `5` | yes | How long a dead puppet streams the death animation before `ENTITY_LEAVE_AOI`. |
+| `ai_patrol_resume_s` | `10` | yes | ALERT cool-down before the puppet resumes patrol after losing its target. |
+| `los_enabled` | `true` | yes | Master switch for server-side line-of-sight hit gating; `false` allows every hit. |
+| `los_data_dir` | `"zone_los"` | yes | Directory holding the per-level `<level>.occl` occluders next to the server binary. Missing files fail open. |
 | `world_item_ttl_min` | `60` (pointer; explicit `0` disables) | yes | Minutes before dropped world items expire via the 30 s sweep. |
 | `world_item_max_per_level` | `500` | yes | Max persisted world item rows per level; drops beyond the cap are rejected and the client is resynced. |
+| `trade_max_money_delta` | `200000` | no | Maximum rubles one `OpTradeAction` may move; a capped buy/sell is echoed as corrected. |
+
+### Occluders (`zone_los`)
+
+Line-of-sight gating needs a `<level>.occl` file per level. Release packages are expected to ship `server/zone_los/l01_escape.occl` (52,967,834 bytes) next to `zone-server.exe`; the artifact is not tracked in git and is not present in the in-tree v0.6.0 snapshot. To generate one from a level's `level.cform`:
+
+```bat
+levelgeom.exe --cform <path>\level.cform --out zone_los\l01_escape.occl
+```
+
+Place every generated `.occl` in the configured `los_data_dir` (default `zone_los`, resolved relative to the working directory). A missing, unreadable or corrupt file fails **open** — hits are allowed and one warning is logged per level — so only levels with an artifact get geometry gating.
+
+### Level travel
+
+The menu start is always `l01_escape` (engine limitation). Once in game, the client reports every level load with `OpLevelChange` (0x0074); the server accepts any printable level name, resets the session's grid/AoI/AI caches, exchanges entity enters/leaves with peers on both levels, recomputes safe-zone state and re-sends world items in range. No reconnect is needed. See [zone-server/docs/LEVEL_TRAVEL.md](zone-server/docs/LEVEL_TRAVEL.md).
 
 ---
 
@@ -166,7 +190,7 @@ ZoneClient_Injector.exe --pid 14280
 2. In the game, click the native **Zone** button on the main menu.
 3. In the browser, enter the address (default `127.0.0.1`), the port `27015` and your callsign, then click **Connect**. If the server is reachable, its row/query reply shows in the browser (name, map `l01_escape`, player counts, mode, lock state, protocol and tick rate).
 4. The footer stays open while the handshake is pending and polls `ZoneNet:IsConnected()`: `Connected to <ip>:<port>` on success, or `Failed - server unreachable, see xray log` after roughly 16 seconds (the DLL gives up after 15 s / 5 tries). A version mismatch, full server or ban is surfaced through `ZN_GetLastError`.
-5. In game, the HUD shows `[ZO] Online` with the current ping. Remote players appear as proxies; AI patrol squads appear near the Cordon.
+5. In game, the HUD shows `[ZO] Online` with the current ping. Remote players appear as proxies; AI patrol squads appear near the Cordon and may engage hostile players.
 
 If the browser reports `DLL missing - inject ZoneClient first`, the client DLL was not loaded: with the proxy path check that both `version.dll` and `ZoneClient.dll` are in `bin\`; with the injector path inject before opening the zone menu.
 
@@ -190,11 +214,11 @@ It performs 12 real binary-protocol handshakes and exercises snapshots, groups, 
 
 ### Seamless join
 
-A new account receives `SHOW_START` (0x0071) and the native faction/loadout dialog opens. Pick a faction and loadout and click **Start**: the server validates the choice, creates the character plus starter inventory in SQLite, then the client starts `l01_escape`, applies the server spawn/faction and materializes the synced inventory. Returning accounts go straight to their saved spawn. Only `l01_escape` is hosted; any level change requires a reconnect.
+A new account receives `SHOW_START` (0x0071) and the native faction/loadout dialog opens. Pick a faction and loadout and click **Start**: the server validates the choice, creates the character plus starter inventory in SQLite, then the client starts `l01_escape`, applies the server spawn/faction and materializes the synced inventory. Returning accounts go straight to their saved spawn. The menu start is always `l01_escape` (engine limitation); in game, changing level reports `OpLevelChange` and the server switches peers, safe-zone state and per-level caches without a reconnect.
 
 ### Factions, groups and chat
 
-- Faction relations are server-authoritative and ship to clients as `configs/mod_system_zone_faction_relations.ltx`; hostile factions are flagged as enemies, and the server rejects same-faction and same-group damage. Movement is client-authoritative by owner decision: the server accepts finite, in-bounds transforms as-is with no speed/teleport validation or corrections. Player-vs-player hits are validated: the client reports a proxy hit with `OpDamageNotify` (0x0050), the server checks attacker session, safe zones on either side, friendly fire, 3D range (≤ 300 m), damage sanity, a 150 single-hit clamp and the rolling damage budget, then relays the accepted hit to the victim, whose client applies it via `change_health`. The path is implemented but not yet exercised by two live clients, and damage is applied 1:1 with no server-side armor scaling.
+- Faction relations are server-authoritative and ship to clients as `configs/mod_system_zone_faction_relations.ltx`; hostile factions are flagged as enemies, and the server rejects same-faction and same-group damage. Movement is client-authoritative by owner decision: the server accepts finite, in-bounds transforms as-is with no speed/teleport validation or corrections. Player-vs-player hits are validated: the client reports a proxy hit with `OpDamageNotify` (0x0050), the server checks attacker session, cross-level, safe zones on either side, friendly fire, 3D range (≤ 300 m), damage sanity, a 150 single-hit clamp, the rolling damage budget and — when an occluder exists for the level — the multi-sample line-of-sight gate, then relays the accepted hit to the victim, whose client applies it via `change_health`. The path is implemented but not yet exercised by two live clients, and damage is applied 1:1 with no server-side armor scaling.
 - Mixed-faction groups are supported. Chat commands: `/invite <callsign>`, `/accept`, `/decline`, `/leave`, `/group`.
 - Open chat with the game's `kXRR_CHAT` binding when the executable exposes it, otherwise `Y`.
 
@@ -202,13 +226,17 @@ A new account receives `SHOW_START` (0x0071) and the native faction/loadout dial
 
 Twelve canonical zones (Rookie Village, 100 Rads Bar, Yantar Bunker, Flea Market, etc.) protect every faction equally: weapons are holstered, fire is blocked, damage is suppressed in both directions and client-side AI hostility is suppressed, with a PDA notification and HUD banner on entry/leave. Safe-zone protection does not depend on faction, group or war state.
 
-### Item ledger and world items
+### Item ledger, world items, stashes and traders
 
-Dropping, picking up and consuming items are server-authoritative (0x007D/0x007E): the server owns the inventory rows and world item ids, rejects duplicate pickups and rate-limits actions. Dropped items persist in the world, sync to players entering the area and expire after the configured TTL. Container deposit/withdraw (0x007F/0x0080) is implemented and tested server-side, but no client container UI drives it yet.
+Dropping, picking up and consuming items are server-authoritative (0x007D/0x007E): the server owns the inventory rows and world item ids, rejects duplicate pickups and rate-limits actions. Dropped items persist in the world, sync to players entering the area and expire after the configured TTL. The native stash and trader windows are server-authoritative too: stash store/take (0x0081/0x0082) addresses a world stash by level position (0.5 m grid, 5 m reach, created on first store), trader buy/sell (0x0083/0x0084) debits or credits the SQLite ruble balance with the price capped by `trade_max_money_delta`, and every money change pushes `OpWalletUpdate` (0x0085) so the client wallet reconciles. The numeric container path (0x007F/0x0080, SQLite rowid addressing) is implemented and tested server-side, but no client container UI drives it yet.
 
-### AI patrols
+### AI patrols and combat
 
-Server-authoritative patrol squads replicate to clients inside 180 m (leaving past 220 m) and stream state at ~30 Hz. Puppets rotate and animate but do not fight in this wave.
+Server-authoritative squads replicate to clients inside 180 m (leaving past 220 m) and stream state at ~30 Hz. With `ai_combat_enabled` (default true) a hostile squad acquires players inside 40 m, chases at run speed, melees at 2 m reach every 1.5 s, and despawns 5 s after death; hostility follows the faction relation matrix, monsters engage everyone, and safe zones suppress the FSM on both sides. Actor fire damages a puppet over the same 0x0050 path (`TargetID >= 1_000_000`). Puppets do not loot and do not path around level geometry yet.
+
+### Level travel
+
+Once a level is loaded, travel to any installed level works: the client loads it and reports `OpLevelChange` (0x0074). The server accepts the report, resets the session's spatial-grid/AoI/AI caches, exchanges entity enters/leaves between the old and new level, recomputes safe-zone state from the accepted position and re-sends world items in range. The menu start remains `l01_escape` in this release.
 
 ---
 
@@ -219,4 +247,8 @@ Server-authoritative patrol squads replicate to clients inside 180 m (leaving pa
 - **Server does not appear in LAN scan:** Windows Firewall may be blocking UDP `27015`; allow the server executable or connect by IP directly.
 - **Port conflict:** change `port` in `zone_server.yaml` or pass `--port`, and use the same port in the browser.
 - **AI absent:** check `ai_enabled: true` and that the `ai_squads` table has rows (it is seeded when empty).
+- **AI attacks you near the Cordon:** expected when your faction is hostile to the squad (`ai_combat_enabled: true`). Set `ai_combat_enabled: false` to keep patrols but disable aggro. Safe zones suppress attacks on both sides.
+- **Hits rejected as "no line of sight":** the level has an occluder and all three body samples were blocked. This is working as intended; remove or rename the level's `.occl` only for debugging. A missing occluder fails open and never blocks damage.
+- **Occluder not used:** confirm `los_enabled: true`, the level has a matching `<level>.occl` in `los_data_dir`, and the server's working directory is where the `zone_los` folder lives. Names are case-sensitive on Linux; one warning per level is logged when loading fails.
 - **Items not dropping/picking up:** item actions are gated on being connected and outside an xrRazom session; watch for the resync notice if the server rejects an action.
+- **Stash/trade action rejected:** both share the item rate limit and the client-monotonic ActionID floor with the item ledger. A rejected action resyncs inventory and wallet; a trader price above `trade_max_money_delta` (200000) is applied as a corrected, smaller delta. Stashes must be within 5 m of your server position and on the same level.

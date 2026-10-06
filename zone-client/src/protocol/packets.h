@@ -39,7 +39,12 @@ enum class Opcode : uint16_t {
     ITEM_ACTION = 0x007D,
     ITEM_UPDATE = 0x007E,
     CONTAINER_ACTION = 0x007F,
-    CONTAINER_UPDATE = 0x0080
+    CONTAINER_UPDATE = 0x0080,
+    STASH_ACTION = 0x0081,
+    STASH_RESULT = 0x0082,
+    TRADE_ACTION = 0x0083,
+    TRADE_RESULT = 0x0084,
+    WALLET_UPDATE = 0x0085
 };
 
 struct HeartbeatPayload {

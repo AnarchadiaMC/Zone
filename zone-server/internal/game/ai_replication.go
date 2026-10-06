@@ -66,8 +66,9 @@ func resolveAIMaxEntities(cfg *config.Config) int {
 // SpatialGrid: AI visibility is computed against the same radius directly, so
 // the 30 Hz player snapshot path is untouched.
 //
-// Wave A scope: patrol-only puppets, no combat, no damage, no AI-vs-player
-// logic. State antics/attack/death values exist on the wire but are unused.
+// Scope: patrol replication plus the optional lightweight combat FSM driven by
+// the game tick (see ai.CombatStep). Attack events are validated and relayed
+// after the squad manager lock is released.
 type aiReplication struct {
 	mu          sync.Mutex
 	enterRadius float32
@@ -92,6 +93,7 @@ type aiReplication struct {
 	scratchOnline     map[uint32]bool
 	scratchInRange    map[uint32]bool
 	scratchVisibleSet map[uint32]bool
+	scratchTargets    []ai.CombatTarget
 }
 
 // aiCandidate is one in-range puppet with its squared distance to the
@@ -203,6 +205,33 @@ func (a *aiReplication) entityID(squadID uint32) (uint32, bool) {
 	return id, ok
 }
 
+// squadIDForEntity is the reverse of entityID, used by the player->AI damage
+// path. The registry is small (bounded by ai_max_entities), so a linear scan
+// keeps the map single-directional.
+func (a *aiReplication) squadIDForEntity(entityID uint32) (uint32, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for squadID, id := range a.entityIDs {
+		if id == entityID {
+			return squadID, true
+		}
+	}
+	return 0, false
+}
+
+// visibleSessions returns the session IDs currently tracking squadID.
+func (a *aiReplication) visibleSessions(squadID uint32) []uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []uint32
+	for sessID, set := range a.visible {
+		if set[squadID] {
+			out = append(out, sessID)
+		}
+	}
+	return out
+}
+
 // markVisible records that sessionID now knows squadID and reports whether the
 // transition was new (exactly-once ENTITY_ENTER_AOI).
 func (a *aiReplication) markVisible(sessionID, squadID uint32) bool {
@@ -302,6 +331,10 @@ type aiPlayerView struct {
 	id          uint32
 	level       string
 	pos         [3]float32
+	faction     string
+	health      float32
+	inSafe      bool
+	pendingCreate bool
 	lastAIState time.Time
 }
 
@@ -333,13 +366,23 @@ func (s *Server) tickAIReplication(now time.Time) {
 		}
 		sess.Lock()
 		v := aiPlayerView{
-			sess:        sess,
-			id:          sess.SessionID,
-			level:       sess.CurrentLevel,
-			pos:         sess.Position,
-			lastAIState: sess.LastAIStateSent,
+			sess:          sess,
+			id:            sess.SessionID,
+			level:         sess.CurrentLevel,
+			pos:           sess.Position,
+			faction:       sess.Faction,
+			health:        sess.Health,
+			inSafe:        sess.InSafeZone,
+			pendingCreate: sess.PendingCreate,
+			lastAIState:   sess.LastAIStateSent,
 		}
 		sess.Unlock()
+		// Safe-zone state is authoritative from position+level, not the
+		// (possibly stale) session flag: direct-inserted test sessions and
+		// clients that never sent a transform start with InSafeZone=false.
+		if !v.inSafe {
+			v.inSafe = CheckSafeZone(v.pos[0], v.pos[1], v.pos[2], v.level) != nil
+		}
 		views = append(views, v)
 	}
 	a.scratchViews = views
@@ -377,7 +420,26 @@ func (s *Server) tickAIReplication(now time.Time) {
 	// Dead squads broadcast AnimDeath and are despawned after the delay; the
 	// returned IDs are released AFTER the per-view pass below so visible
 	// sessions still get their ENTITY_LEAVE_AOI before the entity disappears.
-	despawned := s.squads.TickPuppets(now, online)
+	// With AI combat enabled the FSM also acquires/chases/attacks hostile
+	// players; attack events are validated and relayed after the lock drops.
+	step := ai.CombatStep{
+		Enabled:   s.aiCombat.Enabled,
+		Params:    s.aiCombat.Params,
+		Hostile:   aiHostileToPlayer,
+		SquadGate: aiSquadAllowedToFight,
+	}
+	if step.Enabled {
+		step.Targets = s.combatTargets(views, a.scratchTargets)
+		a.scratchTargets = step.Targets
+	}
+	var despawned []uint32
+	if step.Enabled {
+		var attacks []ai.AIAttackEvent
+		despawned, attacks = s.squads.TickPuppetsWithCombat(now, online, step)
+		s.applyAIAttacks(attacks)
+	} else {
+		despawned = s.squads.TickPuppets(now, online)
+	}
 	puppets = s.squads.SnapshotPuppetsInto(a.scratchPuppets)
 	a.scratchPuppets = puppets
 
@@ -386,7 +448,7 @@ func (s *Server) tickAIReplication(now time.Time) {
 		// No transport (DB-less scale tests): simulation advanced, nothing to
 		// send and no visibility bookkeeping to keep.
 		for _, squadID := range despawned {
-			a.release(squadID)
+			s.releaseAISquad(squadID)
 		}
 		return
 	}
@@ -541,8 +603,23 @@ func (s *Server) tickAIReplication(now time.Time) {
 	// Registry release happens after the per-view pass so any session that
 	// still had the despawned squad visible received its leave packet above.
 	for _, squadID := range despawned {
-		a.release(squadID)
+		s.releaseAISquad(squadID)
 	}
+}
+
+// releaseAISquad drops the replication entity, cleans the AI entity's damage
+// budget/reject-audit entries and forgets the squad. Called on corpse despawn.
+func (s *Server) releaseAISquad(squadID uint32) {
+	if s == nil || s.aiRepl == nil {
+		return
+	}
+	if entityID, ok := s.aiRepl.entityID(squadID); ok {
+		if s.damageHandler != nil {
+			s.damageHandler.ClearBudget(entityID)
+		}
+		s.clearDamageAudit(entityID)
+	}
+	s.aiRepl.release(squadID)
 }
 
 // scratchLiveMap returns the reusable live-session set.

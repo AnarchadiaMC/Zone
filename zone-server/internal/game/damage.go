@@ -24,6 +24,11 @@ type DamageHandler struct {
 	maxDamagePerHit float32 // e.g. 150.0
 	groups          *GroupManager
 
+	// los, when set, gates a hit on server-side level geometry. It receives the
+	// shared level name and both positions and returns true when at least one
+	// of the multi-sample segments is clear (fail-open for missing levels).
+	los func(level string, from, to [3]float32) bool
+
 	// Rolling per-attacker damage budget. Guarded by budgetMu because UDP
 	// workers handle damage concurrently.
 	budgetMu         sync.Mutex
@@ -31,6 +36,12 @@ type DamageHandler struct {
 	budget           map[uint32][]damageSpend
 
 	now func() time.Time
+}
+
+// SetLOSChecker wires the server-side line-of-sight gate. A nil checker (or a
+// level without occluder data) allows every hit.
+func (dh *DamageHandler) SetLOSChecker(f func(level string, from, to [3]float32) bool) {
+	dh.los = f
 }
 
 // SetGroupManager wires party membership into the friendly-fire gate. A nil
@@ -164,6 +175,14 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 		return 0, false, "attack out of range"
 	}
 
+	// 4b. Line-of-sight gate: when occluder data exists for the shared level,
+	// a hit whose attacker-eye-to-victim head/chest/pelvis samples are ALL
+	// blocked by geometry is rejected. Missing/corrupt occluder data fails
+	// OPEN (the checker returns true).
+	if dh.los != nil && !dh.los(targetLevel, attackerPos, targetPos) {
+		return 0, false, "no line of sight"
+	}
+
 	// 5. Damage sanity:
 	// If dmg.Damage <= 0 || math.IsNaN(float64(dmg.Damage)) || math.IsInf(float64(dmg.Damage), 0): return (0, false, "invalid damage value").
 	// If dmg.Damage > 250.0: return (0, false, "damage exceeds sanity ceiling").
@@ -216,6 +235,93 @@ func (dh *DamageHandler) ValidateAndApplyDamage(
 		dh.logger.Debug("damage applied",
 			zap.Uint32("attacker", attackerID),
 			zap.Uint32("target", targetID),
+			zap.Float32("damage", appliedDamage),
+		)
+	}
+
+	return appliedDamage, true, ""
+}
+
+// ValidateAndApplyPuppetDamage validates a player->AI-puppet hit: attacker
+// session match, same level, <= maxRange from the attacker to the puppet's
+// current position, damage sanity/clamp and the shared rolling damage budget.
+// It does not mutate the puppet; the caller applies the returned amount through
+// SquadManager.ApplyPuppetDamage.
+func (dh *DamageHandler) ValidateAndApplyPuppetDamage(
+	attacker *network.PlayerSession,
+	aiLevel string,
+	aiPos [3]float32,
+	dmg *protocol.DamageNotify,
+) (appliedDamage float32, valid bool, reason string) {
+	if attacker == nil {
+		return 0, false, "nil session"
+	}
+	if dmg == nil {
+		return 0, false, "nil damage payload"
+	}
+
+	attacker.Lock()
+	attackerID := attacker.SessionID
+	attackerPos := attacker.Position
+	attackerLevel := attacker.CurrentLevel
+	attackerInSafe := attacker.InSafeZone
+	attacker.Unlock()
+
+	if attackerLevel != aiLevel {
+		return 0, false, "cross-level damage rejected"
+	}
+	if dmg.AttackerID != attackerID {
+		return 0, false, "session mismatch"
+	}
+	// Mirror the player-damage policy: a protected player may not deal damage.
+	if attackerInSafe {
+		return 0, false, "safe zone immunity"
+	}
+
+	maxRange := dh.maxRange
+	if maxRange <= 0 {
+		maxRange = 300.0
+	}
+	dist := float32(Displacement(attackerPos, aiPos))
+	if dist > maxRange {
+		return 0, false, "attack out of range"
+	}
+
+	if dh.los != nil && !dh.los(aiLevel, attackerPos, aiPos) {
+		return 0, false, "no line of sight"
+	}
+
+	dmgVal := float64(dmg.Damage)
+	if dmg.Damage <= 0 || math.IsNaN(dmgVal) || math.IsInf(dmgVal, 0) {
+		return 0, false, "invalid damage value"
+	}
+	if dmg.Damage > 250.0 {
+		return 0, false, "damage exceeds sanity ceiling"
+	}
+
+	maxDmg := dh.maxDamagePerHit
+	if maxDmg <= 0 {
+		maxDmg = 150.0
+	}
+	appliedDamage = dmg.Damage
+	if appliedDamage > maxDmg {
+		appliedDamage = maxDmg
+	}
+
+	if dh.damageBudgetPerS > 0 {
+		charged, ok := dh.chargeBudget(attackerID, float64(appliedDamage))
+		if !ok || charged <= 0 {
+			return 0, false, "damage budget exceeded"
+		}
+		appliedDamage = float32(charged)
+	}
+
+	attacker.SetCombat(30 * time.Second)
+
+	if dh.logger != nil {
+		dh.logger.Debug("puppet damage validated",
+			zap.Uint32("attacker", attackerID),
+			zap.String("level", aiLevel),
 			zap.Float32("damage", appliedDamage),
 		)
 	}

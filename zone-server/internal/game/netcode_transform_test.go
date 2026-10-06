@@ -109,9 +109,9 @@ func TestTransform_SessionIDMismatchIgnored(t *testing.T) {
 	}
 }
 
-// A level change still hard-resets position to the server-known spawn and
-// updates the grid; there is no movement validation involved.
-func TestLevelChange_ResetsPositionToSpawn(t *testing.T) {
+// A level change keeps the client-authoritative position (movement policy) and
+// moves the grid entry to it; there is no server-side spawn reset.
+func TestLevelChange_KeepsClientPosition(t *testing.T) {
 	s, _, _ := setupTestServerWithDB(t)
 	sess := newMover(t, s, 6101, 44001, "uuid-level-reset", [3]float32{100, 5, 100})
 
@@ -123,14 +123,14 @@ func TestLevelChange_ResetsPositionToSpawn(t *testing.T) {
 	pos := sess.Position
 	level := sess.CurrentLevel
 	sess.Unlock()
-	if pos != defaultLevelSpawn {
-		t.Fatalf("position after level change = %v, want spawn %v", pos, defaultLevelSpawn)
+	if pos != [3]float32{100, 5, 100} {
+		t.Fatalf("position after level change = %v, want client position [100 5 100]", pos)
 	}
 	if level != "l02_garbage" {
 		t.Fatalf("level after level change = %q, want l02_garbage", level)
 	}
-	if gx, gz, ok := s.grid.GetPosition(sess.SessionID); !ok || gx != defaultLevelSpawn[0] || gz != defaultLevelSpawn[2] {
-		t.Fatalf("grid after level change = (%v,%v,%v), want spawn", gx, gz, ok)
+	if gx, gz, ok := s.grid.GetPosition(sess.SessionID); !ok || gx != 100 || gz != 100 {
+		t.Fatalf("grid after level change = (%v,%v,%v), want client position", gx, gz, ok)
 	}
 }
 

@@ -47,6 +47,26 @@ type Config struct {
 	// registrations beyond the cap are logged and skipped.
 	AIMaxEntities int `yaml:"ai_max_entities"`
 
+	// AI combat FSM knobs. AICombatEnabled is a pointer so an omitted key keeps
+	// the documented default (true) while an explicit `ai_combat_enabled:
+	// false` leaves patrol replication running but disables aggro/attacks.
+	// The numeric knobs use <= 0 as "unset" and resolve to the documented
+	// defaults in the game package.
+	AICombatEnabled    *bool   `yaml:"ai_combat_enabled"`
+	AIAggroRadiusM     float64 `yaml:"ai_aggro_radius_m"`
+	AIAttackRangeM     float64 `yaml:"ai_attack_range_m"`
+	AIAttackCooldownMS int     `yaml:"ai_attack_cooldown_ms"`
+	AIMeleeDamage      float64 `yaml:"ai_melee_damage"`
+	AICorpseSeconds    int     `yaml:"ai_corpse_seconds"`
+	AIPatrolResumeS    int     `yaml:"ai_patrol_resume_s"`
+
+	// Line-of-sight gating. LosEnabled is a pointer so an omitted key keeps the
+	// default (true); explicit `los_enabled: false` disables server-side
+	// occluder checks entirely. LosDataDir holds the per-level <name>.occl
+	// files produced by tools/levelgeom.
+	LosEnabled *bool  `yaml:"los_enabled"`
+	LosDataDir string `yaml:"los_data_dir"`
+
 	// WorldItemTTLMin is the world-item lifetime in minutes. Pointer semantics:
 	// an omitted key keeps the 60-minute default, an explicit 0 disables the
 	// TTL sweep (items persist until picked up).
@@ -54,6 +74,10 @@ type Config struct {
 	// WorldItemMaxPerLevel caps persisted world_items rows per level; new drops
 	// beyond the cap are rejected. Values <= 0 fall back to the default 500.
 	WorldItemMaxPerLevel int `yaml:"world_item_max_per_level"`
+
+	// TradeMaxMoneyDelta caps the absolute ruble amount one OpTradeAction may
+	// move. Values <= 0 fall back to DefaultTradeMaxMoneyDelta (200000).
+	TradeMaxMoneyDelta int `yaml:"trade_max_money_delta"`
 }
 
 // DefaultWorldItemTTLMin is the world-item TTL applied when the key is absent.
@@ -62,6 +86,24 @@ const DefaultWorldItemTTLMin = 60
 // DefaultWorldItemMaxPerLevel is the per-level world item cap applied when the
 // key is absent or non-positive.
 const DefaultWorldItemMaxPerLevel = 500
+
+// DefaultTradeMaxMoneyDelta is the per-action ruble cap applied when
+// trade_max_money_delta is absent or non-positive.
+const DefaultTradeMaxMoneyDelta = 200000
+
+// AI combat FSM defaults, applied when the corresponding key is absent.
+const (
+	DefaultAIAggroRadiusM     = 40.0
+	DefaultAIAttackRangeM     = 2.0
+	DefaultAIAttackCooldownMS = 1500
+	DefaultAIMeleeDamage      = 10.0
+	DefaultAICorpseSeconds    = 5
+	DefaultAIPatrolResumeS    = 10
+)
+
+// DefaultLOSDataDir is the directory scanned for <level>.occl files when the
+// key is absent or empty.
+const DefaultLOSDataDir = "zone_los"
 
 // WorldItemTTLMinutes returns the configured world-item TTL in minutes: the
 // default when the key is absent, the explicit value otherwise (0 = disabled).
@@ -79,6 +121,44 @@ func (c *Config) AIEnabledOrDefault() bool {
 		return true
 	}
 	return *c.AIEnabled
+}
+
+// AICombatEnabledOrDefault reports whether the puppet combat FSM is enabled,
+// defaulting to true when the key is absent (or the config is nil, as in
+// tests).
+func (c *Config) AICombatEnabledOrDefault() bool {
+	if c == nil || c.AICombatEnabled == nil {
+		return true
+	}
+	return *c.AICombatEnabled
+}
+
+// LosEnabledOrDefault reports whether server-side line-of-sight gating is
+// enabled, defaulting to true when the key is absent (or the config is nil).
+func (c *Config) LosEnabledOrDefault() bool {
+	if c == nil || c.LosEnabled == nil {
+		return true
+	}
+	return *c.LosEnabled
+}
+
+// LOSDataDirOrDefault returns the occluder directory, defaulting to "zone_los"
+// when the key is absent or empty.
+func (c *Config) LOSDataDirOrDefault() string {
+	if c == nil || c.LosDataDir == "" {
+		return "zone_los"
+	}
+	return c.LosDataDir
+}
+
+// TradeMaxMoneyDeltaOrDefault returns the per-action trade money cap,
+// defaulting to DefaultTradeMaxMoneyDelta when the key is absent or
+// non-positive (or the whole config is nil, as in tests).
+func (c *Config) TradeMaxMoneyDeltaOrDefault() int {
+	if c == nil || c.TradeMaxMoneyDelta <= 0 {
+		return DefaultTradeMaxMoneyDelta
+	}
+	return c.TradeMaxMoneyDelta
 }
 
 // SetDefaults sets sensible defaults for optional or missing fields.
@@ -142,8 +222,32 @@ func (c *Config) SetDefaults() {
 	if c.AIMaxEntities <= 0 {
 		c.AIMaxEntities = 64
 	}
+	if c.AIAggroRadiusM <= 0 {
+		c.AIAggroRadiusM = DefaultAIAggroRadiusM
+	}
+	if c.AIAttackRangeM <= 0 {
+		c.AIAttackRangeM = DefaultAIAttackRangeM
+	}
+	if c.AIAttackCooldownMS <= 0 {
+		c.AIAttackCooldownMS = DefaultAIAttackCooldownMS
+	}
+	if c.AIMeleeDamage <= 0 {
+		c.AIMeleeDamage = DefaultAIMeleeDamage
+	}
+	if c.AICorpseSeconds <= 0 {
+		c.AICorpseSeconds = DefaultAICorpseSeconds
+	}
+	if c.AIPatrolResumeS <= 0 {
+		c.AIPatrolResumeS = DefaultAIPatrolResumeS
+	}
+	if c.LosDataDir == "" {
+		c.LosDataDir = DefaultLOSDataDir
+	}
 	if c.WorldItemMaxPerLevel <= 0 {
 		c.WorldItemMaxPerLevel = DefaultWorldItemMaxPerLevel
+	}
+	if c.TradeMaxMoneyDelta <= 0 {
+		c.TradeMaxMoneyDelta = DefaultTradeMaxMoneyDelta
 	}
 }
 
