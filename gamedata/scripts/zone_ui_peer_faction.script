@@ -77,6 +77,8 @@ function UIZonePeerFaction:__init(owner) super()
 
   self:SetWndRect(Frect():set(0, 0, 1024, 768))
   self:Enable(true)
+  -- Cached singleton: the holder must never delete it on HideDialog.
+  self:SetAutoDelete(false)
 
   self.faction_cell = {
     ["stalker"]  = { row = 1, col = 1 },
@@ -525,7 +527,6 @@ function UIZonePeerFaction:CloseToMenu()
     self.owner:Show(true)
   end
   if self:IsShown() then self:HideDialog() end
-  CUIScriptWnd.Show(self, false)
 end
 
 function UIZonePeerFaction:BuildLoadoutItems()
@@ -634,8 +635,11 @@ function UIZonePeerFaction:OnStartGame()
 
   self.submitted = true
   if self.text_error then self.text_error:SetText("") end
-  self:HideDialog()
-  CUIScriptWnd.Show(self, false)
+  -- Hide only. Never call engine methods after HideDialog: the dialog may
+  -- already be destroyed by its holder, and any virtual call on it raises
+  -- "pure virtual function called" (same fault as the server browser Back
+  -- crash). Base ui_mm_faction_select.script:1587-1590 ends at HideDialog too.
+  if self:IsShown() then self:HideDialog() end
 end
 
 -- Server-side failure (OpError 0x0077) or local precondition failure: reset the
