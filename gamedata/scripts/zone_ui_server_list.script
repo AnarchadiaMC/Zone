@@ -2220,17 +2220,17 @@ function UIZoneServerList:OnListSelect()
     self:UpdateDetails()
 end
 
--- Engine TAB_CHANGED callback: capture the selection only. Rebuilding the list
--- and starting scans from inside the engine's tab-control callback can crash
--- (re-entrancy), so the heavy work is deferred to the next Update tick.
+-- Engine TAB_CHANGED callback: set a flag only. Calling engine getters
+-- (GetActiveId) or rebuilding the list from inside the tab-control's own
+-- callback crashes (re-entrancy), so all work happens on the next Update tick.
 function UIZoneServerList:OnTabChanged()
-    self.tab_id = self:GetActiveTabId()
     self.tab_dirty = true
 end
 
 function UIZoneServerList:ProcessTabChange()
     if not self.tab_dirty then return end
     self.tab_dirty = false
+    self.tab_id = self:GetActiveTabId()
     self:AbortScan()
     self.broadcast_hit = nil
     self:UpdateDirectVisibility()
