@@ -97,6 +97,7 @@
         <texture>ui_inGame2_edit_box_1</texture>
     </host_bg>
     <edit_ip x="360" y="244" width="454" height="22" max_symb_count="64">
+        <text font="letterica16" vert_align="c"/>
         <text_color>
             <e r="235" g="235" b="230"/>
             <d r="120" g="120" b="120"/>
@@ -109,6 +110,7 @@
         <texture>ui_inGame2_edit_box_1</texture>
     </port_bg>
     <edit_port x="360" y="286" width="134" height="22" max_symb_count="5">
+        <text font="letterica16" vert_align="c"/>
         <text_color>
             <e r="235" g="235" b="230"/>
             <d r="120" g="120" b="120"/>
@@ -121,6 +123,7 @@
         <texture>ui_inGame2_edit_box_1</texture>
     </nick_bg>
     <edit_nick x="360" y="328" width="284" height="22" max_symb_count="24">
+        <text font="letterica16" vert_align="c"/>
         <text_color>
             <e r="235" g="235" b="230"/>
             <d r="120" g="120" b="120"/>

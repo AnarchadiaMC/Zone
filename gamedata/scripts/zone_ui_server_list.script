@@ -461,7 +461,10 @@ function UIZoneServerList:Now()
     local t = 0
     pcall(function() if time_global then t = time_global() end end)
     if not t or t == 0 then
-        pcall(function() if time_continual then t = time_continual() * 1000 end end)
+        pcall(function()
+            local dev = device and device()
+            if dev and dev.time_continual then t = dev:time_continual() end
+        end)
     end
     return t or 0
 end
@@ -1200,7 +1203,6 @@ function UIZoneServerList:AddRow(entry, index)
 
     local icon = item:AddIconField(24)
     if icon then
-        if font then pcall(function() icon:SetFont(font) end) end
         w.icon = icon
     end
     local name = item:AddTextField("", 128)
@@ -2563,10 +2565,8 @@ function UIZoneServerList:SwitchTab(delta)
     if next_i < 1 then next_i = #TAB_ORDER end
     if next_i > #TAB_ORDER then next_i = 1 end
     pcall(function() self.tabs:SetActiveTab(TAB_ORDER[next_i]) end)
-    local after = self:GetActiveTabId()
-    if self.tab_id ~= after then
-        self.tab_id = after
-        self:OnTabChanged()
+    if self.tab_id ~= TAB_ORDER[next_i] then
+        self.tab_dirty = true
     end
 end
 

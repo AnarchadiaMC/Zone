@@ -63,8 +63,6 @@ local NEVER_BLOCK = {
     "kUSE", "kINVENTORY", "kACTIVE_JOBS", "kBUY", "kDROP",
     "kQUICK_SAVE", "kQUICK_LOAD", "kPAUSE", "kCONSOLE", "kQUIT",
     "kCHAT", "kCHAT_TEAM", "kFREELOOK", "kTORCH", "kDETECTOR",
-    -- names used by other engines; honored only when key_bindings exports them
-    "kPDA", "kMAP", "kTALK", "kTRADE",
 }
 local NEVER_BLOCK_IDS = {}
 

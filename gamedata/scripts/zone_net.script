@@ -346,7 +346,8 @@ function ZoneNet:SendRaw(opcode, payload, len, reliable)
     local op = tonumber(opcode)
     if not op or op < 0 or op > 65535 then return false end
     local n = tonumber(len) or 0
-    if n < 0 or n > 4096 then return false end
+    -- ZN_SendRaw rejects payloads > 1200 bytes (zone_bindings.cpp:211).
+    if n < 0 or n > 1200 then return false end
     local rel = reliable and 1 or 0
     local ok, res = pcall(function()
         return zone_client.ZN_SendRaw(math.floor(op), payload, math.floor(n), rel)
