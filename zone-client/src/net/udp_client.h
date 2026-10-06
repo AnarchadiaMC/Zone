@@ -10,6 +10,14 @@ namespace NetClient
     void Connect(const std::string& ip, uint16_t port, const std::string& uuid, uint32_t hwid, const std::string& nick);
     void Disconnect();
 
+    // DllMain-safe best-effort goodbye: sends one DISCONNECT datagram on the
+    // session socket using only atomic/plain reads and a local address copy.
+    // No locks, no allocation, no join, no WSACleanup, so it is safe to call
+    // from DLL_PROCESS_DETACH during process termination (lpvReserved != NULL).
+    // No-op when not connected or the socket is invalid; delivery is not
+    // guaranteed. Do not call from FreeLibrary paths.
+    void SendDisconnectBestEffort();
+
     struct Transform {
         float x = 0.0f;
         float y = 0.0f;

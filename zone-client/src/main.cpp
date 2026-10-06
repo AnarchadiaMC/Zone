@@ -13,7 +13,12 @@ namespace
     {
         try
         {
-            Sleep(500);
+            // Provision embedded assets before any delay: the engine finishes its
+            // gamedata filesystem scan ~0.5s after process start, and files written
+            // after the scan stay invisible for the whole session.
+            AssetProvisioner::EnsureAssets();
+
+            Sleep(100);
 
             MH_STATUS mhStatus = MH_Initialize();
             if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED)
@@ -22,7 +27,6 @@ namespace
             }
 
             Identity::Init();
-            AssetProvisioner::EnsureAssets();
             NetClient::Init();
         }
         catch (const std::exception& e)
@@ -63,6 +67,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
             // is in select/sendto/CRT). Signal shutdown only; the worker is
             // daemonized and the OS reclaims the socket on process exit.
             // Previous code called NetClient::Shutdown() here (join + WSACleanup).
+            // On process termination (lpvReserved != nullptr) skip a best-effort
+            // DISCONNECT so the server drops the session promptly; FreeLibrary
+            // still performs no cleanup at all.
+            if (lpvReserved != nullptr)
+            {
+                NetClient::SendDisconnectBestEffort();
+            }
             break;
         }
 

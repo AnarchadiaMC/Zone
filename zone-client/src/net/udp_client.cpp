@@ -587,6 +587,17 @@ namespace NetClient
         }
     }
 
+    void SendDisconnectBestEffort()
+    {
+        SOCKET sock = g_Socket;
+        if (sock == INVALID_SOCKET || g_State != CONNECTED)
+            return;
+
+        sockaddr_in target = g_ServerAddr;
+        ZO_Header hdr = { 0x5A4F, 1, FlagReliable, ++g_Sequence, (uint16_t)Opcode::DISCONNECT, 0 };
+        sendto(sock, (const char*)&hdr, sizeof(hdr), 0, (sockaddr*)&target, sizeof(target));
+    }
+
     void Shutdown()
     {
         Disconnect();
