@@ -479,11 +479,79 @@ func (d *DB) BanAccount(uuid string, reason string) error {
 
 func (d *DB) GetStash(stashID uint32) (*StashRecord, error) {
 	row := d.db.QueryRow("SELECT stash_id, level_name, pos_x, pos_y, pos_z, COALESCE(owner_uuid, ''), COALESCE(passcode, ''), contents_json, created_at, updated_at FROM world_stashes WHERE stash_id = ?", stashID)
+	return scanStash(row)
+}
+
+// scanStash decodes one world_stashes row selected with the canonical column
+// order used by GetStash/FindStashAt.
+func scanStash(row *sql.Row) (*StashRecord, error) {
 	var s StashRecord
 	if err := row.Scan(&s.StashID, &s.LevelName, &s.PosX, &s.PosY, &s.PosZ, &s.OwnerUUID, &s.Passcode, &s.ContentsJSON, &s.CreatedAt, &s.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &s, nil
+}
+
+// FindStashAt returns the stash at an exact (level, position) key or
+// sql.ErrNoRows. Positions are stored rounded onto the 0.5 m key grid, so the
+// exact equality match is deliberate; callers round before calling.
+func (d *DB) FindStashAt(level string, x, y, z float32) (*StashRecord, error) {
+	row := d.db.QueryRow(`SELECT stash_id, level_name, pos_x, pos_y, pos_z, COALESCE(owner_uuid, ''), COALESCE(passcode, ''), contents_json, created_at, updated_at
+		FROM world_stashes WHERE level_name = ? AND pos_x = ? AND pos_y = ? AND pos_z = ?
+		ORDER BY stash_id LIMIT 1`, level, x, y, z)
+	return scanStash(row)
+}
+
+// FindOrCreateStashAt resolves the ownerless world stash at an exact (level,
+// position) key, inserting an empty one when absent. SELECT and INSERT share
+// one transaction; the caller still serializes concurrent creates (see
+// StashManager.FindOrCreateWorldStash) so one key never materialises two
+// ownerless stashes. owner_uuid/passcode stay NULL, i.e. a world stash any
+// nearby character may use.
+func (d *DB) FindOrCreateStashAt(level string, x, y, z float32) (*StashRecord, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	selectRow := tx.QueryRow(`SELECT stash_id, level_name, pos_x, pos_y, pos_z, COALESCE(owner_uuid, ''), COALESCE(passcode, ''), contents_json, created_at, updated_at
+		FROM world_stashes WHERE level_name = ? AND pos_x = ? AND pos_y = ? AND pos_z = ?
+		ORDER BY stash_id LIMIT 1`, level, x, y, z)
+	rec, err := scanStash(selectRow)
+	if err == nil {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return rec, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	now := time.Now().Unix()
+	res, err := tx.Exec(`INSERT INTO world_stashes (level_name, pos_x, pos_y, pos_z, owner_uuid, passcode, contents_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, NULL, NULL, '[]', ?, ?)`, level, x, y, z, now, now)
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &StashRecord{
+		StashID:      uint32(id),
+		LevelName:    level,
+		PosX:         x,
+		PosY:         y,
+		PosZ:         z,
+		ContentsJSON: "[]",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}, nil
 }
 
 func (d *DB) SaveStash(stashID uint32, level string, x, y, z float32, contentsJSON string) error {

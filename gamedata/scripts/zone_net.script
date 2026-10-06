@@ -32,6 +32,44 @@ local next_item_action_id = 0
 local pending_item_actions = {}
 local spawned_world_items = {}
 
+-- Stash/trade ledgers (OpStashAction 0x0081 / OpStashResult 0x0082 and
+-- OpTradeAction 0x0083 / OpTradeResult 0x0084). Declared here (before
+-- reset_state) so disconnect/reset and level change can clear them. Both
+-- queues share the item ledger's monotonic ActionID counter.
+local pending_stash_actions = {}
+local pending_trade_actions = {}
+-- Short-window dedupe for stash callbacks: a take is reported both by the
+-- engine binder path (bind_stalker_ext.script:148) and by the UI inventory
+-- diff (ui_inventory.script:2180), so the same (box, item, action) must not
+-- produce two server actions. Keys live at most a few seconds.
+local stash_dedupe = {}
+local stash_dedupe_ops = 0
+
+-- Trade UI observation (Anomaly custom UIInventory): staged items per side and
+-- the money baseline used to detect the commit. The engine actor_on_trade
+-- callback does not fire for this UI (see the trade hook comment below).
+local trade_staged_sell = {}
+local trade_staged_buy = {}
+local trade_last_money = nil
+local trade_session_open = false
+local trade_engine_cb_seen = false
+
+-- Wallet reconciliation (OpWalletUpdate 0x0085 S->C) and UI-echo pickup
+-- suppression state. Declared before reset_state so disconnect can clear it.
+--   wallet_money_last_seen: last server value applied to the actor wallet.
+--   pending_wallet_money:   server value queued while no actor exists (join).
+--   trade_commit_tg:        last trade commit; pickup echoes of the transfer
+--                           arrive within TRADE_PICKUP_SUPPRESS_MS after it.
+--   recently_moved_items:   local object ids a stash/trade callback just moved.
+local wallet_money_last_seen = nil
+local pending_wallet_money = nil
+local trade_commit_tg = 0
+local recently_moved_items = {}
+local recently_moved_ops = 0
+local WALLET_NOTICE_THRESHOLD = 1000
+local TRADE_PICKUP_SUPPRESS_MS = 2000
+local RECENT_MOVE_TTL_MS = 5000
+
 -- Forward declarations: dispatch_packet references these but they are defined
 -- after it (they need the parse helpers declared further down). clear_pending_join
 -- is forward-declared so reset_state can disarm the on-disk join marker.
@@ -251,6 +289,20 @@ function reset_state()
     next_item_action_id = 0
     pending_item_actions = {}
     spawned_world_items = {}
+    pending_stash_actions = {}
+    pending_trade_actions = {}
+    stash_dedupe = {}
+    stash_dedupe_ops = 0
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+    trade_last_money = nil
+    trade_session_open = false
+    trade_engine_cb_seen = false
+    wallet_money_last_seen = nil
+    pending_wallet_money = nil
+    trade_commit_tg = 0
+    recently_moved_items = {}
+    recently_moved_ops = 0
     if clear_pending_join then pcall(clear_pending_join) end
 end
 
@@ -679,6 +731,15 @@ local function retransmit_pending_item_actions(tg)
     end
 end
 
+-- Per-session monotonic ActionID, shared by the item, stash and trade ledgers.
+-- The server keeps one idempotency floor per session, so an id must never be
+-- reused across opcodes.
+local function alloc_action_id()
+    next_item_action_id = next_item_action_id + 1
+    if next_item_action_id > 0x7FFFFFFF then next_item_action_id = 1 end
+    return next_item_action_id
+end
+
 local function send_item_action(action, item_id, section, count, x, y, z, condition, local_se_id)
     if not item_send_allowed() then return nil end
     if type(section) ~= "string" or section == "" then return nil end
@@ -687,9 +748,7 @@ local function send_item_action(action, item_id, section, count, x, y, z, condit
         return nil
     end
 
-    next_item_action_id = next_item_action_id + 1
-    if next_item_action_id > 0x7FFFFFFF then next_item_action_id = 1 end
-    local action_id = next_item_action_id
+    local action_id = alloc_action_id()
 
     local buf = g_item_payload
     item_payload_u32(buf, 0, action_id)
@@ -724,6 +783,539 @@ local function send_item_action(action, item_id, section, count, x, y, z, condit
         timed_out = false,
     }
     return action_id
+end
+
+-- ---------------------------------------------------------------------------
+-- Stash / trade / wallet ledger (0x0081..0x0085).
+--
+-- Wire layouts (field order as frozen; lengths are the actual field sums):
+--   0x0081 84 B C->S: ActionID u32, Action u8 (1=store, 2=take),
+--                     X/Y/Z f32, Section[64], Count u16, Condition u8
+--   0x0082 73 B S->C: ActionID u32, Result u8 (0 ok, 1 rejected, 2 corrected),
+--                     Action u8, Count i16, Section[64], Condition u8
+--   0x0083 76 B C->S: ActionID u32, Action u8 (1=buy, 2=sell),
+--                     MoneyDelta u32, Section[64], Count u16, Condition u8
+--   0x0084 75 B S->C: ActionID u32, Result u8, Action u8, MoneyDelta i32,
+--                     Section[64], Condition u8
+--   0x0085  4 B S->C: Money u32 (server-authoritative wallet)
+--
+-- The stated 83/78/71 B sizes in the protocol note do not match the field
+-- lists (they sum to 84/76/75); the field lists win here because they carry
+-- the semantic contract and two of the stated sizes cannot hold their own
+-- fields. Inbound parsing: 0x0082 needs >= 73, 0x0084 is strict 75 with a
+-- tolerant 71-byte legacy branch, 0x0085 needs >= 4. On the wire Condition is
+-- u8 0..100; callers convert item:condition() (0..1) with item_condition_u8
+-- before calling SendStash/SendTrade.
+-- Unconfirmed actions are retransmitted with the SAME ActionID/payload every
+-- 500 ms up to 4 times; the server idempotency cache makes a replay safe.
+-- ---------------------------------------------------------------------------
+local STASH_ACTION_PAYLOAD_LEN = 84
+local TRADE_ACTION_PAYLOAD_LEN = 76
+local STASH_RESULT_MIN_LEN = 73
+-- OpTradeResult is frozen at 75 B. The legacy 71-byte layout (no MoneyDelta)
+-- is still accepted because the length distinguishes it unambiguously from 75;
+-- any other length is logged once and dropped (strict 75 is the contract).
+local TRADE_RESULT_LEN = 75
+local TRADE_RESULT_LEGACY_LEN = 71
+local g_stash_payload = ffi.new("char[84]")
+local g_trade_payload = ffi.new("char[76]")
+
+local function stash_payload(action_id, action, x, y, z, section, count, condition)
+    local buf = g_stash_payload
+    item_payload_u32(buf, 0, action_id)
+    item_payload_u8(buf, 4, action)
+    item_payload_f32(buf, 5, x or 0)
+    item_payload_f32(buf, 9, y or 0)
+    item_payload_f32(buf, 13, z or 0)
+    item_payload_section(buf, 17, section)
+    item_payload_u16(buf, 81, count or 1)
+    item_payload_u8(buf, 83, condition or 0)
+    return ffi.string(buf, STASH_ACTION_PAYLOAD_LEN)
+end
+
+local function trade_payload(action_id, action, money_delta, section, count, condition)
+    local buf = g_trade_payload
+    item_payload_u32(buf, 0, action_id)
+    item_payload_u8(buf, 4, action)
+    item_payload_u32(buf, 5, money_delta or 0)
+    item_payload_section(buf, 9, section)
+    item_payload_u16(buf, 73, count or 1)
+    item_payload_u8(buf, 75, condition or 0)
+    return ffi.string(buf, TRADE_ACTION_PAYLOAD_LEN)
+end
+
+-- Shared by the stash and trade senders: snapshot the exact bytes and queue
+-- them for retransmission.
+local function queue_pending_action(pending, action_id, payload, entry, section)
+    local tg = time_global()
+    if not entry then entry = {} end
+    entry.action = entry.action or 0
+    entry.section = section
+    entry.time = tg
+    entry.payload = payload
+    entry.resends = 0
+    entry.next_resend_tg = tg + ITEM_ACTION_RESEND_MS
+    entry.timed_out = false
+    pending[action_id] = entry
+    return action_id
+end
+
+-- Public allocator so external callers can reserve an ActionID before calling
+-- SendStash/SendTrade (both also allocate one when passed nil).
+function ZoneNet:NextActionID()
+    return alloc_action_id()
+end
+
+-- Stash store/take. actionID may be nil (allocated here). Returns the id on
+-- success, nil when the send was dropped.
+function ZoneNet:SendStash(actionID, action, x, y, z, section, count, condition)
+    if not item_send_allowed() then return nil end
+    if type(section) ~= "string" or section == "" then return nil end
+    if not (ZoneNet and type(ZoneNet.SendRaw) == "function") then return nil end
+    local act = tonumber(action)
+    if act ~= 1 and act ~= 2 then return nil end
+
+    local id = tonumber(actionID)
+    if id and id > 0 then
+        id = math.floor(id) % 0x80000000
+        if id <= 0 then id = alloc_action_id() end
+        -- Keep the shared counter above any explicitly supplied id so later
+        -- allocations can never reuse it.
+        if id > next_item_action_id then next_item_action_id = id end
+    else
+        id = alloc_action_id()
+    end
+
+    local cnt = math.floor(tonumber(count) or 1)
+    if cnt < 1 then cnt = 1 end
+    if cnt > 65535 then cnt = 65535 end
+    local cond = math.floor(tonumber(condition) or 0)
+    if cond < 0 then cond = 0 end
+    if cond > 100 then cond = 100 end
+
+    local payload = stash_payload(id, act, x, y, z, section, cnt, cond)
+    local sent = ZoneNet:SendRaw(0x0081, payload, STASH_ACTION_PAYLOAD_LEN, 1)
+    if not sent then
+        printf("Zone: failed to send stash action %d for section %s", act, section)
+        return nil
+    end
+    queue_pending_action(pending_stash_actions, id, payload,
+        { action = act, count = cnt }, section)
+    return id
+end
+
+-- Trader buy/sell. actionID may be nil (allocated here). MoneyDelta is the
+-- positive item price (buy and sell); it is clamped to the wire u32.
+function ZoneNet:SendTrade(actionID, action, moneyDelta, section, count, condition)
+    if not item_send_allowed() then return nil end
+    if type(section) ~= "string" or section == "" then return nil end
+    if not (ZoneNet and type(ZoneNet.SendRaw) == "function") then return nil end
+    local act = tonumber(action)
+    if act ~= 1 and act ~= 2 then return nil end
+
+    local id = tonumber(actionID)
+    if id and id > 0 then
+        id = math.floor(id) % 0x80000000
+        if id <= 0 then id = alloc_action_id() end
+        -- Keep the shared counter above any explicitly supplied id so later
+        -- allocations can never reuse it.
+        if id > next_item_action_id then next_item_action_id = id end
+    else
+        id = alloc_action_id()
+    end
+
+    local cnt = math.floor(tonumber(count) or 1)
+    if cnt < 1 then cnt = 1 end
+    if cnt > 65535 then cnt = 65535 end
+    local cond = math.floor(tonumber(condition) or 0)
+    if cond < 0 then cond = 0 end
+    if cond > 100 then cond = 100 end
+
+    local md = math.floor(tonumber(moneyDelta) or 0)
+    if md < 0 then md = 0 end
+    if md > 0xFFFFFFFF then md = 0xFFFFFFFF end
+
+    local payload = trade_payload(id, act, md, section, cnt, cond)
+    local sent = ZoneNet:SendRaw(0x0083, payload, TRADE_ACTION_PAYLOAD_LEN, 1)
+    if not sent then
+        printf("Zone: failed to send trade action %d for section %s", act, section)
+        return nil
+    end
+    queue_pending_action(pending_trade_actions, id, payload,
+        { action = act, count = cnt, money_delta = md }, section)
+    return id
+end
+
+-- Retransmit unacknowledged stash/trade actions at the same cadence as the
+-- item ledger. After the final retry one localized timeout notice is shown;
+-- the entry is pruned after ITEM_ACTION_TTL_MS.
+local function retransmit_pending_map(pending, opcode, payload_len, label, tr_key, fallback)
+    if not (ZoneNet and type(ZoneNet.SendRaw) == "function") then return end
+    local tg = time_global()
+    local stale = nil
+    for id, entry in pairs(pending) do
+        if not entry.timed_out and entry.next_resend_tg and tg >= entry.next_resend_tg then
+            if entry.resends < ITEM_ACTION_MAX_RESENDS then
+                entry.resends = entry.resends + 1
+                entry.next_resend_tg = tg + ITEM_ACTION_RESEND_MS
+                local sent = ZoneNet:SendRaw(opcode, entry.payload, payload_len, 1)
+                if not sent then
+                    printf("Zone: %s action %u resend %d failed",
+                        label, tonumber(id) or 0, entry.resends)
+                end
+            else
+                entry.timed_out = true
+                surface_message(tr(tr_key, fallback))
+                printf("Zone: %s action %u timed out after %d resends (section %s)",
+                    label, tonumber(id) or 0, entry.resends, tostring(entry.section))
+            end
+        elseif entry.timed_out and (tg - (entry.time or 0)) > ITEM_ACTION_TTL_MS then
+            if not stale then stale = {} end
+            stale[#stale + 1] = id
+        end
+    end
+    if stale then
+        for i = 1, #stale do pending[stale[i]] = nil end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- UI-echo pickup suppression (stash withdraw / trader buy).
+--
+-- actor_on_item_take also fires when the player moves an item out of a stash
+-- box or buys one from a trader. Those transfers are already reported through
+-- OpStashAction/OpTradeAction; the extra take report goes out with ItemID 0,
+-- is rejected by the server and forces an inventory resync (pure noise). An
+-- item moved by a stash/trade callback is remembered here and its take report
+-- is dropped while a stash/trade action is in flight. Real world pickups are
+-- never in the moved set, so they still go out unchanged.
+-- ---------------------------------------------------------------------------
+
+local function mark_recent_item_move(local_item_id)
+    if not local_item_id then return end
+    local tg = time_global()
+    recently_moved_items[local_item_id] = tg
+    recently_moved_ops = recently_moved_ops + 1
+    if recently_moved_ops >= 256 then
+        recently_moved_ops = 0
+        for id, t in pairs(recently_moved_items) do
+            if (tg - (t or 0)) > RECENT_MOVE_TTL_MS then
+                recently_moved_items[id] = nil
+            end
+        end
+    end
+end
+
+local function pending_action_matches_section(pending, section, tg)
+    if type(section) ~= "string" or section == "" then return false end
+    for _, entry in pairs(pending) do
+        if entry and entry.section == section and not entry.timed_out
+            and (tg - (entry.time or 0)) <= RECENT_MOVE_TTL_MS then
+            return true
+        end
+    end
+    return false
+end
+
+-- True when this take is the UI echoing a stash/trade transfer and not a real
+-- world pickup. The gate mirrors the task contract: a stash/trade action is
+-- pending, a trade session is open, or a trade commit happened < 2 s ago.
+local function pickup_echo_suppressed(local_item_id, section)
+    local tg = time_global()
+    local in_flight = (next(pending_stash_actions) ~= nil)
+        or (next(pending_trade_actions) ~= nil)
+        or trade_session_open
+        or (trade_commit_tg > 0 and (tg - trade_commit_tg) <= TRADE_PICKUP_SUPPRESS_MS)
+    if not in_flight then return false end
+
+    if local_item_id then
+        local moved_at = recently_moved_items[local_item_id]
+        if moved_at and (tg - moved_at) <= RECENT_MOVE_TTL_MS then return true end
+    end
+    -- Callback order is not guaranteed (the engine take event may precede
+    -- actor_on_item_take_from_box), so also match the section of a fresh
+    -- in-flight action. This can only happen while a transfer UI owns input.
+    if pending_action_matches_section(pending_stash_actions, section, tg) then return true end
+    if pending_action_matches_section(pending_trade_actions, section, tg) then return true end
+    return false
+end
+
+-- Trader buy/sell hooks.
+--
+-- Engine path (vanilla trade window): the base scripts declare actor_on_trade
+-- (axr_main.script:76) and dispatch it from the engine's trade_sell_buy_item
+-- callback (bind_stalker.script:160 -> bind_stalker_ext.script:185-191):
+--   actor_on_trade(item, sell_bye, money)
+-- sell_bye == true: the actor sold the item (money credited).
+--
+-- Anomaly's custom UIInventory does NOT trigger that engine callback:
+-- On_Item_Exchange calls npc:transfer_item, and CScriptGameObject::TransferItem
+-- emits GE_TRADE_SELL/GE_TRADE_BUY directly
+-- (script_game_object_inventory_owner.cpp) instead of CTrade::TransferItem
+-- (trade2.cpp:123), the only eTradeSellBuyItem dispatcher. The custom UI commit
+-- is therefore observed from its documented Lua surface:
+--   * ActorMenu_on_item_after_move (ui_inventory.script:1121) tracks staged
+--     items; bag_id is the SOURCE bag (actor_menu_inventory.script:13-24):
+--     2=iActorBag (actor_trade_bag -> staged to sell), 4=iActorTrade
+--     (actor_trade -> unstaged), 5=iPartnerTradeBag (npc_trade_bag -> staged
+--     to buy), 6=iPartnerTrade (npc_trade -> unstaged);
+--   * the money mutation in TMode_Sell/TMode_Buy (ui_inventory.script:2487/
+--     2531) is the commit signal: delta > 0 = sell, delta < 0 = buy.
+-- Both paths send OpTradeAction; if the engine path ever fires the observer
+-- goes dormant so one trade can never be sent twice.
+local function on_actor_trade(item, sell_bye, money)
+    trade_engine_cb_seen = true
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+    if not item then return end
+    if not item_send_allowed() then return end
+
+    -- The trade UI transfer re-fires actor_on_item_take for this item; mark it
+    -- and open the commit window so the echo is not reported as a pickup.
+    local item_local_id = nil
+    pcall(function() item_local_id = item:id() end)
+    mark_recent_item_move(item_local_id)
+    trade_commit_tg = time_global()
+
+    local section = nil
+    pcall(function() section = item:section() end)
+    if type(section) ~= "string" or section == "" then return end
+
+    local cond = nil
+    pcall(function() cond = item:condition() end)
+    local count = item_stack_count(item)
+    local money_delta = math.abs(tonumber(money) or 0)
+    local action = (sell_bye == true) and 2 or 1
+
+    local action_id = alloc_action_id()
+    local sent = ZoneNet:SendTrade(action_id, action, money_delta, section, count,
+        item_condition_u8(cond))
+    if not sent then
+        printf("Zone: trade action dropped (section %s action %d)", tostring(section), action)
+    end
+end
+
+-- EDDListType values (actor_menu_inventory.script:13-24).
+local BAG_ID_ACTOR_BAG = 2
+local BAG_ID_ACTOR_TRADE = 4
+local BAG_ID_PARTNER_BAG = 5
+local BAG_ID_PARTNER_TRADE = 6
+
+-- Per-item price the trade UI is charging: the staged cell cost when the UI
+-- instance is reachable (ui_inventory.script:2442 GetCellCost), else the base
+-- item cost, else 0.
+local function trade_cell_cost(bag, obj)
+    local cost = 0
+    pcall(function()
+        local menu = nil
+        if type(_G.GetActorMenu) == "function" then menu = _G.GetActorMenu() end
+        local cc = menu and menu.CC and menu.CC[bag]
+        local ci = cc and cc:GetCell_ID(obj:id())
+        if ci then cost = math.floor(cc:GetCellCost(ci) or 0) end
+    end)
+    if cost <= 0 then
+        pcall(function() cost = math.floor(obj:cost() or 0) end)
+    end
+    if cost < 0 then cost = 0 end
+    return cost
+end
+
+local function trade_stage_entry(obj, bag)
+    local section = nil
+    pcall(function() section = obj:section() end)
+    if type(section) ~= "string" or section == "" then return nil end
+    local cond = nil
+    pcall(function() cond = obj:condition() end)
+    return {
+        section = section,
+        count = item_stack_count(obj),
+        cond_u8 = item_condition_u8(cond),
+        money = trade_cell_cost(bag, obj),
+    }
+end
+
+local function on_item_after_move(npc_id, obj, mode, bag_id)
+    if mode ~= "trade" or not obj then return end
+    local id = nil
+    pcall(function() id = obj:id() end)
+    if not id then return end
+    -- Staged for sale/purchase: remember the local id so the transfer echo at
+    -- commit is not sent as a world pickup.
+    mark_recent_item_move(id)
+    if bag_id == BAG_ID_ACTOR_BAG then
+        local entry = trade_stage_entry(obj, "actor_trade")
+        if entry then trade_staged_sell[id] = entry end
+    elseif bag_id == BAG_ID_ACTOR_TRADE then
+        trade_staged_sell[id] = nil
+    elseif bag_id == BAG_ID_PARTNER_BAG then
+        local entry = trade_stage_entry(obj, "npc_trade")
+        if entry then trade_staged_buy[id] = entry end
+    elseif bag_id == BAG_ID_PARTNER_TRADE then
+        trade_staged_buy[id] = nil
+    end
+end
+
+local function send_staged_trades(staged, action)
+    for item_id, entry in pairs(staged) do
+        if entry then
+            mark_recent_item_move(item_id)
+            local aid = alloc_action_id()
+            local sent = ZoneNet:SendTrade(aid, action, entry.money or 0, entry.section,
+                entry.count or 1, entry.cond_u8 or 100)
+            if not sent then
+                printf("Zone: staged trade action dropped (section %s action %d)",
+                    tostring(entry.section), action)
+            end
+        end
+    end
+end
+
+-- Money mutation is the commit signal (ui_inventory.script TMode_Sell/Buy
+-- transfer the staged items and then call give_money). Runs every connected
+-- tick and once more on trade close so a commit followed by an immediate
+-- window close is still captured.
+local function watch_trade_money()
+    local actor = db and db.actor
+    if not actor then return end
+    local money = nil
+    pcall(function() money = actor:money() end)
+    if type(money) ~= "number" then return end
+    if trade_last_money == nil then
+        trade_last_money = money
+        return
+    end
+    local delta = money - trade_last_money
+    trade_last_money = money
+    if delta == 0 then return end
+    -- Commit signal: pickup echoes of the transfer's item takes arrive within
+    -- the suppression window opened here.
+    trade_commit_tg = time_global()
+    if trade_engine_cb_seen then
+        trade_staged_sell = {}
+        trade_staged_buy = {}
+        return
+    end
+    if not trade_session_open then
+        -- Money moved outside a trade session: staged tracking is stale.
+        trade_staged_sell = {}
+        trade_staged_buy = {}
+        return
+    end
+    if delta > 0 then
+        send_staged_trades(trade_staged_sell, 2)
+    else
+        send_staged_trades(trade_staged_buy, 1)
+    end
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+end
+
+local function on_trade_started()
+    trade_session_open = true
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+    local actor = db and db.actor
+    if actor then
+        pcall(function() trade_last_money = actor:money() end)
+    end
+end
+
+local function on_trade_closed()
+    -- A commit immediately before closing must still be sent before the staged
+    -- tables are dropped.
+    pcall(watch_trade_money)
+    trade_session_open = false
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+    local actor = db and db.actor
+    if actor then
+        pcall(function() trade_last_money = actor:money() end)
+    end
+end
+
+-- Stash hooks. The box object is the world stash/container; its position is
+-- the server ledger key. actor_on_item_put_in_box fires from
+-- ui_inventory.script:2172; actor_on_item_take_from_box fires from
+-- ui_inventory.script:2180 and from the engine binder path
+-- (bind_stalker_ext.script:148-150).
+local STASH_DEDUPE_MS = 750
+
+local function stash_dedupe_key(box, item, action)
+    local box_id, item_id = nil, nil
+    pcall(function() box_id = box:id() end)
+    pcall(function() item_id = item:id() end)
+    if not box_id or not item_id then return nil end
+    return tostring(box_id) .. ":" .. tostring(item_id) .. ":" .. tostring(action)
+end
+
+local function stash_dedupe_seen(key)
+    if not key then return false end
+    local last = stash_dedupe[key]
+    if not last then return false end
+    return (time_global() - last) < STASH_DEDUPE_MS
+end
+
+local function stash_dedupe_mark(key)
+    if not key then return end
+    local tg = time_global()
+    stash_dedupe[key] = tg
+    stash_dedupe_ops = stash_dedupe_ops + 1
+    if stash_dedupe_ops >= 256 then
+        stash_dedupe_ops = 0
+        for k, t in pairs(stash_dedupe) do
+            if (tg - (t or 0)) > 5000 then stash_dedupe[k] = nil end
+        end
+    end
+end
+
+local function send_stash_action(box, item, action)
+    if not box or not item then return end
+    if not item_send_allowed() then return end
+
+    -- The withdrawal re-fires actor_on_item_take for this item; mark it so the
+    -- echo is not reported as a world pickup.
+    local local_item_id = nil
+    pcall(function() local_item_id = item:id() end)
+    mark_recent_item_move(local_item_id)
+
+    local section = nil
+    pcall(function() section = item:section() end)
+    if type(section) ~= "string" or section == "" then return end
+
+    -- Both stash callbacks can report the same transfer; only the first wins
+    -- inside the dedupe window.
+    local dedupe_key = stash_dedupe_key(box, item, action)
+    if stash_dedupe_seen(dedupe_key) then return end
+
+    local x, y, z = 0, 0, 0
+    pcall(function()
+        local p = box:position()
+        x, y, z = p.x, p.y, p.z
+    end)
+    -- Position goes on the wire as raw floats. The server rounds the stash key
+    -- to its 0.5 m grid; pre-rounding here would make the client key diverge
+    -- from the server's stored position, so do NOT round client-side.
+
+    local cond = nil
+    pcall(function() cond = item:condition() end)
+    local count = item_stack_count(item)
+
+    local action_id = alloc_action_id()
+    local sent = ZoneNet:SendStash(action_id, action, x, y, z, section, count,
+        item_condition_u8(cond))
+    if sent then
+        stash_dedupe_mark(dedupe_key)
+    else
+        printf("Zone: stash action dropped (section %s action %d)", tostring(section), action)
+    end
+end
+
+local function on_item_put_in_box(box, item)
+    send_stash_action(box, item, 1)
+end
+
+local function on_item_take_from_box(box, item)
+    send_stash_action(box, item, 2)
 end
 
 local function release_world_item_visual(entry)
@@ -825,6 +1417,16 @@ local function on_actor_item_take(item)
     pcall(function() cond = item:condition() end)
     pcall(function() local_id = item:id() end)
     local count = item_stack_count(item)
+
+    -- Stash withdraw / trader buy echo: already reported as an OpStashAction/
+    -- OpTradeAction. Sending it as a pickup uses ItemID 0, which the server
+    -- rejects and answers with a full resync. Drop the echo; real world
+    -- pickups are not marked and pass through unchanged.
+    if pickup_echo_suppressed(local_id, section) then
+        printf("Zone: suppressed UI pickup echo for %s (local id %s)",
+            tostring(section), tostring(local_id))
+        return
+    end
 
     local item_id = 0
     if local_id then
@@ -955,6 +1557,198 @@ local function on_item_update(pkt, offset)
                 tostring(section), tonumber(item_id) or 0)
         end
     end
+end
+
+-- OpStashResult 0x0082. The server force-resends OpInventorySync on a
+-- non-ok result, so the client only surfaces the notice here.
+local function on_stash_result(pkt, offset)
+    local len = string.len(pkt)
+    if len < offset + STASH_RESULT_MIN_LEN - 1 then
+        log_dispatch_once("short_0082", "Zone: dropped short STASH_RESULT packet (%d bytes)", len)
+        return
+    end
+
+    local action_id, pos = read_uint32_le(pkt, offset)
+    local result, pos = read_uint8(pkt, pos)
+    local action, pos = read_uint8(pkt, pos)
+    local count_raw, pos = read_uint16_le(pkt, pos)
+    local count = count_raw
+    if count > 32767 then count = count - 65536 end
+    local section, pos = read_string(pkt, pos, 64)
+    section = clean_cstring(section)
+    local condition, _ = read_uint8(pkt, pos)
+
+    local own = pending_stash_actions[action_id]
+    if own then pending_stash_actions[action_id] = nil end
+
+    if result == 1 then
+        if own then
+            local tmpl = tr("ui_zone_stash_action_rejected", "Server rejected stash action: %s")
+            surface_message(string.format(tmpl, tostring(section)))
+        end
+        printf("Zone: stash action rejected (ActionID %u action %d section %s count %d)",
+            tonumber(action_id) or 0, tonumber(action) or 0, tostring(section), tonumber(count) or 0)
+    elseif result == 2 then
+        if own then
+            local tmpl = tr("ui_zone_stash_action_corrected", "Server corrected stash action: %s")
+            surface_message(string.format(tmpl, tostring(section)))
+        end
+        printf("Zone: stash action corrected (ActionID %u action %d section %s count %d condition %d)",
+            tonumber(action_id) or 0, tonumber(action) or 0, tostring(section),
+            tonumber(count) or 0, tonumber(condition) or 0)
+    end
+end
+
+-- OpTradeResult 0x0084. Result 2 (corrected) carries the server's authoritative
+-- money delta; the local UI already mutated money, so OpWalletUpdate 0x0085 (or
+-- the forced inventory sync 0x0076) is the reconciliation path, not a second
+-- local money change. Strict 75-byte layout; the legacy 71-byte layout is
+-- accepted only because its length cannot be confused with 75.
+local function on_trade_result(pkt, offset)
+    local len = string.len(pkt)
+    local payload_len = len - (offset - 1)
+    if payload_len ~= TRADE_RESULT_LEN and payload_len ~= TRADE_RESULT_LEGACY_LEN then
+        log_dispatch_once("bad_0084_len",
+            "Zone: dropped OpTradeResult 0x0084 with unexpected payload length %d (want %d, legacy %d)",
+            payload_len, TRADE_RESULT_LEN, TRADE_RESULT_LEGACY_LEN)
+        return
+    end
+    if payload_len == TRADE_RESULT_LEGACY_LEN then
+        log_dispatch_once("legacy_0084",
+            "Zone: OpTradeResult 0x0084 using the legacy %d-byte layout (no MoneyDelta)",
+            TRADE_RESULT_LEGACY_LEN)
+    end
+
+    local action_id, pos = read_uint32_le(pkt, offset)
+    local result, pos = read_uint8(pkt, pos)
+    local action, pos = read_uint8(pkt, pos)
+
+    local money = 0
+    if payload_len == TRADE_RESULT_LEN then
+        -- Frozen layout: MoneyDelta i32 before Section[64].
+        local money_raw
+        money_raw, pos = read_uint32_le(pkt, pos)
+        money = money_raw
+        if money > 0x7FFFFFFF then money = money - 4294967296 end
+    end
+    local section = read_string(pkt, pos, 64)
+    pos = pos + 64
+    local condition = read_uint8(pkt, pos)
+    section = clean_cstring(section)
+
+    local own = pending_trade_actions[action_id]
+    if own then pending_trade_actions[action_id] = nil end
+
+    if result == 1 then
+        if own then
+            local tmpl = tr("ui_zone_trade_action_rejected", "Server rejected the trade: %s")
+            surface_message(string.format(tmpl, tostring(section)))
+        end
+        printf("Zone: trade action rejected (ActionID %u action %d section %s money %d)",
+            tonumber(action_id) or 0, tonumber(action) or 0, tostring(section), tonumber(money) or 0)
+    elseif result == 2 then
+        if own then
+            local tmpl = tr("ui_zone_trade_action_corrected", "Server corrected the trade: %s")
+            surface_message(string.format(tmpl, tostring(section)))
+        end
+        printf("Zone: trade action corrected (ActionID %u action %d section %s money %d condition %d)",
+            tonumber(action_id) or 0, tonumber(action) or 0, tostring(section),
+            tonumber(money) or 0, tonumber(condition) or 0)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- OpWalletUpdate 0x0085 (S->C reliable, 4 B: Money u32).
+--
+-- The server owns the wallet: it sends the authoritative value on join and
+-- after every money change. Reconcile the local actor to it:
+--   * read  : CScriptGameObject::Money -> db.actor:money()
+--             (binding script_game_object_script3.cpp:263, impl
+--             script_game_object_inventory_owner.cpp:676)
+--   * apply : CScriptGameObject::GiveMoney -> db.actor:give_money(delta)
+--             (binding script_game_object_script3.cpp:262, impl :735 via
+--             GiveMoneySafe :684, which accepts a negative delta and clamps at
+--             0; the delta is int32-clamped here before the call)
+-- A reconciliation is surfaced only when |delta| > WALLET_NOTICE_THRESHOLD so
+-- routine trade deltas stay quiet. A packet that arrives before the actor
+-- exists (menu phase of the join) is queued and applied on first update.
+-- ---------------------------------------------------------------------------
+local INT32_MAX = 2147483647
+local INT32_MIN = -2147483648
+
+local function reconcile_wallet(target)
+    local actor = db and db.actor
+    if not actor then
+        pending_wallet_money = target
+        return false
+    end
+    local current = nil
+    pcall(function() current = actor:money() end)
+    if type(current) ~= "number" then
+        pending_wallet_money = target
+        return false
+    end
+
+    local delta = target - current
+    if delta == 0 then
+        wallet_money_last_seen = target
+        pending_wallet_money = nil
+        return true
+    end
+
+    local applied = delta
+    local clamped = false
+    if applied > INT32_MAX then
+        applied, clamped = INT32_MAX, true
+    elseif applied < INT32_MIN then
+        applied, clamped = INT32_MIN, true
+    end
+
+    local ok = pcall(function() actor:give_money(applied) end)
+    if not ok then
+        printf("Zone: wallet reconciliation failed (server %u, local %d)", target, current)
+        surface_message(tr("ui_zone_wallet_sync_failed",
+            "Could not synchronize the wallet with the server"))
+        return false
+    end
+    if clamped then
+        printf("Zone: wallet delta %d clamped to %d (server %u, local %d)",
+            delta, applied, target, current)
+    end
+
+    wallet_money_last_seen = target
+    pending_wallet_money = nil
+    -- A wallet apply is not a trade commit: keep the observer baseline in sync
+    -- so watch_trade_money cannot mistake it for a staged-items commit.
+    trade_last_money = target
+
+    if math.abs(delta) > WALLET_NOTICE_THRESHOLD then
+        local tmpl = tr("ui_zone_wallet_updated", "Wallet synchronized: %d -> %d")
+        local msg = string.format(tmpl, current, target)
+        surface_message(msg)
+        pcall(function()
+            if zone_hud and type(zone_hud.push_system_line) == "function" then
+                zone_hud.push_system_line(msg)
+            end
+        end)
+    end
+    printf("Zone: wallet reconciled %d -> %u", current, target)
+    return true
+end
+
+local function apply_pending_wallet()
+    if pending_wallet_money == nil then return end
+    reconcile_wallet(pending_wallet_money)
+end
+
+local function on_wallet_update(pkt, offset)
+    local len = string.len(pkt)
+    if len < offset + 4 - 1 then
+        log_dispatch_once("short_0085", "Zone: dropped short WALLET_UPDATE packet (%d bytes)", len)
+        return
+    end
+    local money = read_uint32_le(pkt, offset)
+    reconcile_wallet(tonumber(money) or 0)
 end
 
 -- External consumers (and the dispatch fallback) reach the ledger through
@@ -1150,6 +1944,32 @@ function dispatch_packet(pkt)
         log_dispatch_once("op_0080",
             "Zone: container update 0x0080 received but no container UI is implemented (%d payload bytes)",
             paylen)
+    elseif opcode == 0x0081 then
+        -- OpStashAction 0x0081 is client->server (protocol v6). A server copy
+        -- is unexpected; log once, never act on it.
+        log_dispatch_once("op_0081",
+            "Zone: ignored server-sent OpStashAction 0x0081 (client->server opcode)")
+    elseif opcode == 0x0083 then
+        -- OpTradeAction 0x0083 is client->server (protocol v6). A server copy
+        -- is unexpected; log once, never act on it.
+        log_dispatch_once("op_0083",
+            "Zone: ignored server-sent OpTradeAction 0x0083 (client->server opcode)")
+    elseif opcode == 0x0082 then
+        -- OpStashResult (S->C reliable): bounds-checked and pcall-isolated.
+        safe_call("stash_result", function()
+            if type(on_stash_result) == "function" then on_stash_result(pkt, offset) end
+        end)
+    elseif opcode == 0x0084 then
+        -- OpTradeResult (S->C reliable): bounds-checked and pcall-isolated.
+        safe_call("trade_result", function()
+            if type(on_trade_result) == "function" then on_trade_result(pkt, offset) end
+        end)
+    elseif opcode == 0x0085 then
+        -- OpWalletUpdate (S->C reliable, 4 B: Money u32): reconcile the local
+        -- wallet to the server-authoritative value.
+        safe_call("wallet_update", function()
+            if type(on_wallet_update) == "function" then on_wallet_update(pkt, offset) end
+        end)
     elseif opcode == 0x007E then
         -- OpItemUpdate (S->C reliable, 89 B). Prefer an external zone_item
         -- module when present; otherwise the ledger section in this file.
@@ -1242,6 +2062,9 @@ local MENU_PUMP_OPCODES = {
     [0x0073] = true,
     [0x0077] = true,
     [0x0020] = true,
+    -- Wallet update can arrive during the join (before the actor exists); the
+    -- handler queues the value and it is applied on first actor update.
+    [0x0085] = true,
 }
 local menu_pumping = false
 
@@ -1708,6 +2531,9 @@ local function on_actor_first_update()
     pcall(send_level_change, true)
     pcall(send_player_visual, true)
     pcall(apply_join_after_load)
+    -- Wallet value received during the menu join is applied once the actor and
+    -- its inventory owner exist.
+    pcall(apply_pending_wallet)
 end
 
 local function on_level_changing()
@@ -1720,6 +2546,23 @@ local function on_level_changing()
     -- Level change destroys every online world item; tracking becomes stale.
     pending_item_actions = {}
     spawned_world_items = {}
+    -- Stash/trade actions reference the old level's objects/positions; results
+    -- will never arrive after the level change, so drop them (the server
+    -- re-syncs inventory on the new level).
+    pending_stash_actions = {}
+    pending_trade_actions = {}
+    stash_dedupe = {}
+    stash_dedupe_ops = 0
+    trade_staged_sell = {}
+    trade_staged_buy = {}
+    trade_last_money = nil
+    trade_session_open = false
+    trade_engine_cb_seen = false
+    wallet_money_last_seen = nil
+    pending_wallet_money = nil
+    trade_commit_tg = 0
+    recently_moved_items = {}
+    recently_moved_ops = 0
 end
 
 local function on_actor_net_destroy()
@@ -1741,6 +2584,20 @@ function register_level_callbacks()
             RegisterScriptCallback("actor_on_item_take", on_actor_item_take)
             RegisterScriptCallback("actor_on_item_drop", on_actor_item_drop)
             RegisterScriptCallback("actor_on_item_use", on_actor_item_use)
+            -- Trader ledger: declared axr_main.script:76, dispatched by
+            -- bind_stalker_ext.script:185 from engine trade_sell_buy_item
+            -- (bind_stalker.script:160).
+            RegisterScriptCallback("actor_on_trade", on_actor_trade)
+            -- Trader ledger for the custom UIInventory: staging + commit
+            -- observation (declared axr_main.script:189-191, dispatched by
+            -- ui_inventory.script:1121 and actor_menu.script:69/77).
+            RegisterScriptCallback("ActorMenu_on_item_after_move", on_item_after_move)
+            RegisterScriptCallback("ActorMenu_on_trade_started", on_trade_started)
+            RegisterScriptCallback("ActorMenu_on_trade_closed", on_trade_closed)
+            -- Stash ledger: ui_inventory.script:2172/2180 and the engine binder
+            -- path bind_stalker_ext.script:148-150.
+            RegisterScriptCallback("actor_on_item_put_in_box", on_item_put_in_box)
+            RegisterScriptCallback("actor_on_item_take_from_box", on_item_take_from_box)
         end
     end)
     pcall(send_level_change, true)
@@ -1874,6 +2731,17 @@ function on_tick()
     -- session is live; after the final retry a timeout notice is surfaced and
     -- the next inventory sync reconciles.
     pcall(retransmit_pending_item_actions, tg)
+    -- Same cadence for unconfirmed stash/trade actions.
+    pcall(retransmit_pending_map, pending_stash_actions, 0x0081, STASH_ACTION_PAYLOAD_LEN,
+        "stash", "ui_zone_stash_action_timeout",
+        "Server did not confirm the stash action; inventory will be reconciled on the next sync")
+    pcall(retransmit_pending_map, pending_trade_actions, 0x0083, TRADE_ACTION_PAYLOAD_LEN,
+        "trade", "ui_zone_trade_action_timeout",
+        "Server did not confirm the trade; inventory will be reconciled on the next sync")
+
+    -- Custom trade UI commit detection (money mutation after staged items were
+    -- transferred by TMode_Sell/TMode_Buy).
+    pcall(watch_trade_money)
 
     if db.actor then
         pcall(function()

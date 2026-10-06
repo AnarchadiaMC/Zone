@@ -16,6 +16,16 @@ handshake and then exercise the full session lifecycle.
 - Malformed packet fuzz (300 random datagrams + one truncated transform)
 - Graceful disconnect and `ENTITY_LEAVE` propagation
 
+## AI combat note
+
+The simulated clients spawn near the Cordon, where the four seeded AI squads
+patrol. With `ai_combat_enabled: true` (the default) a hostile squad can acquire
+a test client, chase and melee it, producing `OpDamageNotify` relays and puppet
+aggro/chase state in the observed traffic. That is expected and does not change
+the pass criteria below; the harness tolerates damage packets. To keep a run
+strictly patrol-only, start the server with `ai_combat_enabled: false` in
+`zone_server.yaml`.
+
 ## Prerequisites
 
 - Python 3.10 or newer (standard library only; no third-party packages)

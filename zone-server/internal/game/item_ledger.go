@@ -43,6 +43,20 @@ type cachedContainerResult struct {
 	packet   protocol.ContainerUpdatePacket
 }
 
+// cachedStashResult is the OpStashResult twin of cachedItemResult. It shares
+// the same floor and rate window, so 0x0081 cannot replay a 0x007D/0x007F ID.
+type cachedStashResult struct {
+	actionID uint32
+	packet   protocol.StashResultPacket
+}
+
+// cachedTradeResult is the OpTradeResult twin of cachedItemResult. It shares
+// the same floor and rate window.
+type cachedTradeResult struct {
+	actionID uint32
+	packet   protocol.TradeResultPacket
+}
+
 // itemActionState is the per-session ledger bookkeeping: monotonic ActionID
 // floor, fixed-size LRUs of recent item and container results, and the
 // rate-limit window.
@@ -55,6 +69,12 @@ type itemActionState struct {
 	containerCache [itemActionCacheSize]cachedContainerResult
 	containerPos   int
 	containerLen   int
+	stashCache     [itemActionCacheSize]cachedStashResult
+	stashPos       int
+	stashLen       int
+	tradeCache     [itemActionCacheSize]cachedTradeResult
+	tradePos       int
+	tradeLen       int
 	rate           []time.Time
 }
 
@@ -186,6 +206,68 @@ func (l *ItemLedger) RecordContainer(sessionID, actionID uint32, result protocol
 	st.containerPos = (st.containerPos + 1) % itemActionCacheSize
 	if st.containerLen < itemActionCacheSize {
 		st.containerLen++
+	}
+}
+
+// LookupStash returns the cached OpStashResult for a replayed ActionID. The
+// cache shares the item ledger's monotonic floor.
+func (l *ItemLedger) LookupStash(sessionID, actionID uint32) (protocol.StashResultPacket, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.sessions[sessionID]
+	if st == nil {
+		return protocol.StashResultPacket{}, false
+	}
+	for i := 0; i < st.stashLen; i++ {
+		if st.stashCache[i].actionID == actionID {
+			return st.stashCache[i].packet, true
+		}
+	}
+	return protocol.StashResultPacket{}, false
+}
+
+// RecordStash advances the shared monotonic floor and caches an OpStashResult
+// for retransmit echo.
+func (l *ItemLedger) RecordStash(sessionID, actionID uint32, result protocol.StashResultPacket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.stateLocked(sessionID)
+	st.recordFloor(actionID)
+	st.stashCache[st.stashPos] = cachedStashResult{actionID: actionID, packet: result}
+	st.stashPos = (st.stashPos + 1) % itemActionCacheSize
+	if st.stashLen < itemActionCacheSize {
+		st.stashLen++
+	}
+}
+
+// LookupTrade returns the cached OpTradeResult for a replayed ActionID. The
+// cache shares the item ledger's monotonic floor.
+func (l *ItemLedger) LookupTrade(sessionID, actionID uint32) (protocol.TradeResultPacket, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.sessions[sessionID]
+	if st == nil {
+		return protocol.TradeResultPacket{}, false
+	}
+	for i := 0; i < st.tradeLen; i++ {
+		if st.tradeCache[i].actionID == actionID {
+			return st.tradeCache[i].packet, true
+		}
+	}
+	return protocol.TradeResultPacket{}, false
+}
+
+// RecordTrade advances the shared monotonic floor and caches an OpTradeResult
+// for retransmit echo.
+func (l *ItemLedger) RecordTrade(sessionID, actionID uint32, result protocol.TradeResultPacket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.stateLocked(sessionID)
+	st.recordFloor(actionID)
+	st.tradeCache[st.tradePos] = cachedTradeResult{actionID: actionID, packet: result}
+	st.tradePos = (st.tradePos + 1) % itemActionCacheSize
+	if st.tradeLen < itemActionCacheSize {
+		st.tradeLen++
 	}
 }
 

@@ -28,6 +28,25 @@ var (
 // between a player and a stash for any interaction.
 const MaxStashInteractDistance = 5.0
 
+// WorldStashGridM is the side of the square grid cell used to key the
+// position-addressed world stashes of OpStashAction. The Lua sender transmits
+// raw float coordinates; the server is the single authority that rounds them.
+// Rounding formula (mirror in Lua): grid = 0.5,
+//
+//	key = math.floor(v / 0.5 + 0.5) * 0.5
+//
+// i.e. round-half-toward-positive-infinity for every sign. NaN/Inf maps to 0.
+const WorldStashGridM = 0.5
+
+// roundWorldStashCoord rounds one coordinate onto the 0.5 m world-stash grid.
+func roundWorldStashCoord(v float32) float32 {
+	f := float64(v)
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0
+	}
+	return float32(math.Floor(f/WorldStashGridM+0.5) * WorldStashGridM)
+}
+
 type StashData struct {
 	StashID   uint32  `json:"stash_id"`
 	LevelName string  `json:"level_name"`
@@ -118,6 +137,37 @@ func (m *StashManager) SaveStash(stashID uint32, level string, x, y, z float32, 
 	}
 
 	return db.SaveStash(stashID, level, x, y, z, contentsJSON)
+}
+
+// FindWorldStash resolves the stash stored at the (already rounded) level +
+// position key of OpStashAction. A missing row maps onto ErrStashNotFound.
+func (m *StashManager) FindWorldStash(level string, x, y, z float32) (*database.StashRecord, error) {
+	db, err := m.getDB()
+	if err != nil {
+		return nil, err
+	}
+	rec, err := db.FindStashAt(level, x, y, z)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStashNotFound
+		}
+		return nil, err
+	}
+	return rec, nil
+}
+
+// FindOrCreateWorldStash resolves the stash at the (already rounded) key,
+// creating an ownerless world stash on the first store. The create is
+// serialized with the other stash APIs by rmwMu so two concurrent first
+// stores cannot materialise duplicate stashes for one key.
+func (m *StashManager) FindOrCreateWorldStash(level string, x, y, z float32) (*database.StashRecord, error) {
+	db, err := m.getDB()
+	if err != nil {
+		return nil, err
+	}
+	m.rmwMu.Lock()
+	defer m.rmwMu.Unlock()
+	return db.FindOrCreateStashAt(level, x, y, z)
 }
 
 // ValidateAccess enforces ownership, proximity, level, and passcode checks for

@@ -6,8 +6,8 @@ import (
 )
 
 // Animation wire values carried by OpAIState entries. They mirror the frozen
-// protocol (0=idle, 1=walk, 2=run, 3=attack, 4=death); attack and death are
-// defined for completeness but unused in the no-combat puppet wave.
+// protocol (0=idle, 1=walk, 2=run, 3=attack, 4=death). Attack is emitted by the
+// combat FSM while a puppet is in ATTACK; death while it is DEAD.
 const (
 	AnimIdle   uint8 = 0
 	AnimWalk   uint8 = 1
@@ -59,8 +59,26 @@ type PuppetState struct {
 	Position [3]float32
 	Yaw      float32
 	Anim     uint8
+	State    AIState
 	Online   bool
 	Health   float32
+}
+
+// puppetStateOf copies one squad into a value snapshot; caller holds sm.mu.
+func puppetStateOf(sq *Squad) PuppetState {
+	return PuppetState{
+		ID:       sq.ID,
+		Label:    sq.Label,
+		Section:  sq.Section,
+		Faction:  sq.Faction,
+		Level:    sq.Level,
+		Position: sq.Position,
+		Yaw:      sq.Yaw,
+		Anim:     sq.Anim,
+		State:    sq.State,
+		Online:   sq.Online,
+		Health:   sq.Health,
+	}
 }
 
 // RegisterPuppet creates a replicable puppet squad with a generated loop when
@@ -115,17 +133,33 @@ func (sm *SquadManager) RegisterPuppet(def PuppetDef) *Squad {
 	return sq
 }
 
-// TickPuppets advances every puppet squad one simulation step. Squads whose ID
-// is present in online step at the caller's tick rate with elapsed time (the
-// game tick); all other squads use a 1 Hz macro-step so off-screen patrols keep
-// moving cheaply. Dead squads are still processed: they broadcast AnimDeath and
-// are despawned (returned in the result) after puppetDespawnDelay, so the
-// caller can release their replication entity instead of leaking a corpse
-// forever. Must be called from the single game-loop goroutine.
+// TickPuppets advances every puppet squad one simulation step with the
+// patrol-only behaviour (no combat). See TickPuppetsWithCombat for the combat
+// FSM. Squads whose ID is present in online step at the caller's tick rate with
+// elapsed time (the game tick); all other squads use a 1 Hz macro-step so
+// off-screen patrols keep moving cheaply. Dead squads are still processed: they
+// broadcast AnimDeath and are despawned (returned in the result) after the
+// corpse delay, so the caller can release their replication entity instead of
+// leaking a corpse forever. Must be called from the single game-loop goroutine.
 func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uint32 {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	return sm.tickPuppetsLocked(now, online, CombatStep{}, nil)
+}
 
+// TickPuppetsWithCombat is TickPuppets plus the lightweight combat FSM. It
+// returns the despawned squad IDs and the melee attack events produced this
+// tick; the caller validates and applies each attack after the manager lock is
+// released. With step.Enabled false it is exactly TickPuppets.
+func (sm *SquadManager) TickPuppetsWithCombat(now time.Time, online map[uint32]bool, step CombatStep) (despawned []uint32, attacks []AIAttackEvent) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	despawned = sm.tickPuppetsLocked(now, online, step, &attacks)
+	return despawned, attacks
+}
+
+// tickPuppetsLocked is the shared simulation body. Caller holds sm.mu.
+func (sm *SquadManager) tickPuppetsLocked(now time.Time, online map[uint32]bool, step CombatStep, attacks *[]AIAttackEvent) []uint32 {
 	var despawned []uint32
 	for id, sq := range sm.squads {
 		if !sq.Puppet {
@@ -142,7 +176,7 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uin
 				sq.deadSince = now
 			}
 			applyPuppetStep(sq, now, 0)
-			if now.Sub(sq.deadSince) >= puppetDespawnDelay {
+			if now.Sub(sq.deadSince) >= sm.corpseDelayOrDefault() {
 				delete(sm.squads, id)
 				despawned = append(despawned, id)
 			}
@@ -162,6 +196,9 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uin
 				}
 			}
 			sq.lastStep = now
+			if step.Enabled && stepCombat(sq, now, step, dt, attacks) {
+				continue
+			}
 			applyPuppetStep(sq, now, dt)
 			continue
 		}
@@ -175,6 +212,11 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uin
 		}
 		elapsed := now.Sub(sq.lastStep).Seconds()
 		if elapsed < offlineStepInterval.Seconds() {
+			// Combat states are still advanced (a stale Chase target must cool
+			// down to Alert/Patrol) but with no displacement while offline.
+			if step.Enabled && stepCombat(sq, now, step, 0, attacks) {
+				continue
+			}
 			applyPuppetStep(sq, now, 0)
 			continue
 		}
@@ -183,9 +225,21 @@ func (sm *SquadManager) TickPuppets(now time.Time, online map[uint32]bool) []uin
 			elapsed = offlineStepClampSec
 		}
 		sq.lastStep = now
+		if step.Enabled && stepCombat(sq, now, step, elapsed, attacks) {
+			continue
+		}
 		applyPuppetStep(sq, now, elapsed)
 	}
 	return despawned
+}
+
+// corpseDelayOrDefault returns the configured corpse delay, or the wave-A
+// default when unset.
+func (sm *SquadManager) corpseDelayOrDefault() time.Duration {
+	if sm.corpseDelay > 0 {
+		return sm.corpseDelay
+	}
+	return puppetDespawnDelay
 }
 
 // applyPuppetStep moves sq along its patrol loop by speed*dt seconds and
@@ -266,18 +320,7 @@ func (sm *SquadManager) SnapshotPuppetsInto(buf []PuppetState) []PuppetState {
 		if !sq.Puppet {
 			continue
 		}
-		buf = append(buf, PuppetState{
-			ID:       sq.ID,
-			Label:    sq.Label,
-			Section:  sq.Section,
-			Faction:  sq.Faction,
-			Level:    sq.Level,
-			Position: sq.Position,
-			Yaw:      sq.Yaw,
-			Anim:     sq.Anim,
-			Online:   sq.Online,
-			Health:   sq.Health,
-		})
+		buf = append(buf, puppetStateOf(sq))
 	}
 	return buf
 }

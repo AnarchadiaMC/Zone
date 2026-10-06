@@ -57,10 +57,9 @@ func TestDamage_NormalSustainedDPSPasses(t *testing.T) {
 }
 
 func TestDamage_NoLOSGeometryDocumented(t *testing.T) {
-	// There is no world geometry server-side: a hit through a wall within range
-	// is accepted today. This test pins that known limitation so it is a
-	// deliberate choice, not an accident, until server-side level collision
-	// data exists.
+	// A bare DamageHandler has no occluder checker wired (the Server wires one
+	// from los_data_dir); without it a hit through a wall within range passes.
+	// This pins the fail-open default so it is deliberate, not accidental.
 	dh := NewDamageHandler()
 	attacker, target := createTestSessions()
 	attacker.Position = [3]float32{0, 0, 0}

@@ -41,6 +41,11 @@ const (
 	OpItemUpdate         = 0x007E
 	OpContainerAction    = 0x007F
 	OpContainerUpdate    = 0x0080
+	OpStashAction        = 0x0081
+	OpStashResult        = 0x0082
+	OpTradeAction        = 0x0083
+	OpTradeResult        = 0x0084
+	OpWalletUpdate       = 0x0085
 )
 
 type PacketHeader struct {

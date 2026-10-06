@@ -267,4 +267,28 @@
     <string id="ui_zone_item_action_timeout">
         <text>Сервер не подтвердил действие с предметом; инвентарь будет синхронизирован при следующей синхронизации.</text>
     </string>
+    <string id="ui_zone_stash_action_rejected">
+        <text>Сервер отклонил действие с тайником: %s</text>
+    </string>
+    <string id="ui_zone_stash_action_corrected">
+        <text>Сервер скорректировал действие с тайником: %s</text>
+    </string>
+    <string id="ui_zone_stash_action_timeout">
+        <text>Сервер не подтвердил действие с тайником; инвентарь будет синхронизирован при следующей синхронизации</text>
+    </string>
+    <string id="ui_zone_trade_action_rejected">
+        <text>Сервер отклонил сделку: %s</text>
+    </string>
+    <string id="ui_zone_trade_action_corrected">
+        <text>Сервер скорректировал сделку: %s</text>
+    </string>
+    <string id="ui_zone_trade_action_timeout">
+        <text>Сервер не подтвердил сделку; инвентарь будет синхронизирован при следующей синхронизации</text>
+    </string>
+    <string id="ui_zone_wallet_updated">
+        <text>Кошелёк синхронизирован: %d -> %d</text>
+    </string>
+    <string id="ui_zone_wallet_sync_failed">
+        <text>Не удалось синхронизировать кошелёк с сервером</text>
+    </string>
 </string_table>

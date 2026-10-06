@@ -184,6 +184,98 @@ func (e *EconomyManager) SellItem(uuid string, itemSection string, price int) (b
 	return true, nil
 }
 
+// SellItems removes count copies of section from the character inventory and
+// credits price rubles in ONE transaction (OpTradeAction action=sell). The
+// consumed stack's condition is derived from the inventory row actually
+// removed, never from the client. It returns the wire condition bucket of the
+// first consumed row and false (changing nothing) when the character does not
+// hold enough copies.
+func (e *EconomyManager) SellItems(uuid, section string, count, price int) (uint8, bool, error) {
+	if count <= 0 || price <= 0 {
+		return 0, false, nil
+	}
+
+	db, err := e.getDB()
+	if err != nil {
+		return 0, false, err
+	}
+
+	tx, err := db.RawDB().Begin()
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+
+	_, removedCondition, err := database.RemoveInventoryItemsLocked(tx, uuid, section, count, -1)
+	if err != nil {
+		if errors.Is(err, database.ErrInsufficientItems) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+
+	res, err := tx.Exec("UPDATE characters SET rubles = rubles + ?, updated_at = ? WHERE client_uuid = ?", price, time.Now().Unix(), uuid)
+	if err != nil {
+		return 0, false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	if rows == 0 {
+		return 0, false, ErrCharacterNotFound
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return conditionToWire(removedCondition), true, nil
+}
+
+// BuyItems debits price rubles and credits count copies of section with the
+// given 0-100 condition bucket in ONE transaction (OpTradeAction action=buy).
+// The credit follows CreditInventoryLocked stack/condition rules. It returns
+// false (changing nothing) when the character cannot afford price.
+func (e *EconomyManager) BuyItems(uuid, section string, count int, conditionBucket uint8, price int) (bool, error) {
+	if count <= 0 || price <= 0 {
+		return false, nil
+	}
+
+	db, err := e.getDB()
+	if err != nil {
+		return false, err
+	}
+
+	tx, err := db.RawDB().Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var rubles int
+	if err := tx.QueryRow("SELECT rubles FROM characters WHERE client_uuid = ?", uuid).Scan(&rubles); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrCharacterNotFound
+		}
+		return false, err
+	}
+	if rubles < price {
+		return false, nil
+	}
+
+	if _, err := tx.Exec("UPDATE characters SET rubles = ?, updated_at = ? WHERE client_uuid = ?", rubles-price, time.Now().Unix(), uuid); err != nil {
+		return false, err
+	}
+	if err := database.CreditInventoryLocked(tx, uuid, section, count, conditionBucket); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // GetTier returns economy_tier for character.
 func (e *EconomyManager) GetTier(uuid string) (int, error) {
 	db, err := e.getDB()

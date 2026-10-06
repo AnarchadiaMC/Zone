@@ -371,7 +371,10 @@ func TestJoinFlow_LevelChangeRejectedDuringPendingCreate(t *testing.T) {
 	}
 }
 
-func TestJoinFlow_UnknownLevelIgnored(t *testing.T) {
+// Unknown but printable level names are accepted: travel is client-trusted
+// between all installed levels, and unknown names only lose the wire-id /
+// safe-zone mapping (generic level switching still applies).
+func TestJoinFlow_UnknownPrintableLevelAccepted(t *testing.T) {
 	s, sink, db := setupTestServerWithDB(t)
 	if err := db.AutoProvision("uuid-join-unknownlv", "hwid", "Wanderer"); err != nil {
 		t.Fatalf("AutoProvision: %v", err)
@@ -398,11 +401,16 @@ func TestJoinFlow_UnknownLevelIgnored(t *testing.T) {
 	sess.Lock()
 	level := sess.CurrentLevel
 	sess.Unlock()
-	if level != "l01_escape" {
-		t.Errorf("unknown level must be ignored, current level %q", level)
+	if level != "not_a_real_level" {
+		t.Errorf("printable unknown level must be accepted, current level %q", level)
 	}
-	if got := len(packetsByOpcode(sink, protocol.OpInventorySync)); got != 1 {
-		t.Errorf("expected no resync for unknown level, got %d deliveries", got)
+	// A genuinely different level resyncs the kit, unknown or not.
+	if got := len(packetsByOpcode(sink, protocol.OpInventorySync)); got != 2 {
+		t.Errorf("expected inventory resync for unknown level, got %d deliveries", got)
+	}
+	// The wire id falls back to 0 for unmapped names.
+	if id := levelIDForName("not_a_real_level"); id != 0 {
+		t.Errorf("levelIDForName(unknown) = %d, want 0", id)
 	}
 }
 

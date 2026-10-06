@@ -79,6 +79,8 @@ type Server struct {
 	aoi      *AoIManager
 	squads   *ai.SquadManager
 	aiRepl   *aiReplication
+	aiCombat aiCombatConfig
+	losMgr   *losManager
 	logger   *zap.Logger
 	seq      atomic.Uint32
 	// sessionIDSeq allocates session IDs independently of the packet sequence
@@ -162,6 +164,13 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	s.groups = NewGroupManager(groupMax, inviteTTL)
 	s.damageHandler.SetGroupManager(s.groups)
 
+	// Wave B combat FSM + server-side line-of-sight gating. Both default to
+	// enabled; missing/corrupt occluder files fail open per level.
+	s.aiCombat = resolveAICombat(cfg)
+	s.losMgr = newLOSManager(cfg.LosEnabledOrDefault(), cfg.LOSDataDirOrDefault(), logger)
+	s.damageHandler.SetLOSChecker(s.losMgr.damageAllowed)
+	s.squads.SetCorpseDelay(resolveAICorpseSeconds(cfg))
+
 	// Hit-registration wiring: the rolling damage budget is the only
 	// combat-rate limiter. Movement is client-authoritative.
 	if cfg != nil && cfg.DamageBudgetPerS > 0 {
@@ -176,9 +185,10 @@ func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue 
 	// AI replication wiring: puppet squads are loaded from ai_squads (seeding
 	// the default l01_escape set when the table is empty) only while
 	// ai_enabled is true. Disabled means no AI entities, no counters, no
-	// packets. Wave A replication is patrol-only; combat/damage are roadmap.
-	// Enter/leave radii implement AoI hysteresis; ai_max_entities caps the
-	// replicated set.
+	// packets. The combat FSM is layered on top and gated by
+	// ai_combat_enabled; corpse release and patrol-resume timings come from
+	// config. Enter/leave radii implement AoI hysteresis; ai_max_entities caps
+	// the replicated set.
 	aiEnter, aiLeave := resolveAIRadii(cfg)
 	s.aiRepl = newAIReplication(aiEnter, aiLeave, resolveAIMaxEntities(cfg), s.logger)
 	if db != nil && cfg.AIEnabledOrDefault() {
@@ -600,6 +610,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 				s.sendLoadLevel(sess)
 				s.syncInventoryForLevel(sess)
 				s.sendWorldItemsInAoI(sess)
+				s.sendWalletUpdate(sess)
 			}
 			// Spawn flow is on the wire first; enforcement + AOI follow it.
 			s.sendSafezoneState(sess)
@@ -834,6 +845,13 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		}
 		attackerID := attackerSess.SessionID
 
+		// AI puppet targets use their own registry and the shared validation
+		// pipeline; they are never PlayerSessions, so route them first.
+		if dmg.TargetID >= AIEntityIDBase {
+			s.handlePuppetDamage(attackerSess, attackerID, &dmg)
+			return
+		}
+
 		// Check if target is a sleeper proxy (Issue 16). Sleeper damage is
 		// routed through the same ValidateAndApplyDamage path as live targets
 		// so safe-zone immunity, range and sanity checks cannot be bypassed.
@@ -978,6 +996,7 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.sendLoadLevel(sess)
 		s.syncInventoryForLevel(sess)
 		s.sendWorldItemsInAoI(sess)
+		s.sendWalletUpdate(sess)
 		res := protocol.HandshakeRes{Status: 0, SpawnX: -211.3, SpawnY: -20.2, SpawnZ: -145.8, WorldTime: uint64(time.Now().Unix()), EcoTier: 1, HasCharacter: 1}
 		copyNulTerm(res.Faction[:], faction)
 		binary.LittleEndian.PutUint32(res.SessionID[:], sessID)
@@ -1004,6 +1023,12 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			return
 		}
 		levelName := nullTermString(lvl.Level[:])
+		// Any printable, bounded level name is accepted: travel between all
+		// installed levels is client-trusted (consistent with the movement
+		// policy) and needs no level transition token. Unknown names still get
+		// generic level switching, safe-zone state and entity exchange; only
+		// the wire u8 id mapping (levelIDForName) is best-effort. See
+		// docs/LEVEL_TRAVEL.md.
 		if levelName == "" || len(levelName) > 31 || !isPrintableLevelName(levelName) {
 			s.logger.Warn("Rejected invalid level change",
 				zap.String("addr", addr.String()),
@@ -1011,36 +1036,32 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			)
 			return
 		}
-		if _, ok := supportedLevels[levelName]; !ok {
-			s.logger.Warn("Ignored unsupported level change",
-				zap.String("addr", addr.String()),
-				zap.String("level", levelName),
-			)
-			return
-		}
-		// Level change is a hard position reset: the client is being loaded at
-		// the level's server-known spawn, so position and safe-zone state
-		// restart from that spawn.
-		spawn := levelSpawnFor(levelName)
+		// Movement is client-authoritative: the client's last reported position
+		// is kept (the new level's first transform refines it). Per-level
+		// caches are reset so grid/AoI/entity state restart on the new level.
 		sess.Lock()
 		oldLevel := sess.CurrentLevel
 		sess.CurrentLevel = levelName
-		sess.Position = spawn
-		sess.Rotation = [2]float32{}
+		pos := sess.Position
 		sess.Velocity = [3]float32{}
 		sess.InSafeZone = false
 		sess.SafeZoneID = ""
 		sessID := sess.SessionID
 		sess.Unlock()
-		s.grid.Update(sessID, spawn[0], spawn[2])
-
-		s.aoi.RemoveSession(sess.SessionID)
+		s.grid.Update(sessID, pos[0], pos[2])
+		s.aoi.RemoveSession(sessID)
+		if s.aiRepl != nil {
+			s.aiRepl.forgetSession(sessID)
+		}
 		if oldLevel != levelName {
-			s.broadcastEntityLeaveToPeers(sess.SessionID, oldLevel)
+			s.broadcastEntityLeaveToPeers(sessID, oldLevel)
 			sess.Lock()
 			sess.Gvid = 0
 			sess.EnterBroadcastLevel = ""
 			sess.Unlock()
+			// (a) the mover receives ENTITY_ENTER for every same-level peer
+			// with a gvid and a known visual; (b) the mover's own ENTITY_ENTER
+			// is broadcast by the next transform/visual once gvid is set again.
 			s.sendExistingPeersToNewcomer(sess)
 			s.sendWorldItemsInAoI(sess)
 		}
@@ -1075,6 +1096,10 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 		s.handleItemAction(addr, buf)
 	case protocol.OpContainerAction:
 		s.handleContainerAction(addr, buf)
+	case protocol.OpStashAction:
+		s.handleStashAction(addr, buf)
+	case protocol.OpTradeAction:
+		s.handleTradeAction(addr, buf)
 	case protocol.OpAck:
 		// Any inbound traffic from a live session refreshes LastSeen.
 		if sess := s.sessions.GetByAddr(addr.String()); sess != nil {
@@ -1190,11 +1215,13 @@ func (s *Server) sendSafezoneState(sess *network.PlayerSession) {
 	s.SendToSession(sess, protocol.OpSafezoneState, protocol.FlagReliable, payload)
 }
 
-// supportedLevels maps every level name the server recognises onto the wire
-// u8 level id used by OpLoadLevel. Only l01_escape is hosted today, so every
-// entry currently resolves to id 0; the remaining names come from the
-// safe-zone table and exist so a client level report is validated instead of
-// desyncing server-side AOI/chat filtering.
+// supportedLevels maps known level names onto the wire u8 level id used by
+// OpLoadLevel. It is deliberately best-effort: OpLevelChange accepts ANY
+// printable level name so in-game travel works between every installed level
+// and mod levels (movement and level reports are client-authoritative), and
+// unknown names simply map to id 0. Keep this map in sync with the level list
+// when a deployment wants distinct wire ids. The level list in
+// safeZoneTable/defaultSafeZones covers the canonical Anomaly maps.
 var supportedLevels = map[string]uint8{
 	"l01_escape":     0,
 	"l02_garbage":    0,
@@ -1806,7 +1833,8 @@ func (s *Server) Tick(now time.Time) {
 		s.ackQueue.Tick(now)
 	}
 
-	// Wave A AI replication: puppet patrolsim + AoI enter/leave + OpAIState.
+	// AI replication: puppet simulation (patrol + optional combat FSM), AoI
+	// enter/leave and OpAIState streaming.
 	s.tickAIReplication(now)
 
 	// Periodic safe-zone state: every connected client receives a fresh
@@ -1821,15 +1849,10 @@ func (s *Server) Tick(now time.Time) {
 }
 
 // defaultLevelSpawn is the server-known spawn used when a session enters a
-// level: the Cordon rookie village centre for l01_escape. Every hosted level
-// currently shares it until per-level spawn tables exist; what matters is that
-// the server, not the client, owns the post-level-change position.
+// level with no client-reportable position yet: the Cordon rookie village
+// centre for l01_escape. Level travel itself keeps the client-authoritative
+// position (see docs/LEVEL_TRAVEL.md).
 var defaultLevelSpawn = [3]float32{-211.3, -20.2, -145.8}
-
-// levelSpawnFor returns the server-known spawn for a supported level name.
-func levelSpawnFor(name string) [3]float32 {
-	return defaultLevelSpawn
-}
 
 const (
 	// worldItemSweepInterval throttles the world_items TTL sweep so the table is

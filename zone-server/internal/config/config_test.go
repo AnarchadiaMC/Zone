@@ -305,3 +305,137 @@ func TestConfigWorldItemDefaultsAndKeys(t *testing.T) {
 		t.Errorf("explicit WorldItemMaxPerLevel = %d, want 12", tuned.WorldItemMaxPerLevel)
 	}
 }
+
+// AI combat and LOS keys default to enabled with the documented numeric
+// defaults when omitted.
+func TestConfigAICombatAndLOSDefaults(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !cfg.AICombatEnabledOrDefault() {
+		t.Error("AICombatEnabledOrDefault = false, want true when omitted")
+	}
+	if cfg.AIAggroRadiusM != DefaultAIAggroRadiusM {
+		t.Errorf("AIAggroRadiusM = %v, want %v", cfg.AIAggroRadiusM, DefaultAIAggroRadiusM)
+	}
+	if cfg.AIAttackRangeM != DefaultAIAttackRangeM {
+		t.Errorf("AIAttackRangeM = %v, want %v", cfg.AIAttackRangeM, DefaultAIAttackRangeM)
+	}
+	if cfg.AIAttackCooldownMS != DefaultAIAttackCooldownMS {
+		t.Errorf("AIAttackCooldownMS = %d, want %d", cfg.AIAttackCooldownMS, DefaultAIAttackCooldownMS)
+	}
+	if cfg.AIMeleeDamage != DefaultAIMeleeDamage {
+		t.Errorf("AIMeleeDamage = %v, want %v", cfg.AIMeleeDamage, DefaultAIMeleeDamage)
+	}
+	if cfg.AICorpseSeconds != DefaultAICorpseSeconds {
+		t.Errorf("AICorpseSeconds = %d, want %d", cfg.AICorpseSeconds, DefaultAICorpseSeconds)
+	}
+	if cfg.AIPatrolResumeS != DefaultAIPatrolResumeS {
+		t.Errorf("AIPatrolResumeS = %d, want %d", cfg.AIPatrolResumeS, DefaultAIPatrolResumeS)
+	}
+	if !cfg.LosEnabledOrDefault() {
+		t.Error("LosEnabledOrDefault = false, want true when omitted")
+	}
+	if cfg.LosDataDir != DefaultLOSDataDir {
+		t.Errorf("LosDataDir = %q, want %q", cfg.LosDataDir, DefaultLOSDataDir)
+	}
+}
+
+// Explicit AI combat and LOS keys override defaults in both directions.
+func TestConfigAICombatAndLOSKeysLoaded(t *testing.T) {
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+ai_combat_enabled: false
+ai_aggro_radius_m: 25.5
+ai_attack_range_m: 1.5
+ai_attack_cooldown_ms: 900
+ai_melee_damage: 7.5
+ai_corpse_seconds: 3
+ai_patrol_resume_s: 4
+los_enabled: false
+los_data_dir: "custom_los"
+`
+	tmpfile, err := os.CreateTemp("", "config_combat_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.AICombatEnabledOrDefault() {
+		t.Error("AICombatEnabledOrDefault = true, want false from explicit key")
+	}
+	if cfg.AIAggroRadiusM != 25.5 || cfg.AIAttackRangeM != 1.5 {
+		t.Errorf("combat radii = %v/%v, want 25.5/1.5", cfg.AIAggroRadiusM, cfg.AIAttackRangeM)
+	}
+	if cfg.AIAttackCooldownMS != 900 || cfg.AIMeleeDamage != 7.5 {
+		t.Errorf("cooldown/damage = %d/%v, want 900/7.5", cfg.AIAttackCooldownMS, cfg.AIMeleeDamage)
+	}
+	if cfg.AICorpseSeconds != 3 || cfg.AIPatrolResumeS != 4 {
+		t.Errorf("corpse/resume = %d/%d, want 3/4", cfg.AICorpseSeconds, cfg.AIPatrolResumeS)
+	}
+	if cfg.LosEnabledOrDefault() {
+		t.Error("LosEnabledOrDefault = true, want false from explicit key")
+	}
+	if cfg.LOSDataDirOrDefault() != "custom_los" {
+		t.Errorf("LOSDataDirOrDefault = %q, want custom_los", cfg.LOSDataDirOrDefault())
+	}
+}
+
+// trade_max_money_delta defaults to 200000 and clamps non-positive values;
+// explicit YAML values override it.
+func TestConfigTradeMaxMoneyDelta(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.TradeMaxMoneyDelta != DefaultTradeMaxMoneyDelta {
+		t.Errorf("TradeMaxMoneyDelta default = %d, want %d", cfg.TradeMaxMoneyDelta, DefaultTradeMaxMoneyDelta)
+	}
+	if got := cfg.TradeMaxMoneyDeltaOrDefault(); got != 200000 {
+		t.Errorf("TradeMaxMoneyDeltaOrDefault = %d, want 200000", got)
+	}
+
+	zero := &Config{}
+	if got := zero.TradeMaxMoneyDeltaOrDefault(); got != DefaultTradeMaxMoneyDelta {
+		t.Errorf("nil-key TradeMaxMoneyDeltaOrDefault = %d, want %d", got, DefaultTradeMaxMoneyDelta)
+	}
+	zero.SetDefaults()
+	if zero.TradeMaxMoneyDelta != DefaultTradeMaxMoneyDelta {
+		t.Errorf("TradeMaxMoneyDelta after SetDefaults = %d, want %d", zero.TradeMaxMoneyDelta, DefaultTradeMaxMoneyDelta)
+	}
+
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+trade_max_money_delta: 5000
+`
+	tmpfile, err := os.CreateTemp("", "config_trade_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	loaded, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.TradeMaxMoneyDelta != 5000 {
+		t.Errorf("trade_max_money_delta = %d, want 5000", loaded.TradeMaxMoneyDelta)
+	}
+}

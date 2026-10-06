@@ -267,4 +267,28 @@
     <string id="ui_zone_item_action_timeout">
         <text>Server did not confirm an item action; inventory will be reconciled on the next sync</text>
     </string>
+    <string id="ui_zone_stash_action_rejected">
+        <text>Server rejected stash action: %s</text>
+    </string>
+    <string id="ui_zone_stash_action_corrected">
+        <text>Server corrected the stash action: %s</text>
+    </string>
+    <string id="ui_zone_stash_action_timeout">
+        <text>Server did not confirm the stash action; inventory will be reconciled on the next sync</text>
+    </string>
+    <string id="ui_zone_trade_action_rejected">
+        <text>Server rejected the trade: %s</text>
+    </string>
+    <string id="ui_zone_trade_action_corrected">
+        <text>Server corrected the trade: %s</text>
+    </string>
+    <string id="ui_zone_trade_action_timeout">
+        <text>Server did not confirm the trade; inventory will be reconciled on the next sync</text>
+    </string>
+    <string id="ui_zone_wallet_updated">
+        <text>Wallet synchronized: %d -> %d</text>
+    </string>
+    <string id="ui_zone_wallet_sync_failed">
+        <text>Could not synchronize the wallet with the server</text>
+    </string>
 </string_table>

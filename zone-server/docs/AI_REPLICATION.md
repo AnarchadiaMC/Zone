@@ -1,14 +1,14 @@
-# AI Squad Replication (Wave A)
+# AI Squad Replication (Wave A + combat)
 
 Server-side AI puppet replication for protocol v5. The client receives the same
 packets as any other actor (`ENTITY_ENTER_AOI`, `ENTITY_LEAVE_AOI`,
-`OpAIState`) and needs no C++ changes.
+`OpAIState`, `OpDamageNotify`) and needs no C++ changes.
 
 ## Scope
 
-- Patrol-only puppets. **No combat, no damage, no AI-vs-player logic runs in
-  this wave.** `State` stays `AIStatePatrol`; the `anim` attack/death values
-  exist on the wire but are never produced for puppets.
+- Patrol replication plus a lightweight server-side combat FSM
+  (IDLE/PATROL, ALERT, CHASE, ATTACK, DEAD). The FSM is not an X-Ray port: it
+  uses the existing puppet simulation and the shared player-damage validation.
 - One replicated entity per squad (the leader puppet). The seeded squads are
   conceptually three-member patrols; member-level puppets are roadmap.
 - Puppets are *not* inserted into the player `SpatialGrid`. Visibility is
@@ -70,9 +70,9 @@ registration time. The `is_online` column is not written in wave A.
 - **OFFLINE**: macro-stepped at 1 Hz with `dt = elapsed` clamped to 2 s.
 
 Steering is speed-based along the generated loop: walk speed 1.5 m/s default,
-run 3.0 m/s available via `SquadManager.SetPuppetRun` (optional transition, not
-scheduled by default). Yaw faces the movement direction; anim is idle when
-stationary, walk/run by speed.
+run 3.0 m/s used while chasing or via `SquadManager.SetPuppetRun`. Yaw faces the
+movement direction; anim is idle when stationary, walk/run by speed, attack in
+the ATTACK state and death in the DEAD state.
 
 ## Replication flow (per tick)
 
@@ -87,14 +87,64 @@ stationary, walk/run by speed.
 `ai_enabled: false` performs no seeding, registers no entities, and sends no AI
 packets. `ai_online_radius_m` defaults to 220.
 
+## Combat FSM (Wave B)
+
+| key | default | meaning |
+|---|---|---|
+| `ai_combat_enabled` | `true` | master switch; `false` = patrol only |
+| `ai_aggro_radius_m` | `40` | 3D acquire radius for a hostile player |
+| `ai_attack_range_m` | `2.0` | melee reach (distance at which ATTACK starts) |
+| `ai_attack_cooldown_ms` | `1500` | time between melee swings |
+| `ai_melee_damage` | `10` | damage per swing |
+| `ai_corpse_seconds` | `5` | dead puppet despawn/ENTITY_LEAVE delay |
+| `ai_patrol_resume_s` | `10` | ALERT cool-down before PATROL resumes |
+
+States:
+
+- **IDLE/PATROL** — generated loop patrol. A hostile player inside
+  `ai_aggro_radius_m` is acquired. Hostility comes from the persisted faction
+  relation table (`< 0` = enemy); same faction never engages. Squads with an
+  empty or `monster` faction are mutants/neutral and hostile to everyone.
+- **CHASE** — steers toward the player at run speed (3.0 m/s default, clamped
+  to the 250 ms online step), `anim=2`.
+- **ATTACK** — inside `ai_attack_range_m`, faces the player, `anim=3`, and
+  swings every `ai_attack_cooldown_ms`.
+- **ALERT** — target died/left/disconnected/safe-zoned or the squad entered a
+  safe zone. After `ai_patrol_resume_s`, returns to PATROL.
+- **DEAD** — player damage reduced the puppet to 0 HP. `anim=4` streams for
+  `ai_corpse_seconds`, then the entity is released with `ENTITY_LEAVE_AOI`.
+
+Damage paths:
+
+- AI -> player: the FSM emits an attack event; the game validates it through
+  the **same** `DamageHandler.ValidateAndApplyDamage` as player damage (level,
+  safe zone, group/faction, range, line of sight when the level has an occluder,
+  sanity, budget) using a proxy session with
+  `SessionID = AI entity id`, then relays `OpDamageNotify` (0x0050) to the
+  victim with `AttackerID = AI entity id`.
+- Player -> AI: `OpDamageNotify` with `TargetID >= 1_000_000` is routed to
+  `handlePuppetDamage`. Attacker session, range <= 300 m to the puppet's
+  current position, line of sight when an occluder exists, damage
+  sanity/clamp and the shared rolling budget are
+  validated; the amount is applied to the puppet HP and an updated
+  `ENTITY_ENTER_AOI` is pushed to sessions already tracking it (the
+  `OpAIState` wire entry has no health field). A lethal hit sets DEAD.
+- Targets are filtered to alive, same-level players outside server safe zones;
+  the attacking squad must also be outside a safe zone.
+- **No loot yet** (roadmap): corpses release without dropping items.
+
 ## Tests
 
 - `TestAI_AoIBoundariesExactlyOnce`, `TestAI_StateChunkedOnlyOnline`,
   `TestAI_OfflineMacroStepAt1Hz`, `TestAI_SeedSquadsWhenTableEmpty`,
   `TestAI_DisabledNoEntities` (game), plus protocol layout/round-trip tests and
   the existing 48-session regressions.
+- Combat: `TestCombat_*` (ai package FSM) and `TestAICombat_*` (game
+  integration: hostility gating, safe zones, cooldown, relay, player kills,
+  corpse lifecycle, config flag, validation).
 
 ## Roadmap
 
-Combat, damage, loot, faction hostility, per-member puppets, server-side
-pathfinding against level geometry, and persistence of puppet health/state.
+Loot drops, server-side pathfinding against level geometry during chase,
+per-member puppets, faction-aware AI-vs-AI combat, and persistence of puppet
+health/state.
