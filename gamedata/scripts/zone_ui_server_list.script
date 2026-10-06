@@ -502,7 +502,11 @@ local function xml_init(xml, method, path, parent)
 end
 
 function UIZoneServerList:InitControls()
-    self:SetAutoDelete(true)
+    -- The dialog instance is cached and reused for the whole session. Auto-delete
+    -- would destroy it on HideDialog (engine takes ownership when the dialog is
+    -- hidden), leaving the cache dangling and crashing the next frame that touches
+    -- it. Keep ownership in Lua and only hide/show.
+    self:SetAutoDelete(false)
 
     pcall(function()
         if getFS then
@@ -2169,6 +2173,8 @@ function UIZoneServerList:PollConnect()
 end
 
 function UIZoneServerList:Update()
+    if self.closed then return end
+    pcall(function() self:ProcessTabChange() end)
     pcall(function() CUIScriptWnd.Update(self) end)
     pcall(function()
         if self.async_ok then
@@ -2214,14 +2220,22 @@ function UIZoneServerList:OnListSelect()
     self:UpdateDetails()
 end
 
+-- Engine TAB_CHANGED callback: capture the selection only. Rebuilding the list
+-- and starting scans from inside the engine's tab-control callback can crash
+-- (re-entrancy), so the heavy work is deferred to the next Update tick.
 function UIZoneServerList:OnTabChanged()
-    self:AbortScan()
     self.tab_id = self:GetActiveTabId()
+    self.tab_dirty = true
+end
+
+function UIZoneServerList:ProcessTabChange()
+    if not self.tab_dirty then return end
+    self.tab_dirty = false
+    self:AbortScan()
     self.broadcast_hit = nil
     self:UpdateDirectVisibility()
     self:RefreshList()
     if self.tab_id == TAB_DIRECT then
-        self:AbortScan()
         if self.state ~= STATE_CONNECTING and self.state ~= STATE_CONNECTED and self.state ~= STATE_FAILED then
             self:SetState(STATE_IDLE)
         end
@@ -2438,6 +2452,8 @@ function UIZoneServerList:OnRemove()
 end
 
 function UIZoneServerList:OnShow()
+    self.closed = false
+    self.tab_dirty = false
     self.tab_id = self:GetActiveTabId()
     self:UpdateLabels()
     self:UpdateDirectVisibility()
@@ -2470,11 +2486,14 @@ end
 -- drops the edit-box keyboard capture and hides the dialog, so focus can never
 -- persist after the window is gone.
 function UIZoneServerList:Close()
+    if self.closed then return end
+    self.closed = true
     self:AbortScan()
     self:ReleaseEditFocus()
     self.filter_editing = false
-    self:HideDialog()
-    CUIScriptWnd.Show(self, false)
+    -- Last engine call: after HideDialog nothing may touch this window until a
+    -- future open resets self.closed and re-shows it.
+    pcall(function() self:HideDialog() end)
 end
 
 function UIZoneServerList:OnBack()
