@@ -427,6 +427,11 @@ local function notify_hud(locked)
 end
 
 local function apply_enter()
+    -- Enforcement is an in-game concept: the server can send safezone state
+    -- to a client that is still on the main menu, where no actor and no
+    -- CLevel exist. level.release_action dereferences Level() with no null
+    -- check (level_script.cpp:1201-1207), which faults at the menu.
+    if not (db and db.actor) then return end
     pcall(install_fire_hook)
     pcall(function() set_weapon_locked(true) end)
     -- Release a possibly-held fire key so the engine does not keep firing
@@ -437,7 +442,8 @@ local function apply_enter()
     pcall(function()
         if level and level.release_action and bind_to_dik and key_bindings then
             local dik = bind_to_dik(key_bindings.kWPN_FIRE)
-            if dik ~= nil and dik ~= 0 then
+            if dik ~= nil and dik ~= 0
+                and (not level.present or level.present()) then
                 level.release_action(dik)
             end
         end
@@ -451,6 +457,12 @@ local function apply_exit()
 end
 
 local function refresh_enforcement()
+    -- No live actor (main menu, level change, disconnect): never enforce,
+    -- never call engine input methods - Level() is NULL outside the game.
+    if not (db and db.actor) then
+        enforced = false
+        return
+    end
     -- Co-op live: never enter enforcement, whatever the (stale) packet/atomic
     -- state says; the next active tick resets the remaining flags.
     local locked = (packet_locked or auth_locked) and not xrr_is_active()
