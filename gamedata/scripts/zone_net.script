@@ -2142,9 +2142,9 @@ local function console_exec(cmd)
 end
 
 -- A new game can only be created from the main menu: the engine's KERNEL:start
--- handler asserts no level is loaded. Console "start" runs Anomaly's own
--- new-game flow from all.spawn; the spawn registry picks the start level
--- (l01_escape), so this is the stock path with no xrRazom dependency.
+-- handler asserts no level is loaded. Console "start" boots the engine's
+-- placeholder map (fake_start); the hosted level is then loaded by
+-- change_level_to() from on_actor_first_update.
 local function start_singleplayer_game()
     return console_exec("start server(all/single/alife/new) client(localhost)")
 end
@@ -2154,6 +2154,44 @@ local function level_name_from_id(level_id)
     if tonumber(level_id) == 0 then return "l01_escape" end
     return "l01_escape"
 end
+
+-- Maps a hosted level to its default entry point in the stock start-location
+-- table (configs\plugins\new_game_start_locations.ltx, read through the game
+-- file system). The graph ids are required by the engine's ChangeLevel.
+local function level_start_section(level_name)
+    if level_name == "l01_escape" then return "rookie_village" end
+    return nil
+end
+
+-- Load the hosted level properly. The console "start" path boots a placeholder
+-- map (fake_start), so the actor must be moved with ChangeLevel + real graph
+-- ids; without this the world is empty (sky only).
+local function change_level_to(level_name)
+    local section = level_start_section(level_name)
+    if not section then return false end
+
+    local ok = false
+    pcall(function()
+        local ini_map = ini_file("plugins\\new_game_start_locations.ltx")
+        if not ini_map then return end
+        local lvid = ini_map:r_float_ex(section, "lvid")
+        local gvid = ini_map:r_float_ex(section, "gvid")
+        local x = ini_map:r_float_ex(section, "x")
+        local y = ini_map:r_float_ex(section, "y")
+        local z = ini_map:r_float_ex(section, "z")
+        if type(lvid) == "number" and type(gvid) == "number"
+            and type(x) == "number" and type(y) == "number" and type(z) == "number"
+            and ChangeLevel then
+            printf("Zone: loading level %s at %s (lvid %d gvid %d)",
+                tostring(level_name), section, math.floor(lvid), math.floor(gvid))
+            ChangeLevel(vector():set(x, y, z), math.floor(lvid), math.floor(gvid), VEC_ZERO)
+            ok = true
+        end
+    end)
+    return ok
+end
+
+
 
 -- Pending-join marker: survives the Lua VM restart caused by a level load.
 local function join_marker_path()
@@ -2217,6 +2255,18 @@ local function load_pending_join()
     return sp
 end
 
+local function actor_section_count(section)
+    local n = 0
+    local actor = db and db.actor
+    if not actor or type(section) ~= "string" then return 0 end
+    pcall(function()
+        actor:iterate_inventory(function(_, obj)
+            if obj and obj:section() == section then n = n + 1 end
+        end, nil)
+    end)
+    return n
+end
+
 local function create_inventory_entry(entry)
     local actor = db and db.actor
     if not actor then return false end
@@ -2230,6 +2280,14 @@ local function create_inventory_entry(entry)
     local copies = math.floor(tonumber(entry.count) or 1)
     if copies < 1 then copies = 1 end
     if copies > 100 then copies = 100 end
+
+    -- The sync states the desired total the actor must own. Only create the
+    -- shortfall: reconnects, VM restarts and level resyncs must never stack
+    -- another copy of items the actor already has (observed x6 duplication).
+    copies = copies - actor_section_count(section)
+    if copies <= 0 then
+        return true
+    end
 
     local pos  = actor:position()
     local lvid = actor:level_vertex_id()
@@ -2528,7 +2586,25 @@ handle_show_start = function(pkt, offset)
     end
 end
 
+-- True when a level change was initiated this frame (the world restarts, so
+-- the caller must not apply the join to the placeholder map).
+local function change_level_to_pending_target()
+    local sp = load_pending_join()
+    if not sp then return false end
+    if type(sp.level) ~= "string" or sp.level == "" then return false end
+    if not in_game() then return false end
+    if current_level_name() == sp.level then return false end
+    return change_level_to(sp.level)
+end
+
 local function on_actor_first_update()
+    -- The console "start" boots a placeholder map; move to the hosted level
+    -- first. ChangeLevel restarts the world, so skip this frame's join work;
+    -- it runs again on the real level.
+    local switched = false
+    pcall(function() switched = change_level_to_pending_target() end)
+    if switched then return end
+
     pcall(send_level_change, true)
     pcall(send_player_visual, true)
     pcall(apply_join_after_load)
@@ -2537,7 +2613,13 @@ local function on_actor_first_update()
     pcall(apply_pending_wallet)
 end
 
+-- Set while the engine restarts the world for a level change (travel or the
+-- join-time ChangeLevel). Cleared in on_actor_net_destroy so a real quit is
+-- told apart from a travel teardown.
+local level_travel_in_progress = false
+
 local function on_level_changing()
+    level_travel_in_progress = true
     -- If level.name() already reports the new level, send now; otherwise the
     -- on_tick comparison and actor_on_first_update send it after the load.
     pcall(send_level_change, false)
@@ -2570,6 +2652,28 @@ local function on_actor_net_destroy()
     last_level_sent = nil
     last_visual_sent = nil
     last_visual_check = 0
+    -- Actor teardown without a level change means the player quit to the menu
+    -- or desktop: drop the server session at once instead of leaving it alive
+    -- until the server's stale timeout, so another server can be joined.
+    if not level_travel_in_progress then
+        pcall(function()
+            if ZoneNet and ZoneNet.Disconnect then ZoneNet:Disconnect() end
+        end)
+    end
+    level_travel_in_progress = false
+end
+
+-- Console quit paths (ui_main_menu exec_console_cmd "quit"/"disconnect") are
+-- dispatched after execution; notify the server best-effort. The DLL detach
+-- hook is the backstop when the engine tears down without returning to Lua.
+local function on_console_execute(cmd)
+    if type(cmd) ~= "string" then return end
+    local c = string.lower(cmd)
+    if c == "quit" or c == "disconnect" then
+        pcall(function()
+            if ZoneNet and ZoneNet.Disconnect then ZoneNet:Disconnect() end
+        end)
+    end
 end
 
 function register_level_callbacks()
@@ -2580,6 +2684,8 @@ function register_level_callbacks()
             RegisterScriptCallback("actor_on_first_update", on_actor_first_update)
             RegisterScriptCallback("on_level_changing", on_level_changing)
             RegisterScriptCallback("actor_on_net_destroy", on_actor_net_destroy)
+            -- Declared axr_main.script:216, dispatched by _g.script:751.
+            RegisterScriptCallback("on_console_execute", on_console_execute)
             -- Verified base callbacks: declared in axr_main.script:66/69 and
             -- dispatched by bind_stalker_ext.script:142/156.
             RegisterScriptCallback("actor_on_item_take", on_actor_item_take)

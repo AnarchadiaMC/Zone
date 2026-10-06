@@ -2174,6 +2174,38 @@ function UIZoneServerList:PollConnect()
     end
 end
 
+-- A live "Connected" state must reflect the socket, not a cached state: the
+-- server can stop or drop the session while the browser stays open.
+function UIZoneServerList:PollLiveState()
+    if self.state ~= STATE_CONNECTED then return end
+    local connected = false
+    pcall(function()
+        if ZoneNet and ZoneNet.IsConnected then
+            connected = ZoneNet:IsConnected() and true or false
+        end
+    end)
+    if connected then return end
+
+    local raw = ""
+    pcall(function()
+        if ZoneNet and ZoneNet.GetLastError then raw = ZoneNet:GetLastError() or "" end
+    end)
+    self.connect_start = 0
+    self.last_fail_reason = raw
+    if raw ~= "" then
+        local shown = raw
+        pcall(function()
+            if ZoneNet and type(ZoneNet.LocalizeError) == "function" then
+                shown = ZoneNet:LocalizeError(raw) or raw
+            end
+        end)
+        self:SetState(STATE_FAILED, shown)
+    else
+        self:SetState(STATE_IDLE)
+    end
+    self:RefreshList()
+end
+
 function UIZoneServerList:Update()
     if self.closed then return end
     pcall(function() self:ProcessTabChange() end)
@@ -2186,6 +2218,7 @@ function UIZoneServerList:Update()
         end
     end)
     pcall(function() self:PollConnect() end)
+    pcall(function() self:PollLiveState() end)
     pcall(function() self:ServiceRetries() end)
     pcall(function() self:AnimateSpinner() end)
     -- Menu-safe pump: the join flow packets (SHOW_START/LOAD_LEVEL) arrive
