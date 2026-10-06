@@ -3,7 +3,15 @@ local FILES = {
     [ [[ui\ui_mm_main.xml]]    ] = true,
 }
 
-local LISTS = { "menu_main", "menu_main_last_save" }
+-- The engine builds different lists depending on its state at menu-build time
+-- (UIMMShniaga.cpp:75-96): pre-game uses menu_main / menu_main_last_save, but
+-- a rebuild after a level is destroyed can still run with the level pointer set
+-- and then use the in-game lists. Inject into all of them so the Zone button
+-- cannot disappear after returning from a game.
+local LISTS = {
+    "menu_main", "menu_main_last_save",
+    "menu_main_single", "menu_main_single_dead", "menu_main_mm",
+}
 
 local BTN = { name = "btn",
               attr = { name = "btn_zone_online", caption = "ui_mm_zone_online" } }
