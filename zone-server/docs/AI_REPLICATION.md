@@ -12,8 +12,9 @@ packets as any other actor (`ENTITY_ENTER_AOI`, `ENTITY_LEAVE_AOI`,
 - One replicated entity per squad (the leader puppet). The seeded squads are
   conceptually three-member patrols; member-level puppets are roadmap.
 - Puppets are *not* inserted into the player `SpatialGrid`. Visibility is
-  computed directly against `ai_online_radius_m`, so the 30 Hz player snapshot
-  path and the 48-player regression are untouched.
+  computed directly against the replication radii (`ai_enter_radius_m` /
+  `ai_leave_radius_m`), so the 30 Hz player snapshot path and the 48-player
+  regression are untouched.
 
 ## Wire (frozen v5)
 
@@ -65,7 +66,7 @@ registration time. The `is_online` column is not written in wave A.
 
 ## Simulation tiers
 
-- **ONLINE** (any same-level player within `ai_online_radius_m`, 2D distance):
+- **ONLINE** (any same-level player within `ai_leave_radius_m`, 2D distance):
   stepped every game tick with `dt = elapsed` clamped to 250 ms.
 - **OFFLINE**: macro-stepped at 1 Hz with `dt = elapsed` clamped to 2 s.
 
@@ -85,7 +86,9 @@ the ATTACK state and death in the DEAD state.
 4. Stream `OpAIState` chunks (max 32) to every player with in-range squads.
 
 `ai_enabled: false` performs no seeding, registers no entities, and sends no AI
-packets. `ai_online_radius_m` defaults to 220.
+packets. `ai_online_radius_m` is a legacy alias; absent an explicit non-220
+value, `ai_enter_radius_m` / `ai_leave_radius_m` default to 180 m / 220 m and
+`ai_max_entities` caps the registered puppet squads at 64.
 
 ## Combat FSM (Wave B)
 

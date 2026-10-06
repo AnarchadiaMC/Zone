@@ -86,7 +86,7 @@ func main() {
 		log.Fatalf("Failed to seed safe zones: %v", err)
 	}
 
-	dbQueue := db.StartWriteQueue(ctx)
+	dbQueue := db.StartWriteQueue()
 
 	server := game.NewServer(cfg, db, logger, dbQueue)
 	if err := server.InitUDP(); err != nil {
@@ -104,6 +104,13 @@ func main() {
 	if err := server.Run(ctx); err != nil && err != context.Canceled {
 		logger.Error("Server error", zap.Error(err))
 	}
+
+	// Graceful shutdown order: wait for the final game tick (no more write
+	// producers), close the queue so the worker drains and joins, then let the
+	// deferred db.Close() run against an idle database.
+	server.WaitGameLoop()
+	close(dbQueue)
+	db.WaitWriteQueue()
 
 	logger.Info("Server shutdown complete")
 }

@@ -20,6 +20,13 @@ const (
 	losPelvisOffset float32 = 0.5
 )
 
+// losMaxNegativeCacheEntries bounds the negative (missing/unsafe) level cache.
+// Level names are client-reported (OpLevelChange accepts any printable name),
+// so without a cap a client cycling crafted names could grow the map without
+// bound. Once the cap is reached, further unknown levels still fail open but
+// are neither cached nor logged.
+const losMaxNegativeCacheEntries = 256
+
 // losManager caches one occluder set per level, loading <level>.occl from the
 // configured directory on first use. Missing, unreadable or corrupt files fail
 // OPEN (damage allowed) and are logged once per level. All methods are safe for
@@ -85,19 +92,28 @@ func (m *losManager) occluderFor(level string) (*los.Occluders, bool) {
 		return nil, false
 	}
 	if !safeOccluderLevelName(level) {
-		m.missing[level] = true
-		m.logf(level, "unsafe level name; line-of-sight checks disabled for this level (fail open)")
+		m.cacheMissing(level, "unsafe level name; line-of-sight checks disabled for this level (fail open)")
 		return nil, false
 	}
 	path := filepath.Join(m.dir, level+".occl")
 	occ, err := los.Load(path)
 	if err != nil {
-		m.missing[level] = true
-		m.logf(level, "occluder load failed; line-of-sight checks fail open for this level")
+		m.cacheMissing(level, "occluder load failed; line-of-sight checks fail open for this level")
 		return nil, false
 	}
 	m.loaded[level] = occ
 	return occ, occ != nil
+}
+
+// cacheMissing records one failed level lookup and logs it once, unless the
+// negative cache is full: in that case the level is still failed open but not
+// retained, keeping the client-controlled key space bounded.
+func (m *losManager) cacheMissing(level, msg string) {
+	if len(m.missing) >= losMaxNegativeCacheEntries {
+		return
+	}
+	m.missing[level] = true
+	m.logf(level, msg)
 }
 
 // logf emits one warning per level (the caller only calls it on the first

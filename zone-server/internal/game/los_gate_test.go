@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"go.uber.org/zap"
@@ -175,6 +176,23 @@ func TestLOS_DisabledAllowsDamage(t *testing.T) {
 	sendDamageNotify(t, s, attacker, 1, target.SessionID, 25)
 	if got := len(packetsByOpcode(sink, protocol.OpDamageNotify)); got != 1 {
 		t.Fatalf("los_enabled=false blocked damage: relays %d, want 1", got)
+	}
+}
+
+// The negative occluder cache is bounded: client-reported level names beyond
+// the cap still fail open but are not retained, so the key space cannot grow
+// without bound.
+func TestLOS_MissingCacheBounded(t *testing.T) {
+	m := newLOSManager(true, t.TempDir(), zap.NewNop())
+	for i := 0; i < losMaxNegativeCacheEntries+64; i++ {
+		level := "unknown_level_" + strconv.Itoa(i)
+		if !m.damageAllowed(level, [3]float32{0, 0, 0}, [3]float32{1, 1, 1}) {
+			t.Fatalf("missing occluder for %s blocked damage, want fail open", level)
+		}
+	}
+	if len(m.missing) > losMaxNegativeCacheEntries {
+		t.Fatalf("negative occluder cache grew to %d entries, want <= %d",
+			len(m.missing), losMaxNegativeCacheEntries)
 	}
 }
 

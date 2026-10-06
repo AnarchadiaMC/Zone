@@ -66,12 +66,12 @@ func boolToUint8(b bool) uint8 {
 }
 
 type Server struct {
-	cfg       *config.Config
-	db        *database.DB
-	dbQueue   chan *database.DBWriteJob
-	udp       *network.UDPListener
-	udpMu     sync.RWMutex
-	nickMu    sync.Mutex
+	cfg      *config.Config
+	db       *database.DB
+	dbQueue  chan *database.DBWriteJob
+	udp      *network.UDPListener
+	udpMu    sync.RWMutex
+	nickMu   sync.Mutex
 	sessions *network.SessionManager
 	grid     *SpatialGrid
 	economy  *EconomyManager
@@ -105,6 +105,16 @@ type Server struct {
 	lastPlayTimeCredit time.Time
 	// lastWorldItemSweep throttles the world_items TTL sweep (see Tick).
 	lastWorldItemSweep time.Time
+	// gameLoopWG tracks RunGameLoop so shutdown can wait for the final tick
+	// before the DB write queue is closed.
+	gameLoopWG sync.WaitGroup
+}
+
+// WaitGameLoop blocks until RunGameLoop has processed its final tick and
+// returned. Shutdown calls it before closing the DB write queue so no write
+// is enqueued after the queue is closed.
+func (s *Server) WaitGameLoop() {
+	s.gameLoopWG.Wait()
 }
 
 func NewServer(cfg *config.Config, db *database.DB, logger *zap.Logger, dbQueue ...chan *database.DBWriteJob) *Server {

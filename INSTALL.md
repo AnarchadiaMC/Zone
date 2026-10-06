@@ -67,7 +67,7 @@ On first start the server creates the embedded SQLite database (`zone_world.db`)
 
 ### Configuration reference (`zone_server.yaml`)
 
-All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets 28 of them; the rest fall back to the defaults below when omitted.
+All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets all 32 of them; omitted keys fall back to the defaults below.
 
 | Key | Default | In shipped YAML | Purpose |
 |---|---|:---:|---|
@@ -88,9 +88,9 @@ All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets
 | `item_rate_per_s` | `5` | yes | Item action rate limit per session (shared by 0x007D, 0x007F, 0x0081 and 0x0083). |
 | `ai_enabled` | `true` | yes | Master switch for AI seeding, simulation, replication and AI packets. |
 | `ai_online_radius_m` | `220` | yes | Legacy alias. When set to a non-220 value it pins both hysteresis radii (no hysteresis); otherwise the enter/leave defaults apply. |
-| `ai_enter_radius_m` | `180` | no | A puppet enters a client's replication stream inside this 2D radius. |
-| `ai_leave_radius_m` | `220` | no | A visible puppet leaves only past this radius (hysteresis). Clamped ≥ enter radius. |
-| `ai_max_entities` | `64` | no | Maximum registered puppet squads; registrations beyond the cap are logged and skipped, and per-session in-range sets are capped nearest-first. |
+| `ai_enter_radius_m` | `180` | yes | A puppet enters a client's replication stream inside this 2D radius. |
+| `ai_leave_radius_m` | `220` | yes | A visible puppet leaves only past this radius (hysteresis). Clamped ≥ enter radius. |
+| `ai_max_entities` | `64` | yes | Maximum registered puppet squads; registrations beyond the cap are logged and skipped, and per-session in-range sets are capped nearest-first. |
 | `ai_combat_enabled` | `true` | yes | Master switch for the puppet combat FSM; `false` keeps patrol replication but disables aggro, chase and attacks. |
 | `ai_aggro_radius_m` | `40` | yes | 3D radius in which a puppet acquires a hostile player. |
 | `ai_attack_range_m` | `2.0` | yes | Melee reach; inside this distance the FSM starts swinging. |
@@ -102,7 +102,7 @@ All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets
 | `los_data_dir` | `"zone_los"` | yes | Directory holding the per-level `<level>.occl` occluders next to the server binary. Missing files fail open. |
 | `world_item_ttl_min` | `60` (pointer; explicit `0` disables) | yes | Minutes before dropped world items expire via the 30 s sweep. |
 | `world_item_max_per_level` | `500` | yes | Max persisted world item rows per level; drops beyond the cap are rejected and the client is resynced. |
-| `trade_max_money_delta` | `200000` | no | Maximum rubles one `OpTradeAction` may move; a capped buy/sell is echoed as corrected. |
+| `trade_max_money_delta` | `200000` | yes | Maximum rubles one `OpTradeAction` may move; a capped buy/sell is echoed as corrected. |
 
 ### Occluders (`zone_los`)
 

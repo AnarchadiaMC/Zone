@@ -1,7 +1,6 @@
 package database
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,11 +8,15 @@ import (
 	"math"
 	_ "modernc.org/sqlite"
 	"strings"
+	"sync"
 	"time"
 )
 
 type DB struct {
 	db *sql.DB
+	// writeWG tracks the write-behind worker started by StartWriteQueue so a
+	// shutdown can drain and join it before Close.
+	writeWG sync.WaitGroup
 }
 
 func Open(dbPath string) (*DB, error) {
@@ -962,29 +965,28 @@ func (d *DB) InsertAudit(clientUUID, eventType, detail string) error {
 	return err
 }
 
-func (d *DB) StartWriteQueue(ctx context.Context) chan *DBWriteJob {
+// StartWriteQueue starts the single write-behind worker and returns the job
+// channel. The caller must stop all producers, close the channel, and call
+// WaitWriteQueue before Close, so the worker drains every buffered write
+// before the database handle is closed.
+func (d *DB) StartWriteQueue() chan *DBWriteJob {
 	q := make(chan *DBWriteJob, 1000)
+	d.writeWG.Add(1)
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				for len(q) > 0 {
-					job := <-q
-					if job != nil {
-						if _, err := d.db.Exec(job.Query, job.Args...); err != nil {
-							log.Printf("database write error during shutdown drain: %v (query: %s)", err, job.Query)
-						}
-					}
-				}
-				return
-			case job := <-q:
-				if job != nil {
-					if _, err := d.db.Exec(job.Query, job.Args...); err != nil {
-						log.Printf("database write error: %v (query: %s)", err, job.Query)
-					}
+		defer d.writeWG.Done()
+		for job := range q {
+			if job != nil {
+				if _, err := d.db.Exec(job.Query, job.Args...); err != nil {
+					log.Printf("database write error: %v (query: %s)", err, job.Query)
 				}
 			}
 		}
 	}()
 	return q
+}
+
+// WaitWriteQueue blocks until the write-behind worker has drained the closed
+// job channel and exited. It is a no-op when StartWriteQueue was never called.
+func (d *DB) WaitWriteQueue() {
+	d.writeWG.Wait()
 }

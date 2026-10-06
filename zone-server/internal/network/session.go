@@ -11,33 +11,33 @@ import (
 
 type PlayerSession struct {
 	sync.Mutex
-	SessionID         uint32
-	AccountID         string
-	Name              string
-	UDPAddr           *net.UDPAddr
-	CurrentLevel      string
-	Position          [3]float32
-	Rotation          [2]float32
-	Velocity          [3]float32
-	Health            float32
-	AnimFlags         uint8
-	Gvid              uint16
-	Visual            [64]byte
-	HasVisual         bool
-	InSafeZone        bool
-	SafeZoneID        string
-	LastSeen          time.Time
-	LastSequence      uint32
+	SessionID    uint32
+	AccountID    string
+	Name         string
+	UDPAddr      *net.UDPAddr
+	CurrentLevel string
+	Position     [3]float32
+	Rotation     [2]float32
+	Velocity     [3]float32
+	Health       float32
+	AnimFlags    uint8
+	Gvid         uint16
+	Visual       [64]byte
+	HasVisual    bool
+	InSafeZone   bool
+	SafeZoneID   string
+	LastSeen     time.Time
+	LastSequence uint32
 	// LastAIStateSent throttles OpAIState to a time-based ~30 Hz ceiling
 	// regardless of the configured tick rate.
 	LastAIStateSent time.Time
 	SessionToken    uint64
-	Dirty            bool
-	LastCheckpoint   time.Time
-	InCombatUntil    time.Time
-	ChatTimestamps   []time.Time
-	PendingCreate    bool
-	Faction          string
+	Dirty           bool
+	LastCheckpoint  time.Time
+	InCombatUntil   time.Time
+	ChatTimestamps  []time.Time
+	PendingCreate   bool
+	Faction         string
 	// EnterBroadcastLevel is the level for which ENTITY_ENTER_AOI has been
 	// broadcast to same-level peers. Empty until a broadcast happens with a
 	// valid gvid and visual; reset on level change.

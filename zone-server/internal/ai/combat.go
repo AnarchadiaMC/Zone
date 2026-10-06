@@ -275,4 +275,3 @@ func distSq3D(a, b [3]float32) float32 {
 	dz := a[2] - b[2]
 	return dx*dx + dy*dy + dz*dz
 }
-

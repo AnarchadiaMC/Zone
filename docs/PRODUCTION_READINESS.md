@@ -203,22 +203,22 @@ Each item: area → why → acceptance criteria.
     integrity check and bounded data loss (≤ checkpoint interval), panic isolation
     per worker, documented restart behavior.
 
-15. **Graceful shutdown / save flush unverified and racy.** On signal, `main.go:67-108`
-    cancels ctx and then defers `db.Close()`; the write-queue drain (`db.go:901-926`)
-    races `Close`, and no code flushes dirty sessions (up to 60 s of movement lost,
-    `Tick` checkpoint at `server.go:2148-2155`). Clients receive no disconnect
-    message. **AC:** shutdown flushes dirty sessions, drains the queue before
-    closing the DB, sends a disconnect reason, and a restart soak proves no loss.
+15. **Graceful shutdown / save flush partially hardened.** On SIGINT/SIGTERM,
+    `main.go` cancels ctx; shutdown now waits for the final game tick
+    (`Server.WaitGameLoop`), closes the DB write queue and joins its drain
+    (`DB.WaitWriteQueue`) before the deferred `db.Close()`, so the previous
+    drain-vs-Close race is closed. Still open: dirty sessions are only flushed by
+    the 60 s checkpoint, so a shutdown can lose up to that window of movement, and
+    clients receive no disconnect message. **AC:** shutdown flushes dirty sessions,
+    sends a disconnect reason, and a restart soak proves no loss.
 
 16. **Config validation/completeness.** `Validate()` checks only port, tick rate and
     max players (`config.go:257-272`); an invalid `log_level` silently falls back to
-    info; `map_name` is not checked against `supportedLevels`; four keys
-    (`ai_enter_radius_m`, `ai_leave_radius_m`, `ai_max_entities`,
-    `trade_max_money_delta`) are absent from the sample YAML (`INSTALL.md`
-    documents them). The movement keys and the deprecated `correction_tolerance_m`
-    key were removed with the guard (`config.go` now carries 32 keys; the shipped
-    YAML sets 28). **AC:** full schema validation with errors on unknown/invalid
-    values, `--check-config`, docs and sample YAML match the struct.
+    info; `map_name` is not checked against `supportedLevels`. The movement keys and
+    the deprecated `correction_tolerance_m` key were removed with the guard, and the
+    sample YAML now sets all 32 keys (`config.go`, `zone_server.yaml`). **AC:** full
+    schema validation with errors on unknown/invalid values, `--check-config`, docs
+    and sample YAML match the struct.
 
 17. **Per-opcode rate limits partial.** Beyond the per-IP bucket: chat 5/5 s (shared
     with group responses), item ledger 5/s (shared with container, stash and trade

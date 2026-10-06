@@ -327,15 +327,15 @@ func (s *Server) AIEntityIDOf(squadID uint32) (uint32, bool) {
 
 // aiPlayerView is a per-tick copy of session replication state.
 type aiPlayerView struct {
-	sess        *network.PlayerSession
-	id          uint32
-	level       string
-	pos         [3]float32
-	faction     string
-	health      float32
-	inSafe      bool
+	sess          *network.PlayerSession
+	id            uint32
+	level         string
+	pos           [3]float32
+	faction       string
+	health        float32
+	inSafe        bool
 	pendingCreate bool
-	lastAIState time.Time
+	lastAIState   time.Time
 }
 
 // tickAIReplication is called once per game tick.

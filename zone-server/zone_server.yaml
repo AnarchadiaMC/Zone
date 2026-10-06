@@ -14,7 +14,12 @@ invite_ttl_sec: 60
 damage_budget_per_s: 400
 item_rate_per_s: 5
 ai_enabled: true
+# ai_online_radius_m is a legacy alias: when set to a non-220 value it pins both
+# hysteresis radii (no hysteresis); otherwise enter 180 / leave 220 apply.
 ai_online_radius_m: 220
+ai_enter_radius_m: 180
+ai_leave_radius_m: 220
+ai_max_entities: 64
 # AI combat FSM (wave B). ai_combat_enabled: false keeps patrol replication but
 # disables aggro, chasing and attacks. Radii/damage/timings fall back to the
 # documented defaults (40 / 2.0 / 1500 / 10 / 5 / 10) when omitted or <= 0.
@@ -34,3 +39,5 @@ los_data_dir: "zone_los"
 # world_item_max_per_level caps rows per level; drops beyond the cap reject.
 world_item_ttl_min: 60
 world_item_max_per_level: 500
+# Per-action ruble cap for OpTradeAction; <= 0 falls back to 200000.
+trade_max_money_delta: 200000
