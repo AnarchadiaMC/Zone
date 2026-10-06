@@ -207,16 +207,17 @@ Each item: area → why → acceptance criteria.
     `main.go` cancels ctx; shutdown now waits for the final game tick
     (`Server.WaitGameLoop`), closes the DB write queue and joins its drain
     (`DB.WaitWriteQueue`) before the deferred `db.Close()`, so the previous
-    drain-vs-Close race is closed. Still open: dirty sessions are only flushed by
-    the 60 s checkpoint, so a shutdown can lose up to that window of movement, and
-    clients receive no disconnect message. **AC:** shutdown flushes dirty sessions,
-    sends a disconnect reason, and a restart soak proves no loss.
+    drain-vs-Close race is closed. Shutdown now also sends `OpDisconnect` to
+    every live session before the socket closes. Still open: dirty sessions are
+    only flushed by the 60 s checkpoint, so a shutdown can lose up to that
+    window of movement. **AC:** shutdown flushes dirty sessions and a restart
+    soak proves no loss.
 
 16. **Config validation/completeness.** `Validate()` checks only port, tick rate and
     max players (`config.go:257-272`); an invalid `log_level` silently falls back to
     info; `map_name` is not checked against `supportedLevels`. The movement keys and
     the deprecated `correction_tolerance_m` key were removed with the guard, and the
-    sample YAML now sets all 32 keys (`config.go`, `zone_server.yaml`). **AC:** full
+    sample YAML now sets all 33 keys (`config.go`, `zone_server.yaml`). **AC:** full
     schema validation with errors on unknown/invalid values, `--check-config`, docs
     and sample YAML match the struct.
 

@@ -204,8 +204,8 @@ func TestContainerDepositInsufficientRejected(t *testing.T) {
 	if corrected[0].Count != -1 {
 		t.Fatalf("correction count = %d, want -1 (server holds 1)", corrected[0].Count)
 	}
-	if len(packetsByOpcode(sink, protocol.OpInventorySync)) == 0 {
-		t.Fatal("correction did not force an inventory sync")
+	if got := len(packetsByOpcode(sink, protocol.OpInventorySync)); got != 0 {
+		t.Fatalf("insufficient deposit changed no server state but forced %d inventory sync(s)", got)
 	}
 	if items := stashItems(t, s, 302); len(items) != 0 {
 		t.Fatalf("stash changed on rejected deposit: %+v", items)
@@ -450,8 +450,8 @@ func TestConsumeRemovesExactlyOnce(t *testing.T) {
 		t.Fatalf("replay removed items: %d, want 1", avail)
 	}
 
-	// Over-consume is corrected to the authoritative remaining count plus a
-	// forced inventory sync.
+	// Over-consume is corrected to the authoritative remaining count. No
+	// inventory sync follows: the rejected consume changed no server state.
 	sink.Reset()
 	pkt.ActionID = 3
 	pkt.Count = 5
@@ -460,8 +460,8 @@ func TestConsumeRemovesExactlyOnce(t *testing.T) {
 	if len(corrected) != 1 || corrected[0].Count != -1 {
 		t.Fatalf("consume correction = %+v, want count=-1", corrected)
 	}
-	if len(packetsByOpcode(sink, protocol.OpInventorySync)) == 0 {
-		t.Fatal("consume correction did not force an inventory sync")
+	if got := len(packetsByOpcode(sink, protocol.OpInventorySync)); got != 0 {
+		t.Fatalf("insufficient consume changed no server state but forced %d inventory sync(s)", got)
 	}
 	if got := countAuditEvents(t, s, "item_consume"); got != 1 {
 		t.Errorf("item_consume audit rows = %d, want 1", got)

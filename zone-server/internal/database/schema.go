@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS characters (
     pos_z REAL NOT NULL DEFAULT -145.8,
     yaw REAL NOT NULL DEFAULT 0.0,
     faction TEXT NOT NULL DEFAULT 'stalker',
-    health REAL NOT NULL DEFAULT 1.0,
+    health REAL NOT NULL DEFAULT 100.0,
     bleeding REAL NOT NULL DEFAULT 0.0,
     radiation REAL NOT NULL DEFAULT 0.0,
     economy_tier INTEGER NOT NULL DEFAULT 1,

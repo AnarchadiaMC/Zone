@@ -11,6 +11,9 @@ mode: 0
 locked: false
 group_max_players: 4
 invite_ttl_sec: 60
+# Seconds of client silence before a session is evicted; values below 5 are
+# clamped up to 5.
+session_timeout_sec: 30
 damage_budget_per_s: 400
 item_rate_per_s: 5
 ai_enabled: true

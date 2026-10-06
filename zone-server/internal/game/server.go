@@ -281,6 +281,11 @@ func (s *Server) Run(ctx context.Context) error {
 
 	s.logger.Info("Server started")
 	<-ctx.Done()
+	// Flip every live client to disconnected before the socket closes so a
+	// graceful shutdown is not experienced as a silent timeout.
+	for _, sess := range s.sessions.GetAll() {
+		s.SendToSession(sess, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
+	}
 	return udp.Close()
 }
 
@@ -1046,6 +1051,14 @@ func (s *Server) HandlePacket(data []byte, addr *net.UDPAddr) {
 			)
 			return
 		}
+		if _, known := supportedLevels[levelName]; !known {
+			// Accepted by policy (client-authoritative travel), but a bogus
+			// name such as "fake_start" should be visible in the logs.
+			s.logger.Warn("Accepted unknown level name",
+				zap.String("addr", addr.String()),
+				zap.String("level", levelName),
+			)
+		}
 		// Movement is client-authoritative: the client's last reported position
 		// is kept (the new level's first transform refines it). Per-level
 		// caches are reset so grid/AoI/entity state restart on the new level.
@@ -1388,6 +1401,19 @@ func (s *Server) syncInventoryForLevel(sess *network.PlayerSession) {
 		sess.InventorySyncedLevel = level
 		sess.Unlock()
 	}
+}
+
+// sessionTimeout returns the configured stale-session timeout (config
+// session_timeout_sec, default 30 s, floor 5 s).
+func (s *Server) sessionTimeout() time.Duration {
+	sec := config.DefaultSessionTimeoutSec
+	if s.cfg != nil && s.cfg.SessionTimeoutSec > 0 {
+		sec = s.cfg.SessionTimeoutSec
+		if sec < config.MinSessionTimeoutSec {
+			sec = config.MinSessionTimeoutSec
+		}
+	}
+	return time.Duration(sec) * time.Second
 }
 
 // worldItemTTL returns the configured world-item lifetime, or 0 when the TTL
@@ -1758,11 +1784,12 @@ func (s *Server) Tick(now time.Time) {
 	}
 
 	// Timeout stale sessions & periodic checkpointing (Issue 19)
+	sessionTimeout := s.sessionTimeout()
 	for _, sess := range s.sessions.GetAll() {
 		sess.Lock()
 		sessID := sess.SessionID
 		uuid := sess.AccountID
-		stale := now.Sub(sess.LastSeen) > 30*time.Second
+		stale := now.Sub(sess.LastSeen) > sessionTimeout
 		dirty := sess.Dirty
 		pos := sess.Position
 		yaw := sess.Rotation[0]
@@ -2041,6 +2068,14 @@ func (s *Server) cleanupEvictedSession(evicted *network.PlayerSession) {
 		addrStr = evicted.UDPAddr.String()
 	}
 	evicted.Unlock()
+
+	// Tell the evicted session to drop at once instead of waiting out the
+	// stale timeout. Skip the packet when the same endpoint already carries
+	// its live replacement (same-address reconnect): the new client must not
+	// be told to disconnect.
+	if cur := s.sessions.GetByAddr(addrStr); cur == nil || cur == evicted {
+		s.SendToSession(evicted, protocol.OpDisconnect, protocol.FlagReliable, uint8(1))
+	}
 
 	s.removeFromGroup(evicted)
 	s.grid.Remove(sessID)

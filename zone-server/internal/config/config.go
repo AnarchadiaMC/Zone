@@ -23,6 +23,10 @@ type Config struct {
 	Locked              bool   `yaml:"locked"`
 	GroupMaxPlayers     int    `yaml:"group_max_players"`
 	InviteTTLSec        int    `yaml:"invite_ttl_sec"`
+	// SessionTimeoutSec is the inactivity timeout for live sessions. Omitted
+	// or non-positive values fall back to DefaultSessionTimeoutSec; values
+	// below MinSessionTimeoutSec are clamped up.
+	SessionTimeoutSec int `yaml:"session_timeout_sec"`
 
 	// Hit-registration knobs. DamageBudgetPerS clamps the rolling 1 s damage
 	// an attacker may deal (single hits are also clamped); ItemRatePerS limits
@@ -82,6 +86,13 @@ type Config struct {
 
 // DefaultWorldItemTTLMin is the world-item TTL applied when the key is absent.
 const DefaultWorldItemTTLMin = 60
+
+// Session timeout defaults and floor: an omitted key means 30 s of silence
+// evicts a session, and a configured value below the floor is raised to it.
+const (
+	DefaultSessionTimeoutSec = 30
+	MinSessionTimeoutSec     = 5
+)
 
 // DefaultWorldItemMaxPerLevel is the per-level world item cap applied when the
 // key is absent or non-positive.
@@ -190,6 +201,12 @@ func (c *Config) SetDefaults() {
 	}
 	if c.InviteTTLSec <= 0 {
 		c.InviteTTLSec = 60
+	}
+	if c.SessionTimeoutSec <= 0 {
+		c.SessionTimeoutSec = DefaultSessionTimeoutSec
+	}
+	if c.SessionTimeoutSec < MinSessionTimeoutSec {
+		c.SessionTimeoutSec = MinSessionTimeoutSec
 	}
 	if c.DamageBudgetPerS <= 0 {
 		c.DamageBudgetPerS = 400

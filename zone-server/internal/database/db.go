@@ -397,14 +397,14 @@ func (d *DB) CreateCharacter(uuid, faction, loadout string, money uint32) error 
 	var one int
 	err = tx.QueryRow("SELECT 1 FROM characters WHERE client_uuid=?", uuid).Scan(&one)
 	if err == nil {
-		if _, err := tx.Exec(`UPDATE characters SET faction=?, level_name='l01_escape', pos_x=-211.3, pos_y=-20.2, pos_z=-145.8, yaw=0, health=1.0, profile_rev=1, dead=0, updated_at=? WHERE client_uuid=?`, faction, now, uuid); err != nil {
+		if _, err := tx.Exec(`UPDATE characters SET faction=?, level_name='l01_escape', pos_x=-211.3, pos_y=-20.2, pos_z=-145.8, yaw=0, health=100.0, profile_rev=1, dead=0, updated_at=? WHERE client_uuid=?`, faction, now, uuid); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM character_inventory WHERE client_uuid=?`, uuid); err != nil {
 			return err
 		}
 	} else if err == sql.ErrNoRows {
-		if _, err := tx.Exec(`INSERT INTO characters (client_uuid, faction, profile_rev, dead, created_at, updated_at) VALUES (?, ?, 1, 0, ?, ?)`, uuid, faction, now, now); err != nil {
+		if _, err := tx.Exec(`INSERT INTO characters (client_uuid, faction, health, profile_rev, dead, created_at, updated_at) VALUES (?, ?, 100.0, 1, 0, ?, ?)`, uuid, faction, now, now); err != nil {
 			return err
 		}
 	} else {
@@ -424,15 +424,22 @@ func (d *DB) CreateCharacter(uuid, faction, loadout string, money uint32) error 
 				continue
 			}
 			sec := e
-			ammo := 0
+			count := 1
 			if i := strings.Index(e, ":"); i >= 0 {
 				sec = strings.TrimSpace(e[:i])
-				_, _ = fmt.Sscanf(strings.TrimSpace(e[i+1:]), "%d", &ammo)
+				parsed := 0
+				_, _ = fmt.Sscanf(strings.TrimSpace(e[i+1:]), "%d", &parsed)
+				if parsed > 0 {
+					count = parsed
+				}
+				if count > 65535 {
+					count = 65535
+				}
 			}
 			if sec == "" {
 				continue
 			}
-			if _, err := tx.Exec(`INSERT INTO character_inventory (client_uuid, item_section, ammo_current) VALUES (?, ?, ?)`, uuid, sec, ammo); err != nil {
+			if _, err := tx.Exec(`INSERT INTO character_inventory (client_uuid, item_section, item_count) VALUES (?, ?, ?)`, uuid, sec, count); err != nil {
 				return err
 			}
 		}

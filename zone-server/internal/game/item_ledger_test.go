@@ -266,7 +266,7 @@ func TestItemPickupWrongLevelRejected(t *testing.T) {
 	}
 }
 
-func TestItemDropCorrectionResyncsInventory(t *testing.T) {
+func TestItemDropCorrectionDoesNotResyncInventory(t *testing.T) {
 	s, sink, db := setupTestServerWithDB(t)
 	if err := db.AutoProvision("uuid-correct", "hwid-correct", "Correct"); err != nil {
 		t.Fatalf("AutoProvision: %v", err)
@@ -291,8 +291,8 @@ func TestItemDropCorrectionResyncsInventory(t *testing.T) {
 	if corrected[0].Count != -1 {
 		t.Fatalf("correction count = %d, want -1 (server holds 1)", corrected[0].Count)
 	}
-	if len(packetsByOpcode(sink, protocol.OpInventorySync)) == 0 {
-		t.Fatal("correction did not force an inventory sync")
+	if got := len(packetsByOpcode(sink, protocol.OpInventorySync)); got != 0 {
+		t.Fatalf("insufficient drop changed no server state but forced %d inventory sync(s)", got)
 	}
 }
 

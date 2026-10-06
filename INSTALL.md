@@ -67,7 +67,7 @@ On first start the server creates the embedded SQLite database (`zone_world.db`)
 
 ### Configuration reference (`zone_server.yaml`)
 
-All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets all 32 of them; omitted keys fall back to the defaults below.
+All 33 keys understood by `internal/config`. The shipped `zone_server.yaml` sets all 33 of them; omitted keys fall back to the defaults below.
 
 | Key | Default | In shipped YAML | Purpose |
 |---|---|:---:|---|
@@ -84,6 +84,7 @@ All 32 keys understood by `internal/config`. The shipped `zone_server.yaml` sets
 | `locked` | `false` | yes | `true` rejects new connections (handshake Status 1). |
 | `group_max_players` | `4` | yes | Max group size, clamped to 1–8 (the 0x007A wire capacity). |
 | `invite_ttl_sec` | `60` | yes | Group invite lifetime; swept every tick. |
+| `session_timeout_sec` | `30` | yes | Seconds of client silence before the session is evicted as stale; values below 5 are clamped up to 5. |
 | `damage_budget_per_s` | `400` | yes | Rolling 1 s sustained damage clamp per attacker (hit registration). |
 | `item_rate_per_s` | `5` | yes | Item action rate limit per session (shared by 0x007D, 0x007F, 0x0081 and 0x0083). |
 | `ai_enabled` | `true` | yes | Master switch for AI seeding, simulation, replication and AI packets. |

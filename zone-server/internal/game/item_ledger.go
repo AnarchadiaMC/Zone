@@ -454,15 +454,19 @@ func (s *Server) handleItemDrop(sess *network.PlayerSession, uuid, level, sectio
 			Action:   pkt.Action,
 			Section:  pkt.Section,
 		}
-		if errors.Is(err, database.ErrInsufficientItems) {
+		insufficient := errors.Is(err, database.ErrInsufficientItems)
+		if insufficient {
 			update.Result = protocol.ItemResultCorrected
 			update.Count = clampCountToInt16(-remaining)
 		}
 		s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 		s.replyItemUpdate(sess, update)
-		// Rejected/corrected drops are always client-local mutations: resync so
-		// a ghost item cannot survive the rejection.
-		s.forceInventorySync(sess)
+		// An insufficient-stock drop changed nothing server-side, so the
+		// correction alone is authoritative. Other failures may follow a
+		// partial client-local mutation and still force a resync.
+		if !insufficient {
+			s.forceInventorySync(sess)
+		}
 		s.audit(uuid, "item_drop_rejected",
 			fmt.Sprintf("action_id=%d section=%s count=%d err=%v", pkt.ActionID, section, pkt.Count, err))
 		return

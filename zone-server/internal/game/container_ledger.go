@@ -110,8 +110,9 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 		bucket, err := s.stashMgr.DepositItem(pkt.ContainerID, uuid, level, section, int(pkt.Count), int(pkt.Condition))
 		if err != nil {
 			result := protocol.ItemResultRejected
+			insufficient := errors.Is(err, database.ErrInsufficientItems)
 			var corr int16
-			if errors.Is(err, database.ErrInsufficientItems) {
+			if insufficient {
 				result = protocol.ItemResultCorrected
 				if avail, aerr := s.db.AvailableItemCount(uuid, section); aerr == nil {
 					corr = clampCountToInt16(-avail)
@@ -128,9 +129,12 @@ func (s *Server) handleContainerAction(addr *net.UDPAddr, buf *bytes.Reader) {
 			}
 			s.itemLedger.RecordContainer(sess.SessionID, pkt.ActionID, update)
 			s.replyContainerUpdate(sess, update)
-			// A rejected deposit may have been applied locally by the client;
-			// force a full resync so no ghost stack survives.
-			s.forceInventorySync(sess)
+			// An insufficient-stock deposit changed nothing server-side, so
+			// the correction alone is authoritative; other failures still
+			// force a resync so no ghost stack survives.
+			if !insufficient {
+				s.forceInventorySync(sess)
+			}
 			s.audit(uuid, "item_deposit_rejected",
 				fmt.Sprintf("action_id=%d container=%d section=%s count=%d err=%v", pkt.ActionID, pkt.ContainerID, section, pkt.Count, err))
 			return
@@ -206,7 +210,8 @@ func (s *Server) handleItemConsume(sess *network.PlayerSession, uuid, section st
 			Action:   pkt.Action,
 			Section:  pkt.Section,
 		}
-		if errors.Is(err, database.ErrInsufficientItems) {
+		insufficient := errors.Is(err, database.ErrInsufficientItems)
+		if insufficient {
 			update.Result = protocol.ItemResultCorrected
 			if avail, aerr := s.db.AvailableItemCount(uuid, section); aerr == nil {
 				update.Count = clampCountToInt16(-avail)
@@ -214,9 +219,12 @@ func (s *Server) handleItemConsume(sess *network.PlayerSession, uuid, section st
 		}
 		s.itemLedger.Record(sess.SessionID, pkt.ActionID, update)
 		s.replyItemUpdate(sess, update)
-		// Rejected/corrected consumes are always client-local mutations: resync
-		// so the authoritative stack is restored and no ghost effect survives.
-		s.forceInventorySync(sess)
+		// An insufficient-stock consume changed nothing server-side, so the
+		// correction alone is authoritative. Other failures may follow a
+		// partial client-local mutation and still force a resync.
+		if !insufficient {
+			s.forceInventorySync(sess)
+		}
 		s.audit(uuid, "item_consume_rejected",
 			fmt.Sprintf("action_id=%d section=%s count=%d err=%v", pkt.ActionID, section, pkt.Count, err))
 		return

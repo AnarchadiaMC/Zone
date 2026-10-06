@@ -392,6 +392,61 @@ los_data_dir: "custom_los"
 	}
 }
 
+// session_timeout_sec defaults to 30, clamps values below 5 up to 5, and
+// explicit YAML values override the default.
+func TestConfigSessionTimeout(t *testing.T) {
+	cfg := &Config{Port: 27015, TickRateHz: 30, MaxPlayers: 64}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.SessionTimeoutSec != DefaultSessionTimeoutSec {
+		t.Errorf("SessionTimeoutSec default = %d, want %d", cfg.SessionTimeoutSec, DefaultSessionTimeoutSec)
+	}
+
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{-3, DefaultSessionTimeoutSec},
+		{0, DefaultSessionTimeoutSec},
+		{1, MinSessionTimeoutSec},
+		{4, MinSessionTimeoutSec},
+		{5, 5},
+		{90, 90},
+	}
+	for _, tc := range cases {
+		c := &Config{SessionTimeoutSec: tc.in}
+		c.SetDefaults()
+		if c.SessionTimeoutSec != tc.want {
+			t.Errorf("SessionTimeoutSec %d -> %d, want %d", tc.in, c.SessionTimeoutSec, tc.want)
+		}
+	}
+
+	content := `
+port: 27015
+tick_rate_hz: 30
+max_players: 64
+session_timeout_sec: 90
+`
+	tmpfile, err := os.CreateTemp("", "config_session_timeout_test_*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	tmpfile.Close()
+
+	loaded, err := Load(tmpfile.Name())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.SessionTimeoutSec != 90 {
+		t.Errorf("session_timeout_sec = %d, want 90", loaded.SessionTimeoutSec)
+	}
+}
+
 // trade_max_money_delta defaults to 200000 and clamps non-positive values;
 // explicit YAML values override it.
 func TestConfigTradeMaxMoneyDelta(t *testing.T) {

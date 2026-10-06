@@ -17,7 +17,7 @@ This tree carries the **v0.6.0 package** (the movement-unpoliced build prepared 
 graph TB
     subgraph Server["Dedicated Go Server — zone-server"]
         direction TB
-        YAML["zone_server.yaml<br/>32 config keys"] --> CFG["internal/config"]
+        YAML["zone_server.yaml<br/>33 config keys"] --> CFG["internal/config"]
         CFG --> SRV["game.Server"]
         SRV --> TICK["30 Hz game loop<br/>configurable 1–240 Hz"]
         SRV --> UDP["network.UDPListener<br/>8 workers · FNV-1a affinity<br/>IP token bucket 100/s burst 150"]
@@ -94,7 +94,7 @@ zone-online/
 │   ├── cmd/server/main.go       # Entrypoint: config + CLI overrides, DB, game loop, UDP
 │   ├── internal/
 │   │   ├── ai/                  # A* pathfinding, squad manager, puppet patrol + combat FSM
-│   │   ├── config/              # YAML configuration loader (32 keys)
+│   │   ├── config/              # YAML configuration loader (33 keys)
 │   │   ├── database/            # SQLite schema (10 tables), item/world-item/stash transactions
 │   │   ├── game/                # 30 Hz tick, hit registration, ledgers, level travel, AI combat, AoI, safe zones, groups
 │   │   ├── los/                 # ZLOS occluder loader + segment raycast (hardened)
@@ -222,7 +222,7 @@ The server owns persistent state; the client is the presenter and the source of 
 
 Combat is validated. Hitting a player proxy sends `OpDamageNotify` (0x0050, 13 B) from the client and cancels the local proxy damage. The server validates attacker session match, safe-zone immunity on either side, same faction/group, cross-level, 3D range ≤ 300 m from the last known positions, damage sanity, a 150 single-hit clamp and a rolling 1 s `damage_budget_per_s` (400) budget, then relays the accepted hit to the victim only and writes audit entries. When an occluder exists for the level, the hit must also pass the multi-sample line-of-sight gate (head/chest/pelvis; rejected only if all three segments are blocked; missing artifacts fail open). Hit detection itself stays on the client: the server cannot raycast the shot, and damage is applied 1:1 with no server-side armor or hit-location scaling. The victim's client applies the validated damage to `db.actor` through `change_health` (with its own safe-zone guard) and shows a HUD notice.
 
-Server-authoritative economy state is equally strict: the item ledger rejects duplicate pickups transactionally, echoes cached results for replayed ActionIDs, rate-limits item actions (`item_rate_per_s`) and forces an inventory resync when a client-side mutation was rejected. Stashes are addressed by level position (0.5 m grid, 5 m reach) and resolved/created server-side; trader buy/sell executes against the SQLite inventory and ruble columns with the client-asserted price capped by `trade_max_money_delta` (200000); every money change pushes `OpWalletUpdate` with the absolute balance. AI puppet health, aggro, movement and melee damage are simulated server-side, and a player's hit on a puppet (`TargetID >= 1_000_000`) runs the same validation pipeline.
+Server-authoritative economy state is equally strict: the item ledger rejects duplicate pickups transactionally, echoes cached results for replayed ActionIDs, rate-limits item actions (`item_rate_per_s`) and forces an inventory resync when a rejection may have followed a client-side mutation (insufficient-stock corrections change no server state and skip the resync). Stashes are addressed by level position (0.5 m grid, 5 m reach) and resolved/created server-side; trader buy/sell executes against the SQLite inventory and ruble columns with the client-asserted price capped by `trade_max_money_delta` (200000); every money change pushes `OpWalletUpdate` with the absolute balance. AI puppet health, aggro, movement and melee damage are simulated server-side, and a player's hit on a puppet (`TargetID >= 1_000_000`) runs the same validation pipeline.
 
 Full details, defaults and the still-client-side list: [docs/AUTHORITY_MODEL.md](docs/AUTHORITY_MODEL.md).
 
@@ -265,7 +265,7 @@ cd server
 zone-server.exe
 ```
 
-Client (drag-and-drop, recommended): copy `version.dll` and `ZoneClient.dll` into `<Anomaly>\bin\`, merge the package `gamedata\` into `<Anomaly>\`, launch the game normally. Alternatively, run `ZoneClient_Injector.exe --launch "<Anomaly>\bin\AnomalyDX11.exe"`. Full instructions, all **32 configuration keys** with defaults, CLI flags, the first-run restart note, xrRazom coexistence and connection verification are in [INSTALL.md](INSTALL.md).
+Client (drag-and-drop, recommended): copy `version.dll` and `ZoneClient.dll` into `<Anomaly>\bin\`, merge the package `gamedata\` into `<Anomaly>\`, launch the game normally. Alternatively, run `ZoneClient_Injector.exe --launch "<Anomaly>\bin\AnomalyDX11.exe"`. Full instructions, all **33 configuration keys** with defaults, CLI flags, the first-run restart note, xrRazom coexistence and connection verification are in [INSTALL.md](INSTALL.md).
 
 ---
 

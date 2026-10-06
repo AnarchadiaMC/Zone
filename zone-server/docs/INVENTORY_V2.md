@@ -31,10 +31,11 @@ table, no change to the existing stash APIs. Auto-created stashes
 - Success and failure are sent to the sender only — container contents are
   never broadcast.
 - Deposit with insufficient inventory returns `result=2` (corrected) with the
-  authoritative negative remaining count plus a forced `OpInventorySync`;
-  other failures return `result=1` and also force a resync (a rejected deposit
-  is a client-local mutation, so the client must reconcile). Pure rate-limit
-  rejections never force a sync.
+  authoritative negative remaining count and no inventory sync: nothing changed
+  server-side, so the correction is authoritative on its own. Other failures
+  return `result=1` and force a resync (they may follow a client-local
+  mutation, so the client must reconcile). Pure rate-limit rejections never
+  force a sync.
 - Validation order: known action, section format, non-zero count, stash exists,
   same level, ≤ 5 m from the player's last server position, owner match,
   passcode fail-closed (the wire carries no passcode yet, so protected stashes
@@ -85,10 +86,10 @@ so a 5% item can never repair a 100% stack.
 `OpItemAction` action=3 runs `DB.ConsumeItem` (one transaction, same
 remove-in-id-order helper as drop), then echoes `OpItemUpdate{Action:3,
 Result:0, Count:-N}` to the sender only. Insufficient stock returns
-`result=2` with the negative authoritative remaining count and forces an
-inventory sync; a rejected consume (non-rate-limit) forces a sync as well so a
-ghost effect cannot survive. Replays echo the cached update; nothing is
-removed twice.
+`result=2` with the negative authoritative remaining count and no inventory
+sync (server state did not change); a rejected consume for any other reason
+forces a sync so a ghost effect cannot survive. Replays echo the cached update;
+nothing is removed twice.
 
 ## World items
 
@@ -132,6 +133,7 @@ with container id, section and count in the detail string, plus
 `TestStashConditionRoundTripPreservesInventoryCondition`,
 `TestStashWithdrawCreditsAmmoRounds`, `TestValidateAccessRejectsForeignOwner`,
 `TestItemDropConditionDerivedFromInventory`,
+`TestItemDropCorrectionDoesNotResyncInventory`,
 `TestItemPickupMergesByConditionBucket`, `TestItemPickupRejectedForcesSync`,
 `TestItemDropPerLevelCapRejected`, `TestItemBroadcastAoIOnly`,
 `TestItemPickupCreditsAmmoRounds`, `TestWorldItemTTLSweep`,
